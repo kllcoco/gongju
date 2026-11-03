@@ -2,7 +2,7 @@
 
 ![墨写图标](assets/moxie.png)
 
-一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.4**。
+一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.5**。
 
 ## 功能
 
@@ -52,8 +52,8 @@ python -m venv .venv
 
 脚本创建本地虚拟环境、安装构建依赖，并用 PyInstaller 打包。输出为 `dist/Moxie/`：
 
-- `Moxie-2.0.4.exe`：桌面编辑器。
-- `MoxieMCP-2.0.4.exe`：MCP 入口，需传入 `--mcp`。
+- `Moxie-2.0.5.exe`：桌面编辑器。
+- `MoxieMCP-2.0.5.exe`：MCP 入口，需传入 `--mcp`。
 - `_internal/`：共用运行库，必须与 EXE 一起保留。
 - `mcp-config.json`：根据实际构建位置生成的接入配置。
 - `Documents/`：默认 MCP 文档目录。

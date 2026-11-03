@@ -12,7 +12,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Application build failed.' }
     & $pythonPath tools\prepare_distribution.py
     if ($LASTEXITCODE -ne 0) { throw 'Distribution preparation failed.' }
-    Write-Host 'Ready: dist\Moxie\Moxie-2.0.4.exe'
+    Write-Host 'Ready: dist\Moxie\Moxie-2.0.5.exe'
 } finally {
     Pop-Location
 }

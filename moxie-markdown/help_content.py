@@ -3,7 +3,7 @@ import json
 import sys
 from pathlib import Path
 from core import BASE
-VERSION = '2.0.4'
+VERSION = '2.0.5'
 TOPICS = []
 def add(category,title,steps,template='',language='markdown'):
     TOPICS.append({'id':str(len(TOPICS)),'category':category,'title':title,'steps':steps,'template':template,'language':language})
