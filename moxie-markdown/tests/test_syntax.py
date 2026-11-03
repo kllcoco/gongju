@@ -42,7 +42,4 @@ class Key:widget=app.source
 assert app.enter(Key())=='break';assert app.content().endswith('\n- [ ] ')
 assert app.enter(Key())=='break';assert app.content().endswith('\n\n')
 root.geometry('1040x620');root.update()
-bar=app.heading_menu.master.master
-for widget in bar.winfo_children():
-    assert widget.winfo_x()+widget.winfo_width()<=bar.winfo_width(),(str(widget),widget.winfo_x(),widget.winfo_width(),bar.winfo_width())
-root.destroy();print('PASS: toolbar/context commands, selection and caret, H1-H6, lists/tasks, strike rendering, footnotes, code escaping, references, grouped undo')
+root.destroy();print('PASS: context commands, selection and caret, H1-H6, lists/tasks, strike rendering, footnotes, code escaping, references, grouped undo')

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "moxie-markdown": {
-      "command": "C:/Tools/Moxie/MoxieMCP-2.0.2.exe",
+      "command": "C:/Tools/Moxie/MoxieMCP-2.0.3.exe",
       "args": ["--mcp", "--root", "D:/Notes"]
     }
   }

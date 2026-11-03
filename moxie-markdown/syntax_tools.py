@@ -1,12 +1,11 @@
 import re
 import tkinter as tk
-from tkinter import ttk
 import markdown
 from writing_extension import WritingExtension
 
 class SyntaxTools:
     def html(self):return markdown.markdown(self.content(),extensions=['extra','sane_lists','nl2br',WritingExtension()])
-    def build_toolbar(self,bar):
+    def init_syntax_commands(self):
         self.syntax_commands={
             '粗体':lambda:self.wrap('**','**','粗体文字'),
             '斜体':lambda:self.wrap('*','*','斜体文字'),
@@ -30,17 +29,6 @@ class SyntaxTools:
             '强制换行':lambda:self.wrap('  \n','',''),
             '转义特殊字符':self.escape_selection,
         }
-        heading=ttk.Menubutton(bar,text='标题 ▾',width=6);headmenu=tk.Menu(heading,tearoff=False)
-        for level in range(1,7):headmenu.add_command(label=f'H{level} · {level} 级标题',command=lambda n=level:self.heading(n))
-        headmenu.add_separator();headmenu.add_command(label='恢复正文',command=lambda:self.heading(0));heading.config(menu=headmenu);heading.pack(side='left',padx=2)
-        self.heading_menu=headmenu
-        for label,key in [('粗体','粗体'),('斜体','斜体'),('代码','行内代码')]:ttk.Button(bar,text=label,width=5,command=self.syntax_commands[key]).pack(side='left',padx=2)
-        lists=ttk.Menubutton(bar,text='列表 ▾',width=6);listmenu=tk.Menu(lists,tearoff=False)
-        for key in ['无序列表','有序列表','任务清单','已完成任务']:listmenu.add_command(label=key,command=self.syntax_commands[key])
-        lists.config(menu=listmenu);lists.pack(side='left',padx=2)
-        for key in ['引用','链接','图片','表格']:ttk.Button(bar,text=key,width=5,command=self.syntax_commands[key]).pack(side='left',padx=2)
-        more=ttk.Menubutton(bar,text='更多语法 ▾',width=10);self.more_menu=self.syntax_menu(more);more.config(menu=self.more_menu);more.pack(side='left',padx=(8,2))
-        ttk.Button(bar,text='查找',width=5,command=self.find).pack(side='right',padx=2)
     def syntax_menu(self,parent):
         menu=tk.Menu(parent,tearoff=False)
         headings=tk.Menu(menu,tearoff=False)
@@ -57,6 +45,7 @@ class SyntaxTools:
         for key in ['表格','分隔线','脚注','定义列表','强制换行','转义特殊字符']:menu.add_command(label=key,command=self.syntax_commands[key])
         return menu
     def setup_syntax(self):
+        self.init_syntax_commands()
         self.source.configure(exportselection=False)
         self.context_menu=tk.Menu(self.source,tearoff=False)
         for title,event in [('撤销','<<Undo>>'),('重做','<<Redo>>'),('剪切','<<Cut>>'),('复制','<<Copy>>'),('粘贴','<<Paste>>')]:self.context_menu.add_command(label=title,command=lambda ev=event:self.event(ev))

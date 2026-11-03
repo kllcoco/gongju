@@ -2,14 +2,14 @@
 
 ![墨写图标](assets/moxie.png)
 
-一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.2**。
+一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.3**。
 
 ## 功能
 
 - 新建、打开、保存、另存为、最近文档，识别常见中文编码。
 - 编辑与预览双栏、专注编辑、阅读模式、字号调整。
 - 点击大纲同时定位源码和预览，支持重复标题、下划线式标题及键盘选择。
-- 常用工具栏，以及编辑区鼠标右键语法菜单。
+- 顶部保留新建、打开、保存、查找四个按钮，语法插入统一使用编辑区鼠标右键菜单。
 - H1–H6、粗体、斜体、删除线、引用、列表、任务清单、代码、链接、图片、表格、脚注等。
 - 本地图片、带边框表格、任务清单和删除线预览。
 - 查找替换、撤销重做、列表与任务回车续写。
@@ -45,8 +45,8 @@ python -m venv .venv
 
 脚本创建本地虚拟环境、安装构建依赖，并用 PyInstaller 打包。输出为 `dist/Moxie/`：
 
-- `Moxie-2.0.2.exe`：桌面编辑器。
-- `MoxieMCP-2.0.2.exe`：MCP 入口，需传入 `--mcp`。
+- `Moxie-2.0.3.exe`：桌面编辑器。
+- `MoxieMCP-2.0.3.exe`：MCP 入口，需传入 `--mcp`。
 - `_internal/`：共用运行库，必须与 EXE 一起保留。
 - `mcp-config.json`：根据实际构建位置生成的接入配置。
 - `Documents/`：默认 MCP 文档目录。
@@ -82,7 +82,7 @@ LLM 应先读取文档，再使用返回的 `version` 作为修改请求的 `exp
 ## 文件结构
 
 - `desktop_app.py` / `native_base.py`：桌面窗口与文档操作。
-- `syntax_tools.py` / `writing_extension.py`：工具栏、右键语法菜单与扩展语法。
+- `syntax_tools.py` / `writing_extension.py`：右键语法菜单与扩展语法。
 - `rendering.py` / `outline.py`：阅读预览、PDF 导出及大纲定位。
 - `core.py`：存储、备份、编码和路径边界。
 - `mcp_server.py`：标准 MCP 工具。

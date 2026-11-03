@@ -5,14 +5,14 @@ import shutil
 
 BASE = Path(__file__).resolve().parents[1]
 DEST = BASE / 'dist' / 'Moxie'
-if not (DEST / 'Moxie-2.0.2.exe').is_file():
+if not (DEST / 'Moxie-2.0.3.exe').is_file():
     raise SystemExit('Build moxie.spec before preparing the distribution.')
 (DEST / 'Documents').mkdir(exist_ok=True)
 for name in ['使用说明.md', 'MCP接入说明.md', '示例.md']:
     shutil.copy2(BASE / name, DEST / name)
 shutil.copy2(BASE / '示例.md', DEST / 'Documents' / '示例.md')
 config = {'mcpServers': {'moxie-markdown': {
-    'command': str(DEST / 'MoxieMCP-2.0.2.exe'),
+    'command': str(DEST / 'MoxieMCP-2.0.3.exe'),
     'args': ['--mcp', '--root', str(DEST / 'Documents')],
 }}}
 (DEST / 'mcp-config.json').write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
