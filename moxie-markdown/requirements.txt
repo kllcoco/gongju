@@ -1,0 +1,4 @@
+Markdown==3.11.2
+Pillow==13.0.0
+reportlab==5.1.0
+mcp==2.3.0
