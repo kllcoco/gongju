@@ -21,14 +21,54 @@ class App(SyntaxTools,native_base.App):
         self.filemenu.insert_command(6,label='导出 PDF…',command=self.pdf)
         self.filemenu.insert_command(7,label='恢复草稿…',command=self.restore)
         self.filemenu.insert_command(8,label='历史版本…',command=self.history)
-        self.filemenu.insert_command(9,label='打开 MCP 配置说明',command=lambda:os.startfile(str(BASE/'MCP接入说明.md')))
+        self.filemenu.insert_command(9,label='打开 MCP 配置说明',command=self.show_mcp_guide)
+        self.helpmenu.add_command(label='MCP 接入说明',command=self.show_mcp_guide)
         self.root.bind('<Return>',self.enter)
-        self.root.bind('<Control-plus>',lambda e:self.zoom(1));self.root.bind('<Control-minus>',lambda e:self.zoom(-1))
+        for seq,d in [('<Control-plus>',1),('<Control-equal>',1),('<Control-KP_Add>',1),('<Control-minus>',-1),('<Control-KP_Subtract>',-1)]:self.root.bind(seq,lambda e,d=d:self.zoom(d))
+        self.bind_editor_keys()
         self.tree.bind("<ButtonRelease-1>",self.outline_click)
         self.tree.bind("<Return>",lambda e:(self.jump(),"break")[1])
-        self.setup_syntax()
+        self.setup_syntax();self.apply_text_theme()
         self.start_bridge();self.root.after(2000,self.tick)
         self.root.after(500,self.offer_restore)
+    def bind_editor_keys(self):
+        # Tk's Text class ships Emacs-style keys (Ctrl+I inserts a tab over the selection, Ctrl+O inserts a
+        # newline, Ctrl+H deletes a character, ...). Class bindings run before window bindings, so the
+        # shortcuts are bound on the editor itself and stop with 'break'.
+        actions={'n':self.new,'o':self.open,'s':self.save,'f':self.find,'h':self.find,
+                 'b':lambda:self.syntax_commands['粗体'](),'i':lambda:self.syntax_commands['斜体']()}
+        for key,cmd in actions.items():
+            for seq in ('<Control-%s>'%key,'<Control-%s>'%key.upper()):
+                self.source.bind(seq,lambda e,c=cmd:(c(),'break')[1])
+        self.source.bind('<Control-S>',lambda e:(self.save(True),'break')[1])
+        for key in 'dktpae':self.source.bind('<Control-%s>'%key,lambda e:'break')
+        self.source.bind('<Control-a>',lambda e:(self.select_all(),'break')[1])
+        self.source.bind('<Control-e>',lambda e:'break')
+    def show_mcp_guide(self):
+        from viewer import DocViewer
+        return DocViewer(self,BASE/'MCP接入说明.md','MCP 接入说明')
+    def open_link(self,url,base=None):
+        from urllib.parse import urlparse,unquote
+        if url.startswith(('http://','https://','mailto:')):
+            import webbrowser;webbrowser.open(url);return 'external'
+        if url.startswith('#'):
+            target=unquote(url[1:]).strip().lower()
+            for h in self.renderer.headings if self.renderer else []:
+                if h['text'].strip().lower().replace(' ','-')==target or h['text'].strip().lower()==target:
+                    self.preview.yview(h['mark']);return 'anchor'
+            return None
+        base=Path(base) if base else (self.path.parent if self.path else BASE)
+        target=Path(unquote(urlparse(url).path or url))
+        target=target if target.is_absolute() else (base/target)
+        if target.suffix.lower() in ('.md','.markdown','.mdown','.mkd') and target.is_file():
+            if self.confirm():self.load(target.resolve());return 'opened'
+            return None
+        if target.exists():
+            if messagebox.askyesno('打开文件',f'墨写只能打开 Markdown 文件。\n是否用系统默认程序打开：\n{target.name}？',parent=self.root):
+                try:os.startfile(str(target))
+                except (AttributeError,OSError) as e:messagebox.showerror('打开失败',str(e),parent=self.root)
+            return 'asked'
+        messagebox.showinfo('链接','找不到链接指向的文件：\n'+str(target),parent=self.root);return None
     def show_about(self,query=''):
         from usage_guide import UsageGuide
         guide=getattr(self,'usage_guide',None)
@@ -40,22 +80,35 @@ class App(SyntaxTools,native_base.App):
     def render(self):
         self._rebuilding_outline=True
         selected=self.tree.selection()
-        self.job=None;pos=self.preview.yview();self.preview.config(state='normal');self.preview.delete('1.0','end')
-        self.renderer=Renderer(self.preview,self.path.parent if self.path else BASE);self.renderer.render(self.html());self.preview.config(state='disabled');self.preview.yview_moveto(pos[0]);self.tree.delete(*self.tree.get_children())
+        self.job=None;pos=self.preview.yview();top=self.preview.index('@0,0');self.preview.config(state='normal');self.preview.delete('1.0','end')
+        self.renderer=Renderer(self.preview,self.path.parent if self.path else BASE,self.p,self.open_link,self.fonts['ui']);self.renderer.render(self.html());self.preview.config(state='disabled');self.preview.yview_moveto(pos[0]) if pos[0]<=0 else self.preview.yview(top);self.tree.delete(*self.tree.get_children())
         import re
         self.outline_targets={};cursor=0
         for line,level,title in source_headings(self.content()):
             for i in range(cursor,len(self.renderer.headings)):
                 heading=self.renderer.headings[i]
                 if heading['level']==level and heading['text']==title:
-                    key=str(line);self.tree.insert('','end',iid=key,text='  '*(level-1)+title)
+                    key=str(line);self.tree.insert('','end',iid=key,text='   '*(level-1)+title,tags=('lvl'+str(level),))
                     self.outline_targets[key]=heading['mark'];cursor=i+1;break
         if selected and self.tree.exists(selected[0]):self.tree.selection_set(selected[0])
         self.root.after_idle(lambda:setattr(self,'_rebuilding_outline',False))
-        for name,color in [('md_heading','#087e71'),('md_code','#8960a0'),('md_quote','#768799')]:self.source.tag_configure(name,foreground=color);self.source.tag_remove(name,'1.0','end')
+        for name in ('md_heading','md_code','md_codeblock','md_quote','md_list'):self.source.tag_remove(name,'1.0','end')
+        fence=None
         for n,line in enumerate(self.content().splitlines(),1):
-            tag='md_heading' if re.match(r'^#{1,6}\s',line) else 'md_quote' if line.startswith('>') else 'md_code' if line.startswith('```') else None
-            if tag:self.source.tag_add(tag,f'{n}.0',f'{n}.end')
+            marker=re.match(r'^ {0,3}(`{3,}|~{3,})',line)
+            if fence or marker:
+                self.source.tag_add('md_codeblock',f'{n}.0',f'{n}.end+1c')
+                if marker:
+                    self.source.tag_add('md_code',f'{n}.0',f'{n}.end')
+                    if fence is None:fence=marker[1]
+                    elif marker[1][0]==fence[0] and len(marker[1])>=len(fence):fence=None
+                continue
+            if re.match(r'^ {0,3}#{1,6}\s',line):self.source.tag_add('md_heading',f'{n}.0',f'{n}.end')
+            elif line.lstrip().startswith('>'):self.source.tag_add('md_quote',f'{n}.0',f'{n}.end')
+            else:
+                m=re.match(r'^(\s*)([-*+]|\d+[.)])( \[[ xX]\])? ',line)
+                if m:self.source.tag_add('md_list',f'{n}.{len(m[1])}',f'{n}.{m.end()}')
+        self.source.tag_raise('sel')
         self.update_status()
     def jump(self,event=None):
         if getattr(self,'_rebuilding_outline',False):return
@@ -137,7 +190,7 @@ class App(SyntaxTools,native_base.App):
     def restore(self):
         candidates=self.restore_candidates()
         if not candidates:messagebox.showinfo('恢复草稿','没有其他窗口留下的恢复草稿。');return
-        window=tk.Toplevel(self.root);window.title('恢复草稿');window.geometry('620x330');box=tk.Listbox(window,font=('Microsoft YaHei UI',11));box.pack(fill='both',expand=True,padx=15,pady=15)
+        window=tk.Toplevel(self.root);window.title('恢复草稿');window.geometry('620x330');window.configure(bg=self.p['bg']);box=tk.Listbox(window,font=(self.fonts['ui'],11));box.pack(fill='both',expand=True,padx=15,pady=15)
         for p in candidates:
             data=json.loads(p.read_text('utf-8'));box.insert('end',time.strftime('%m-%d %H:%M',time.localtime(data['updated']))+'  '+(data['path'] or '未命名文档'))
         def apply():
@@ -148,7 +201,7 @@ class App(SyntaxTools,native_base.App):
         if not self.path:messagebox.showinfo('历史版本','保存文件后才会产生历史版本。');return
         folder=DATA/'history'/sha(str(self.path.resolve()).encode())[:24];files=sorted(folder.glob('*.bak'),reverse=True)
         if not files:messagebox.showinfo('历史版本','还没有历史版本。');return
-        win=tk.Toplevel(self.root);win.title('历史版本 · 恢复后需手动保存');win.geometry('530x350');box=tk.Listbox(win,font=('Microsoft YaHei UI',11));box.pack(fill='both',expand=True,padx=14,pady=14)
+        win=tk.Toplevel(self.root);win.title('历史版本 · 恢复后需手动保存');win.geometry('530x350');win.configure(bg=self.p['bg']);box=tk.Listbox(win,font=(self.fonts['ui'],11));box.pack(fill='both',expand=True,padx=14,pady=14)
         for p in files:box.insert('end',time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(int(p.stem)/1e9))+f'   {p.stat().st_size} 字节')
         def restore():
             if not box.curselection() or not self.confirm():return
