@@ -7,10 +7,10 @@ class UsageGuide:
     def __init__(self,app):
         self.app=app;self.topic=None;self.timer=None
         self.window=tk.Toplevel(app.root);win=self.window
-        win.title(f'关于墨写 {VERSION} · 详细用法与模板');win.geometry('1100x780');win.minsize(820,600);win.transient(app.root)
+        win.title(f'关于墨写 {VERSION} · 详细用法与模板');win.configure(bg=getattr(app,'p',{}).get('bg','#f6f7f9'));win.geometry('1100x780');win.minsize(820,600);win.transient(app.root)
         header=ttk.Frame(win,padding=(18,14));header.pack(fill='x')
-        ttk.Label(header,text=f'墨写 {VERSION}  使用指南',font=('Microsoft YaHei UI',18,'bold'),foreground='#137c70').pack(anchor='w')
-        ttk.Label(header,text='选择功能查看步骤，复制正确模板；本窗口不会改动当前文档。').pack(anchor='w',pady=(5,10))
+        ttk.Label(header,text=f'墨写 {VERSION}  使用指南',style='Brand.TLabel').pack(anchor='w')
+        ttk.Label(header,text='选择功能查看步骤，复制正确模板；本窗口不会改动当前文档。',style='Muted.TLabel').pack(anchor='w',pady=(5,10))
         searchbar=ttk.Frame(header);searchbar.pack(fill='x')
         ttk.Label(searchbar,text='搜索功能：').pack(side='left');self.query=tk.StringVar()
         self.search=ttk.Entry(searchbar,textvariable=self.query);self.search.pack(side='left',fill='x',expand=True)
@@ -21,7 +21,7 @@ class UsageGuide:
         self.tree=ttk.Treeview(left,show='tree',selectmode='browse',height=20);ys=ttk.Scrollbar(left,orient='vertical',command=self.tree.yview);self.tree.config(yscrollcommand=ys.set);ys.pack(side='right',fill='y');self.tree.pack(fill='both',expand=True)
         self.tree.bind('<<TreeviewSelect>>',self.selected)
         right=ttk.Frame(split);split.add(right,weight=1)
-        self.heading=ttk.Label(right,text='',font=('Microsoft YaHei UI',14,'bold'),padding=(14,6));self.heading.pack(fill='x')
+        self.heading=ttk.Label(right,text='',font=(getattr(app,'fonts',{}).get('ui','Microsoft YaHei UI'),14,'bold'),padding=(14,6));self.heading.pack(fill='x')
         panes=ttk.Panedwindow(right,orient='vertical');panes.pack(fill='both',expand=True)
         bodyframe=ttk.Frame(panes);panes.add(bodyframe,weight=1);self.body=self.textpane(bodyframe)
         templateframe=ttk.Frame(panes);panes.add(templateframe,weight=2)
@@ -37,7 +37,9 @@ class UsageGuide:
         self.filter_topics();self.search.focus_set()
     def textpane(self,parent,code=False):
         frame=ttk.Frame(parent);frame.pack(fill='both',expand=True)
-        text=tk.Text(frame,wrap='word',font=('Consolas' if code else 'Microsoft YaHei UI',11),bg='#f3f7f9' if code else '#ffffff',fg='#263445',relief='flat',padx=14,pady=12,spacing3=7,state='disabled',exportselection=False)
+        p=getattr(self.app,'p',None) or {'code_bg':'#f3f5f7','surface':'#ffffff','text':'#1f2933','sel':'#c9ebe3'}
+        fonts=getattr(self.app,'fonts',{'ui':'Microsoft YaHei UI','mono':'Consolas'})
+        text=tk.Text(frame,wrap='word',font=(fonts['mono'] if code else fonts['ui'],11),bg=p['code_bg'] if code else p['surface'],fg=p['text'],selectbackground=p['sel'],relief='flat',borderwidth=0,highlightthickness=0,padx=16,pady=12,spacing3=7,state='disabled',exportselection=False)
         scroll=ttk.Scrollbar(frame,command=text.yview);scroll.pack(side='right',fill='y');text.config(yscrollcommand=scroll.set);text.pack(fill='both',expand=True)
         text.bind('<Control-a>',lambda e:(text.tag_add('sel','1.0','end-1c'),'break')[1])
         return text

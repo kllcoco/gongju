@@ -14,7 +14,10 @@
 - 本地图片、带边框表格、任务清单和删除线预览。
 - 查找替换、撤销重做、列表与任务回车续写。
 - 自动恢复草稿、最近 30 次保存版本、外部文件修改检测。
-- HTML 与中文 PDF 导出。
+- HTML 与中文 PDF 导出；PDF 保留粗体、斜体、行内代码、删除线、链接、嵌套列表和代码块。
+- 浅色 / 深色主题（工具栏月亮按钮或“视图 → 深色模式”），编辑区字体可选等宽或中文清晰字体。
+- 大纲高亮光标所在标题；Tab / Shift+Tab 批量缩进多行。
+- MCP 接入说明、文档内指向本地 `.md` 的链接都在墨写内部打开。
 - 11 个 MCP 工具：文件读写、精确替换、打开编辑器，以及读取/修改/保存当前编辑区。
 
 详细操作见 [使用说明](使用说明.md)，LLM 接入见 [MCP 接入说明](MCP接入说明.md)。
@@ -80,6 +83,8 @@ LLM 应先读取文档，再使用返回的 `version` 作为修改请求的 `exp
 .\.venv\Scripts\python.exe tests\test_syntax.py
 .\.venv\Scripts\python.exe tests\test_v2.py
 .\.venv\Scripts\python.exe tests\test_guide.py
+.\.venv\Scripts\python.exe tests\test_ui.py
+.\.venv\Scripts\python.exe tests\test_guide.py
 ```
 
 覆盖大纲同步跳转、右键菜单、格式插入、图片和表格、PDF 导出、恢复与历史、真实 MCP stdio 调用，以及路径边界和版本冲突。测试会创建临时窗口与临时文件；不会修改个人文档。
@@ -90,6 +95,8 @@ LLM 应先读取文档，再使用返回的 `version` 作为修改请求的 `exp
 - `syntax_tools.py` / `writing_extension.py`：右键语法菜单与扩展语法。
 - `rendering.py` / `outline.py`：阅读预览、PDF 导出及大纲定位。
 - `core.py`：存储、备份、编码和路径边界。
+- `theme.py`：浅色/深色配色、字体选择、工具栏图标。
+- `viewer.py`：在墨写内部只读显示附带的说明文档。
 - `mcp_server.py`：标准 MCP 工具。
 - `moxie.spec` / `build.ps1`：Windows 打包。
 
