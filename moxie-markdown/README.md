@@ -2,7 +2,7 @@
 
 ![墨写图标](assets/moxie.png)
 
-一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.3**。
+一个使用 Python/Tkinter 编写的 Windows Markdown 编辑器，包含独立桌面窗口、实时预览和 stdio MCP 服务。当前版本：**2.0.4**。
 
 ## 功能
 
@@ -18,6 +18,10 @@
 - 11 个 MCP 工具：文件读写、精确替换、打开编辑器，以及读取/修改/保存当前编辑区。
 
 详细操作见 [使用说明](使用说明.md)，LLM 接入见 [MCP 接入说明](MCP接入说明.md)。
+
+## 内置使用指南
+
+在程序中选择 **帮助 → 关于与详细用法**，可搜索 62 项功能，查看步骤并复制模板；也可直接查看 [详细使用指南](详细使用指南.md)。指南覆盖全部菜单功能、Markdown 语法、代码块、完整文档模板以及 11 个 MCP 工具。
 
 ## 从源码运行
 
@@ -45,8 +49,8 @@ python -m venv .venv
 
 脚本创建本地虚拟环境、安装构建依赖，并用 PyInstaller 打包。输出为 `dist/Moxie/`：
 
-- `Moxie-2.0.3.exe`：桌面编辑器。
-- `MoxieMCP-2.0.3.exe`：MCP 入口，需传入 `--mcp`。
+- `Moxie-2.0.4.exe`：桌面编辑器。
+- `MoxieMCP-2.0.4.exe`：MCP 入口，需传入 `--mcp`。
 - `_internal/`：共用运行库，必须与 EXE 一起保留。
 - `mcp-config.json`：根据实际构建位置生成的接入配置。
 - `Documents/`：默认 MCP 文档目录。
@@ -75,6 +79,7 @@ LLM 应先读取文档，再使用返回的 `version` 作为修改请求的 `exp
 .\.venv\Scripts\python.exe tests\test_outline.py
 .\.venv\Scripts\python.exe tests\test_syntax.py
 .\.venv\Scripts\python.exe tests\test_v2.py
+.\.venv\Scripts\python.exe tests\test_guide.py
 ```
 
 覆盖大纲同步跳转、右键菜单、格式插入、图片和表格、PDF 导出、恢复与历史、真实 MCP stdio 调用，以及路径边界和版本冲突。测试会创建临时窗口与临时文件；不会修改个人文档。

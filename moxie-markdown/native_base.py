@@ -47,7 +47,7 @@ class App:
         for label,cmd in [('撤销',lambda:self.event('<<Undo>>')),('重做',lambda:self.event('<<Redo>>')),('剪切',lambda:self.event('<<Cut>>')),('复制',lambda:self.event('<<Copy>>')),('粘贴',lambda:self.event('<<Paste>>')),('全选',self.select_all),('查找 / 替换',self.find)]: edit.add_command(label=label,command=cmd)
         view=tk.Menu(menu,tearoff=False); menu.add_cascade(label='视图',menu=view)
         for label,cmd in [('编辑 + 预览',lambda:self.mode('both')),('专注编辑',lambda:self.mode('edit')),('阅读模式',lambda:self.mode('read')),('放大文字',lambda:self.zoom(1)),('缩小文字',lambda:self.zoom(-1))]: view.add_command(label=label,command=cmd)
-        helpm=tk.Menu(menu,tearoff=False); menu.add_cascade(label='帮助',menu=helpm); helpm.add_command(label='Markdown 语法指南',command=lambda:self.load(BASE/'示例.md') if self.confirm() else None); helpm.add_command(label='关于',command=lambda:messagebox.showinfo('墨写','墨写 Markdown 桌面编辑器\n本地运行 · 轻量书写\n支持常用 Markdown、表格、代码块和脚注。'))
+        helpm=tk.Menu(menu,tearoff=False);menu.add_cascade(label='帮助',menu=helpm);helpm.add_command(label='Markdown 语法指南',command=lambda:self.show_about('Markdown 语法'));helpm.add_command(label='关于与详细用法',command=self.show_about)
         top=ttk.Frame(root,padding=(18,12)); top.pack(fill='x'); ttk.Label(top,text='墨写',font=('Microsoft YaHei UI',21,'bold'),foreground='#187b70').pack(side='left'); self.name=ttk.Label(top,text='未命名.md',padding=(20,0)); self.name.pack(side='left')
         for label,cmd in [('查找',self.find),('保存',self.save),('打开',self.open),('新建',self.new)]: ttk.Button(top,text=label,command=cmd).pack(side='right',padx=3)
         self.outer=ttk.Panedwindow(root,orient='horizontal'); self.outer.pack(fill='both',expand=True,padx=14)

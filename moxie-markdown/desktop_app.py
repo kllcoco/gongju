@@ -29,6 +29,14 @@ class App(SyntaxTools,native_base.App):
         self.setup_syntax()
         self.start_bridge();self.root.after(2000,self.tick)
         self.root.after(500,self.offer_restore)
+    def show_about(self,query=''):
+        from usage_guide import UsageGuide
+        guide=getattr(self,'usage_guide',None)
+        if guide is None or not guide.window.winfo_exists():
+            guide=UsageGuide(self);self.usage_guide=guide
+        else:guide.window.deiconify();guide.window.lift()
+        if query:guide.query.set(query);guide.filter_topics()
+        return guide
     def render(self):
         self._rebuilding_outline=True
         selected=self.tree.selection()
