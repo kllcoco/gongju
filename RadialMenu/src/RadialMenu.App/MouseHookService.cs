@@ -34,11 +34,14 @@ internal sealed partial class MouseHookService : IDisposable
     private const uint MouseEventRightDown = 0x0008;
     private const uint MouseEventRightUp = 0x0010;
     private const int HoldMilliseconds = 200;
+    private static readonly long SlowHookThresholdTicks =
+        (long)Math.Ceiling(Stopwatch.Frequency * 0.005);
 
     // “RADIALMM”的 ASCII 数值。所有自注入事件都带此标记，钩子看到后立即放行。
     private static readonly nuint InjectionMarker = unchecked((nuint)0x52414449414C4D4DUL);
 
     private readonly RightButtonGestureTracker _tracker = new();
+    private readonly DiagnosticLogQueue _diagnostics;
     private readonly BlockingCollection<WorkerCommand> _workerCommands = new();
     private readonly ManualResetEventSlim _hookReady = new();
     private readonly LowLevelMouseProc _hookCallback;
@@ -51,9 +54,11 @@ internal sealed partial class MouseHookService : IDisposable
     private int _enabled = 1;
     private int _started;
     private int _disposed;
+    private long _lastReplayToken;
 
-    public MouseHookService()
+    public MouseHookService(DiagnosticLogQueue diagnostics)
     {
+        _diagnostics = diagnostics;
         _hookCallback = HookCallback;
         _holdTimer = new System.Threading.Timer(OnHoldTimer, null, Timeout.Infinite, Timeout.Infinite);
         _hookThread = new Thread(HookThreadMain)
@@ -173,6 +178,29 @@ internal sealed partial class MouseHookService : IDisposable
 
     private nint HookCallback(int code, nuint message, nint data)
     {
+        var startedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            return ProcessHookCallback(code, message, data, startedAt);
+        }
+        finally
+        {
+            var finishedAt = Stopwatch.GetTimestamp();
+            var durationTicks = finishedAt - startedAt;
+            if (durationTicks > SlowHookThresholdTicks)
+            {
+                _diagnostics.Enqueue(new DiagnosticEvent(
+                    DiagnosticEventKind.SlowHookCallback,
+                    finishedAt,
+                    Interlocked.Read(ref _currentTimerToken),
+                    unchecked((long)message),
+                    durationTicks));
+            }
+        }
+    }
+
+    private nint ProcessHookCallback(int code, nuint message, nint data, long eventObservedAt)
+    {
         if (code != 0)
         {
             return CallNextHookEx(_hookHandle, code, message, data);
@@ -181,6 +209,22 @@ internal sealed partial class MouseHookService : IDisposable
         var mouse = Marshal.PtrToStructure<MsllHookStruct>(data);
         if (mouse.ExtraInfo == InjectionMarker)
         {
+            var replayToken = Interlocked.Read(ref _lastReplayToken);
+            if ((uint)message == WmRButtonDown)
+            {
+                _diagnostics.Enqueue(new DiagnosticEvent(
+                    DiagnosticEventKind.InjectedRightDown,
+                    eventObservedAt,
+                    replayToken));
+            }
+            else if ((uint)message == WmRButtonUp)
+            {
+                _diagnostics.Enqueue(new DiagnosticEvent(
+                    DiagnosticEventKind.InjectedRightUp,
+                    eventObservedAt,
+                    replayToken));
+            }
+
             return CallNextHookEx(_hookHandle, code, message, data);
         }
 
@@ -192,7 +236,7 @@ internal sealed partial class MouseHookService : IDisposable
         {
             if (mouseMessage == WmRButtonUp)
             {
-                return CompleteTrackedGesture();
+                return CompleteTrackedGesture(eventObservedAt);
             }
 
             if (mouseMessage == WmMouseMove)
@@ -217,9 +261,13 @@ internal sealed partial class MouseHookService : IDisposable
                 if (_tracker.TryBegin(
                         new ScreenPoint(mouse.Point.X, mouse.Point.Y),
                         WindowFromPoint(mouse.Point),
-                        Stopwatch.GetTimestamp(),
+                        eventObservedAt,
                         out var gesture))
                 {
+                    _diagnostics.Enqueue(new DiagnosticEvent(
+                        DiagnosticEventKind.PhysicalRightDown,
+                        eventObservedAt,
+                        gesture.Token));
                     Interlocked.Exchange(ref _currentTimerToken, gesture.Token);
                     _holdTimer.Change(HoldMilliseconds, Timeout.Infinite);
                 }
@@ -238,23 +286,35 @@ internal sealed partial class MouseHookService : IDisposable
         if (transition.Started)
         {
             _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
-            TryQueue(new WorkerCommand(WorkerCommandKind.LongPressStarted, transition.Gesture));
+            QueueLongPressStarted(transition.Gesture);
         }
 
         return CallNextHookEx(_hookHandle, code, message, data);
     }
 
-    private nint CompleteTrackedGesture()
+    private nint CompleteTrackedGesture(long physicalUpAt)
     {
         _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
-        var result = _tracker.End(Stopwatch.GetTimestamp());
+        var result = _tracker.End(physicalUpAt);
+        _diagnostics.Enqueue(new DiagnosticEvent(
+            DiagnosticEventKind.PhysicalRightUp,
+            physicalUpAt,
+            result.Gesture.Token));
         if (result.Completion == GestureCompletion.ShortClick)
         {
-            TryQueue(new WorkerCommand(WorkerCommandKind.ReplayRightClick, result.Gesture));
+            var queuedAt = Stopwatch.GetTimestamp();
+            _diagnostics.Enqueue(new DiagnosticEvent(
+                DiagnosticEventKind.ReplayQueued,
+                queuedAt,
+                result.Gesture.Token));
+            TryQueue(new WorkerCommand(WorkerCommandKind.ReplayRightClick, result.Gesture, queuedAt));
         }
         else if (result.Completion == GestureCompletion.LongPress)
         {
-            TryQueue(new WorkerCommand(WorkerCommandKind.LongPressReleased, result.Gesture));
+            TryQueue(new WorkerCommand(
+                WorkerCommandKind.LongPressReleased,
+                result.Gesture,
+                Stopwatch.GetTimestamp()));
         }
 
         return 1;
@@ -272,8 +332,18 @@ internal sealed partial class MouseHookService : IDisposable
         var transition = ObserveCurrentHoldThreshold();
         if (transition.Started)
         {
-            TryQueue(new WorkerCommand(WorkerCommandKind.LongPressStarted, transition.Gesture));
+            QueueLongPressStarted(transition.Gesture);
         }
+    }
+
+    private void QueueLongPressStarted(RightButtonGesture gesture)
+    {
+        var queuedAt = Stopwatch.GetTimestamp();
+        _diagnostics.Enqueue(new DiagnosticEvent(
+            DiagnosticEventKind.LongPressQueued,
+            queuedAt,
+            gesture.Token));
+        TryQueue(new WorkerCommand(WorkerCommandKind.LongPressStarted, gesture, queuedAt));
     }
 
     private LongPressTransition ObserveCurrentHoldThreshold()
@@ -312,9 +382,17 @@ internal sealed partial class MouseHookService : IDisposable
                 switch (command.Kind)
                 {
                     case WorkerCommandKind.ReplayRightClick:
-                        ReplayRightClick();
+                        _diagnostics.Enqueue(new DiagnosticEvent(
+                            DiagnosticEventKind.SendInputStarted,
+                            Stopwatch.GetTimestamp(),
+                            command.Gesture.Token));
+                        ReplayRightClick(command.Gesture.Token);
                         break;
                     case WorkerCommandKind.LongPressStarted:
+                        _diagnostics.Enqueue(new DiagnosticEvent(
+                            DiagnosticEventKind.LongPressWorkerStarted,
+                            Stopwatch.GetTimestamp(),
+                            command.Gesture.Token));
                         GestureObserved?.Invoke(
                             this,
                             new GestureObservedEventArgs(GestureObservedKind.LongPressStarted, command.Gesture));
@@ -333,7 +411,7 @@ internal sealed partial class MouseHookService : IDisposable
         }
     }
 
-    private void ReplayRightClick()
+    private void ReplayRightClick(long gestureToken)
     {
         var inputs = new[]
         {
@@ -341,7 +419,13 @@ internal sealed partial class MouseHookService : IDisposable
             CreateMouseInput(MouseEventRightUp)
         };
 
+        Interlocked.Exchange(ref _lastReplayToken, gestureToken);
         var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<Input>());
+        _diagnostics.Enqueue(new DiagnosticEvent(
+            DiagnosticEventKind.SendInputReturned,
+            Stopwatch.GetTimestamp(),
+            gestureToken,
+            sent));
         if (sent != (uint)inputs.Length)
         {
             var error = new Win32Exception(Marshal.GetLastWin32Error());
@@ -373,7 +457,8 @@ internal sealed partial class MouseHookService : IDisposable
 
     private readonly record struct WorkerCommand(
         WorkerCommandKind Kind,
-        RightButtonGesture Gesture);
+        RightButtonGesture Gesture,
+        long QueuedAt);
 
     [StructLayout(LayoutKind.Sequential)]
     private readonly struct Point(int x, int y)

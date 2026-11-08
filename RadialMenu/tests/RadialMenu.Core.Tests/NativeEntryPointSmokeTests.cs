@@ -23,6 +23,8 @@ public sealed class NativeEntryPointSmokeTests
             "TranslateMessage",
             "DispatchMessageW",
             "PeekMessageW",
+            "RegisterHotKey",
+            "UnregisterHotKey",
             "SetProcessDpiAwarenessContext");
 
         VerifyExports(

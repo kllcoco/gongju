@@ -7,6 +7,8 @@ public partial class App : System.Windows.Application
 {
     private MouseHookService? _mouseHook;
     private TrayIconController? _trayIcon;
+    private DiagnosticLogQueue? _diagnostics;
+    private GlobalHotkeyService? _globalHotkey;
     private DispatcherTimer? _smokeTestTimer;
     private int _isStopping;
 
@@ -18,13 +20,15 @@ public partial class App : System.Windows.Application
 
         try
         {
-            _mouseHook = new MouseHookService();
+            _diagnostics = new DiagnosticLogQueue();
+            _mouseHook = new MouseHookService(_diagnostics);
             _trayIcon = new TrayIconController(
                 setPaused: SetPaused,
                 exit: StopApplication);
             _mouseHook.GestureObserved += OnGestureObserved;
             _mouseHook.InjectionFailed += OnInjectionFailed;
             _mouseHook.Start();
+            StartEmergencyHotkey();
             _trayIcon.ShowNotification("径向菜单", "阶段 1 已运行：短按右键保持原生行为。", 1800);
             LogService.Info("程序启动，低级鼠标钩子安装成功。");
 
@@ -74,10 +78,16 @@ public partial class App : System.Windows.Application
         }
 
         Dispatcher.BeginInvoke(() =>
+        {
+            _diagnostics?.Enqueue(new DiagnosticEvent(
+                DiagnosticEventKind.LongPressDispatcherStarted,
+                System.Diagnostics.Stopwatch.GetTimestamp(),
+                e.Gesture.Token));
             _trayIcon?.ShowNotification(
-                "阶段 1：已识别长按",
-                "本次右键已取消；转盘将在阶段 2 接入。",
-                1000));
+                    "阶段 1：已识别长按",
+                    "本次右键已取消；转盘将在阶段 2 接入。",
+                    1000);
+        });
     }
 
     private void OnInjectionFailed(object? sender, string error)
@@ -108,6 +118,9 @@ public partial class App : System.Windows.Application
         _smokeTestTimer?.Stop();
         _smokeTestTimer = null;
 
+        _globalHotkey?.Dispose();
+        _globalHotkey = null;
+
         if (_mouseHook is not null)
         {
             _mouseHook.GestureObserved -= OnGestureObserved;
@@ -119,6 +132,8 @@ public partial class App : System.Windows.Application
         _trayIcon?.Dispose();
         _trayIcon = null;
         LogService.Info("程序退出，低级鼠标钩子已卸载。");
+        _diagnostics?.Dispose();
+        _diagnostics = null;
     }
 
     private void StartSmokeTestTimer()
@@ -133,6 +148,26 @@ public partial class App : System.Windows.Application
             StopApplication();
         };
         _smokeTestTimer.Start();
+    }
+
+    private void StartEmergencyHotkey()
+    {
+        try
+        {
+            _globalHotkey = new GlobalHotkeyService(() => Dispatcher.BeginInvoke(StopApplication));
+            _globalHotkey.Start();
+            LogService.Info("紧急退出热键 Ctrl+Alt+Q 注册成功。");
+        }
+        catch (Exception exception)
+        {
+            _globalHotkey?.Dispose();
+            _globalHotkey = null;
+            LogService.Error("紧急退出热键 Ctrl+Alt+Q 注册失败。", exception);
+            _trayIcon?.ShowNotification(
+                "紧急热键注册失败",
+                "Ctrl+Alt+Q 不可用，请使用托盘左键菜单退出。",
+                3000);
+        }
     }
 
     private void RegisterGlobalExceptionHandlers()

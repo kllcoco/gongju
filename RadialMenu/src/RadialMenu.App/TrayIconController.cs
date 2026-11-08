@@ -6,6 +6,7 @@ namespace RadialMenu.App;
 internal sealed class TrayIconController : IDisposable
 {
     private readonly NotifyIcon _notifyIcon;
+    private readonly ContextMenuStrip _menu;
     private readonly ToolStripMenuItem _pauseItem;
     private readonly Action<bool> _setPaused;
     private bool _disposed;
@@ -19,18 +20,19 @@ internal sealed class TrayIconController : IDisposable
         var exitItem = new ToolStripMenuItem("退出");
         exitItem.Click += (_, _) => exit();
 
-        var menu = new ContextMenuStrip();
-        menu.Items.Add(_pauseItem);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(exitItem);
+        _menu = new ContextMenuStrip();
+        _menu.Items.Add(_pauseItem);
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(exitItem);
 
         _notifyIcon = new NotifyIcon
         {
             Text = "径向菜单（阶段 1）",
             Icon = SystemIcons.Application,
-            ContextMenuStrip = menu,
+            ContextMenuStrip = _menu,
             Visible = true
         };
+        _notifyIcon.MouseClick += OnMouseClick;
     }
 
     public void ShowNotification(string title, string message, int timeoutMilliseconds)
@@ -54,8 +56,9 @@ internal sealed class TrayIconController : IDisposable
         }
 
         _disposed = true;
+        _notifyIcon.MouseClick -= OnMouseClick;
         _notifyIcon.Visible = false;
-        _notifyIcon.ContextMenuStrip?.Dispose();
+        _menu.Dispose();
         _notifyIcon.Dispose();
     }
 
@@ -64,5 +67,13 @@ internal sealed class TrayIconController : IDisposable
         _pauseItem.Checked = !_pauseItem.Checked;
         _pauseItem.Text = _pauseItem.Checked ? "恢复监听" : "暂停监听";
         _setPaused(_pauseItem.Checked);
+    }
+
+    private void OnMouseClick(object? sender, MouseEventArgs e)
+    {
+        if (e.Button == MouseButtons.Left)
+        {
+            _menu.Show(Cursor.Position);
+        }
     }
 }
