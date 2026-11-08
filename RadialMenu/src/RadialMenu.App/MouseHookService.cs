@@ -80,7 +80,6 @@ internal sealed partial class MouseHookService : IDisposable
             if (!value)
             {
                 _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
-                _tracker.Cancel();
             }
         }
     }
@@ -180,12 +179,39 @@ internal sealed partial class MouseHookService : IDisposable
         }
 
         var mouse = Marshal.PtrToStructure<MsllHookStruct>(data);
-        if (mouse.ExtraInfo == InjectionMarker || !Enabled)
+        if (mouse.ExtraInfo == InjectionMarker)
         {
             return CallNextHookEx(_hookHandle, code, message, data);
         }
 
-        switch ((uint)message)
+        var mouseMessage = (uint)message;
+
+        // 已开始的手势必须完整收尾，不受暂停开关影响。否则切换暂停时可能向系统
+        // 泄漏不成对的右键消息，或漏掉移动超过 8px 的长按判定。
+        if (_tracker.IsTracking)
+        {
+            if (mouseMessage == WmRButtonUp)
+            {
+                return CompleteTrackedGesture();
+            }
+
+            if (mouseMessage == WmMouseMove)
+            {
+                return ObserveTrackedMovement(code, message, data, mouse);
+            }
+
+            if (mouseMessage == WmRButtonDown)
+            {
+                return 1;
+            }
+        }
+
+        if (!Enabled)
+        {
+            return CallNextHookEx(_hookHandle, code, message, data);
+        }
+
+        switch (mouseMessage)
         {
             case WmRButtonDown:
                 if (_tracker.TryBegin(
@@ -201,38 +227,37 @@ internal sealed partial class MouseHookService : IDisposable
                 // 同一次物理按下的重复消息也要扣住，避免系统看到不成对的右键事件。
                 return 1;
 
-            case WmMouseMove:
-                var transition = _tracker.ObserveMove(new ScreenPoint(mouse.Point.X, mouse.Point.Y));
-                if (transition.Started)
-                {
-                    _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
-                    TryQueue(new WorkerCommand(WorkerCommandKind.LongPressStarted, transition.Gesture));
-                }
-
-                return CallNextHookEx(_hookHandle, code, message, data);
-
-            case WmRButtonUp:
-                if (!_tracker.IsTracking)
-                {
-                    return CallNextHookEx(_hookHandle, code, message, data);
-                }
-
-                _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
-                var result = _tracker.End(Stopwatch.GetTimestamp());
-                if (result.Completion == GestureCompletion.ShortClick)
-                {
-                    TryQueue(new WorkerCommand(WorkerCommandKind.ReplayRightClick, result.Gesture));
-                }
-                else if (result.Completion == GestureCompletion.LongPress)
-                {
-                    TryQueue(new WorkerCommand(WorkerCommandKind.LongPressReleased, result.Gesture));
-                }
-
-                return 1;
-
             default:
                 return CallNextHookEx(_hookHandle, code, message, data);
         }
+    }
+
+    private nint ObserveTrackedMovement(int code, nuint message, nint data, MsllHookStruct mouse)
+    {
+        var transition = _tracker.ObserveMove(new ScreenPoint(mouse.Point.X, mouse.Point.Y));
+        if (transition.Started)
+        {
+            _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
+            TryQueue(new WorkerCommand(WorkerCommandKind.LongPressStarted, transition.Gesture));
+        }
+
+        return CallNextHookEx(_hookHandle, code, message, data);
+    }
+
+    private nint CompleteTrackedGesture()
+    {
+        _holdTimer.Change(Timeout.Infinite, Timeout.Infinite);
+        var result = _tracker.End(Stopwatch.GetTimestamp());
+        if (result.Completion == GestureCompletion.ShortClick)
+        {
+            TryQueue(new WorkerCommand(WorkerCommandKind.ReplayRightClick, result.Gesture));
+        }
+        else if (result.Completion == GestureCompletion.LongPress)
+        {
+            TryQueue(new WorkerCommand(WorkerCommandKind.LongPressReleased, result.Gesture));
+        }
+
+        return 1;
     }
 
     private void OnHoldTimer(object? state)
@@ -414,34 +439,34 @@ internal sealed partial class MouseHookService : IDisposable
         nint module,
         uint threadId);
 
-    [LibraryImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "UnhookWindowsHookEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool UnhookWindowsHookEx(nint hook);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", EntryPoint = "CallNextHookEx")]
     private static partial nint CallNextHookEx(nint hook, int code, nuint message, nint data);
 
-    [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "SendInput", SetLastError = true)]
     private static partial uint SendInput(uint count, [In] Input[] inputs, int size);
 
-    [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
+    [LibraryImport("user32.dll", EntryPoint = "WindowFromPoint")]
     private static partial nint WindowFromPoint(Point point);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool PostThreadMessage(uint threadId, uint message, nuint wParam, nint lParam);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
     private static partial int GetMessage(out Message message, nint window, uint minimum, uint maximum);
 
-    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
+    [LibraryImport("user32.dll", EntryPoint = "TranslateMessage")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool TranslateMessage(in Message message);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
     private static partial nint DispatchMessage(in Message message);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool PeekMessage(
         out Message message,
@@ -450,7 +475,7 @@ internal sealed partial class MouseHookService : IDisposable
         uint maximum,
         uint removeMessage);
 
-    [LibraryImport("kernel32.dll")]
+    [LibraryImport("kernel32.dll", EntryPoint = "GetCurrentThreadId")]
     private static partial uint GetCurrentThreadId();
 
     [LibraryImport("kernel32.dll", EntryPoint = "GetModuleHandleW", StringMarshalling = StringMarshalling.Utf16)]

@@ -7,6 +7,7 @@ public partial class App : System.Windows.Application
 {
     private MouseHookService? _mouseHook;
     private TrayIconController? _trayIcon;
+    private DispatcherTimer? _smokeTestTimer;
     private int _isStopping;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -26,6 +27,11 @@ public partial class App : System.Windows.Application
             _mouseHook.Start();
             _trayIcon.ShowNotification("径向菜单", "阶段 1 已运行：短按右键保持原生行为。", 1800);
             LogService.Info("程序启动，低级鼠标钩子安装成功。");
+
+            if (e.Args.Contains("--smoke-test", StringComparer.OrdinalIgnoreCase))
+            {
+                StartSmokeTestTimer();
+            }
         }
         catch (Exception exception)
         {
@@ -99,6 +105,9 @@ public partial class App : System.Windows.Application
 
     private void DisposeRuntimeResources()
     {
+        _smokeTestTimer?.Stop();
+        _smokeTestTimer = null;
+
         if (_mouseHook is not null)
         {
             _mouseHook.GestureObserved -= OnGestureObserved;
@@ -110,6 +119,20 @@ public partial class App : System.Windows.Application
         _trayIcon?.Dispose();
         _trayIcon = null;
         LogService.Info("程序退出，低级鼠标钩子已卸载。");
+    }
+
+    private void StartSmokeTestTimer()
+    {
+        _smokeTestTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(5)
+        };
+        _smokeTestTimer.Tick += (_, _) =>
+        {
+            LogService.Info("Windows 启动冒烟测试完成，准备正常退出。");
+            StopApplication();
+        };
+        _smokeTestTimer.Start();
     }
 
     private void RegisterGlobalExceptionHandlers()

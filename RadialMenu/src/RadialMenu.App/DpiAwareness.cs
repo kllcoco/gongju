@@ -16,7 +16,7 @@ internal static partial class DpiAwareness
         }
     }
 
-    [LibraryImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "SetProcessDpiAwarenessContext", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool SetProcessDpiAwarenessContext(nint value);
 }

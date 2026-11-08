@@ -44,3 +44,16 @@ dotnet build .\RadialMenu.sln -c Debug
 ```powershell
 dotnet test .\tests\RadialMenu.Core.Tests\RadialMenu.Core.Tests.csproj -c Release
 ```
+
+在 Windows 上运行时，上述命令还会执行原生入口点冒烟测试：它通过
+`NativeLibrary.Load` 和 `NativeLibrary.GetExport` 验证所有 `LibraryImport`
+声明使用的入口点。非 Windows 环境会明确将该项标记为跳过，不能视为完成了 Windows 冒烟测试。
+
+Windows 上可运行完整的阶段 1 启动冒烟测试：
+
+```powershell
+.\scripts\Test-Stage1Smoke.ps1
+```
+
+脚本会执行原生入口点测试，启动真实的 `RadialMenu.exe`，保留托盘图标约 5 秒，
+检查新日志中是否包含“低级鼠标钩子安装成功”和“低级鼠标钩子已卸载”，然后正常退出。
