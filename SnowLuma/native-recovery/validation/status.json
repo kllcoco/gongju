@@ -1,0 +1,22 @@
+{
+  "version": "2.4.0-native-recovery-candidate.2",
+  "date": "2026-11-11",
+  "platform": "Windows x64",
+  "build": "passed",
+  "repositoryBuildCmdEntry": "blocked before build: Windows PowerShell scripts disabled; policy unchanged",
+  "toolchainRestore": "passed: three required files matched bundled SHA-256 values",
+  "readonlyDifferentialTests": {"passed": 4, "invalidArgumentCases": 20},
+  "coreTests": {"passed": true, "randomizedFramingCases": 1000, "varintCases": 7, "malformedInputChecks": true, "snapshotUidAndIntegerCases": true, "originalHookTlsInspectionRegression": true},
+  "residentExceptionTests": "compiled, not run: existing Application Control block; no retry or bypass",
+  "residentAbiTests": "not run: Windows Application Control blocked resident_tests.exe",
+  "loaderIntegrationTests": "not run: Windows Application Control blocked fixture_host.exe before DLL loading",
+  "realQQTested": false,
+  "completeHookRebuilt": false,
+  "manualMapperSupportsOriginalHook": false,
+  "manualMapperLimitation": "Original Hook has 8 bytes static TLS; static TLS allocation is not implemented",
+  "decompiledRecognizedFunctions": {"injector": 1238, "hook": 1215, "resident": 481},
+  "decompilerOutputDirectlyCompilable": false,
+  "originalBinariesRequiredToBuild": false,
+  "originalBinariesRequiredForDifferentialTests": true,
+  "repositoryTarget": "kllcoco/gongju:SnowLuma/native-recovery"
+}

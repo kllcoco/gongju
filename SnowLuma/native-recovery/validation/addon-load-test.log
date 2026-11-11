@@ -1,0 +1,27 @@
+✖ rebuilt: ordinary load/unload runs attach, prepare and detach (1179.3677ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 0
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1434.4622
+
+✖ failing tests:
+
+test at outputs\SnowLuma-v2.4.0-native-recovery\tests\addon.test.cjs:47:2
+✖ rebuilt: ordinary load/unload runs attach, prepare and detach (1179.3677ms)
+  Error: spawn UNKNOWN
+      at ChildProcess.spawn (node:internal/child_process:487:11)
+      at spawn (node:child_process:813:9)
+      at host (C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\tests\addon.test.cjs:16:14)
+      at TestContext.<anonymous> (C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\tests\addon.test.cjs:48:17)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1402:25)
+      at Test.start (node:internal/test_runner/test:1262:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:387:17) {
+    errno: -4094,
+    code: 'UNKNOWN',
+    syscall: 'spawn'
+  }

@@ -1,0 +1,30 @@
+-- Selecting Windows SDK version 10.0.26100.0 to target Windows 10.0.26200.
+-- Configuring done (0.1s)
+-- Generating done (0.2s)
+-- Build files have been written to: C:/Users/HP/Documents/Codex/2026-11-10/snowluma-2/outputs/SnowLuma-v2.4.0-native-recovery/build
+MSBuild version 18.10.1-1.26427.6+3cd27c13e for .NET Framework
+
+  fixture_host.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\fixture_host.exe
+  fixture_module.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\fixture_module.dll
+  fixture_busy.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\fixture_busy.dll
+  resident.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\snowluma_windows_resident_dispatch.dll
+  pe_image.cpp
+  resident_tests.cpp
+  pe_image.cpp
+  resident_tests.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\resident_tests.exe
+     Creating library C:/Users/HP/Documents/Codex/2026-11-10/snowluma-2/outputs/SnowLuma-v2.4.0-native-recovery/build/Release/snowluma-win32-x64.lib and object C:/Users/HP/Documents/Codex/2026-11-10/snowluma-2/outputs/SnowLuma-v2.4.0-native-recovery/build/Release/snowluma-win32-x64.exp
+  injector.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\snowluma-win32-x64.node
+  hook_core.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\hook_core.lib
+  core_tests.vcxproj -> C:\Users\HP\Documents\Codex\2026-11-10\snowluma-2\outputs\SnowLuma-v2.4.0-native-recovery\build\Release\core_tests.exe
+✔ seven methods and property attributes match the original (3.537ms)
+✔ invalid arguments preserve Promise rejection and error messages (9.3769ms)
+✔ runtime integrity matches original in the same process (1.7172ms)
+✔ Restart Manager handles existing, missing and directory paths (253.8487ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 2016.0672

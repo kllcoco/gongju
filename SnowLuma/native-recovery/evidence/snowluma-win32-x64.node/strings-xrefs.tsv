@@ -1,0 +1,722 @@
+address	value	references
+18003c530	failed to export process enumerator	18000103d:180001010:napi_register_module_v1
+18003c554	getRuntimeIntegrityAsync	180009437:180009350:FUN_180009350;18003c5e0:data
+18003c56d	getFileHoldersAsync	180007768:1800072c0:FUN_1800072c0
+18003c581	loadModuleAsync	180001eff:180001a00:FUN_180001a00
+18003c591	loadModuleManualAsync	180002598:180002170:FUN_180002170
+18003c5a7	unloadModuleAsync	180002e26:180002920:FUN_180002920
+18003c5b9	unloadModuleManualAsync	1800036ca:1800030a0:FUN_1800030a0
+18003c760	Failed to export injector methods	180001098:180001010:napi_register_module_v1
+18003c782	getAllMainProcessAsync	1800011a1:1800010e0:FUN_1800010e0;1800011a8:1800010e0:FUN_1800010e0
+18003c868	failed to create process enumeration promise	180003b79:180003a80:FUN_180003a80
+18003c895	process enumeration	180003b9a:180003a80:FUN_180003a80
+18003c8a9	failed to schedule process enumeration	180003c66:180003a80:FUN_180003a80
+18003c8d0	process enumeration could not complete	180003dec:180003d70:FUN_180003d70
+18003c8f7	process enumeration failed with an unknown native exception	180003fe8:180003fd0:Catch_All@180003fd0
+18003c933	string too long	180004354:180004350:FUN_180004350
+18003c943	bad array new length	18000437d:180004370:FUN_180004370;180004384:180004370:FUN_180004370
+18003cad8	Unknown exception	1800044b7:1800044b0:FUN_1800044b0
+18003caea	CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) failed	180001715:180001230:FUN_180001230;18000171c:180001230:FUN_180001230
+18003cb2c	wrapper.node	1800012c2:180001230:FUN_180001230;180001450:180001230:FUN_180001230
+18003cbcc	unexpected native exception	18000575f:1800056d0:Catch_All@1800056d0;18000608a:180005fe0:Catch_All@180005fe0;18000660f:180006580:Catch_All@180006580;180007245:1800071b0:Catch_All@1800071b0;180008c6e:180008bd0:Catch_All@180008bd0;18000a909:18000a860:Catch_All@18000a860;180003061:180003040:Catch_All@180003040;18000a899:18000a860:Catch_All@18000a860;18000a8cf:18000a860:Catch_All@18000a860;18000189f:180001890:Catch_All@180001890;1800038bb:1800038a0:Catch_All@1800038a0;1800028ed:1800028d0:Catch_All@1800028d0;180002131:180002110:Catch_All@180002110;18000199f:180001990:Catch_All@180001990;1800071e2:1800071b0:Catch_All@1800071b0;180007210:1800071b0:Catch_All@1800071b0;180008c0b:180008bd0:Catch_All@180008bd0;180008c39:180008bd0:Catch_All@180008bd0;1800065af:180006580:Catch_All@180006580;1800065dd:180006580:Catch_All@180006580;1800056ff:1800056d0:Catch_All@1800056d0;18000572d:1800056d0:Catch_All@1800056d0;180006018:180005fe0:Catch_All@180005fe0;18000604f:180005fe0:Catch_All@180005fe0
+18003cbe8	loadModuleAsync(pid, dylibPath) requires 2 arguments	180001a99:180001a00:FUN_180001a00
+18003cc1d	pid must be a uint32	180001d27:180001a00:FUN_180001a00;180001d73:180001a00:FUN_180001a00;1800024bd:180002170:FUN_180002170;18000252c:180002170:FUN_180002170;180002c4e:180002920:FUN_180002920;180002c9a:180002920:FUN_180002920;180003385:1800030a0:FUN_1800030a0;1800033c0:1800030a0:FUN_1800030a0
+18003cc32	path must be a string	18000484f:180004790:FUN_180004790;1800049b2:180004790:FUN_180004790;1800047ec:180004790:FUN_180004790;1800048d6:180004790:FUN_180004790
+18003cc48	failed to create native work promise	1800036a7:1800030a0:FUN_1800030a0;180002c24:180002920:FUN_180002920;180002492:180002170:FUN_180002170;180001cfd:180001a00:FUN_180001a00;180007745:1800072c0:FUN_1800072c0;180009410:180009350:FUN_180009350
+18003cc6d	failed to schedule native work	18000375e:1800030a0:FUN_1800030a0;180002ebb:180002920:FUN_180002920;18000262c:180002170:FUN_180002170;180001f94:180001a00:FUN_180001a00;1800077fc:1800072c0:FUN_1800072c0;1800094ba:180009350:FUN_180009350
+18003cc8c	native work was cancelled	180006162:1800060b0:FUN_1800060b0;1800052b2:180005200:FUN_180005200;180005af4:180005a50:FUN_180005a50;18000a504:18000a460:FUN_18000a460;180006d2a:180006c90:FUN_180006c90;180007faa:180007eb0:FUN_180007eb0
+18003cca6	failed to encode native result	1800061f6:1800060b0:FUN_1800060b0;180005346:180005200:FUN_180005200;180005ba4:180005a50:FUN_180005a50;180005bc1:180005bb0:Catch_All@180005bb0;18000a5b4:18000a460:FUN_18000a460;180006dcc:180006c90:FUN_180006c90;1800084d6:1800084b0:Catch_All@1800084b0;18000a5d1:18000a5c0:Catch_All@18000a5c0;180006df1:180006de0:Catch_All@180006de0;180008351:180007eb0:FUN_180007eb0
+18003ccc5	component loading timed out [COMPONENT_LOAD_TIMEOUT]	180005479:180005390:FUN_180005390;180005487:180005390:FUN_180005390;180005d67:180005c60:FUN_180005c60;180005d75:180005c60:FUN_180005c60
+18003ccfa	component loading failed [COMPONENT_LOAD_FAILED]	1800058fa:180005780:FUN_180005780;180005480:180005390:FUN_180005390;180005d6e:180005c60:FUN_180005c60
+18003cd2b	component unloading timed out [COMPONENT_UNLOAD_TIMEOUT]	180006329:180006240:FUN_180006240;180006337:180006240:FUN_180006240;180006f5d:180006e90:FUN_180006e90;180006f6b:180006e90:FUN_180006e90
+18003cd64	component unloading failed [COMPONENT_UNLOAD_FAILED]	180006330:180006240:FUN_180006240;180006f64:180006e90:FUN_180006e90
+18003cd99	loadModuleManualAsync(pid, dylibPath) requires 2 arguments	180002216:180002170:FUN_180002170
+18003cdd9	entry	180003295:1800030a0:FUN_1800030a0;180005883:180005780:FUN_180005780
+18003cddf	exceptionTable	1800032b4:1800030a0:FUN_1800030a0;1800058a0:180005780:FUN_180005780
+18003cdee	prepare	1800032d3:1800030a0:FUN_1800030a0;1800058bd:180005780:FUN_180005780
+18003cdfb	unloadModuleAsync(pid, dylibPath) requires 2 arguments	1800029b9:180002920:FUN_180002920
+18003ce32	unloadModuleManualAsync(pid, handle) requires 2 arguments	180003144:1800030a0:FUN_1800030a0
+18003ce6c	handle.base must be nonzero	180003561:1800030a0:FUN_1800030a0;18000350c:1800030a0:FUN_1800030a0
+18003ce88	handle.size must be a uint32	180003538:1800030a0:FUN_1800030a0;18000335d:1800030a0:FUN_1800030a0
+18003cea5	 must be an unsigned 64-bit BigInt	1800067c3:180006680:FUN_180006680;180006787:180006680:FUN_180006680
+18003cf5c	getFileHoldersAsync(path) requires a non-empty path	180007381:1800072c0:FUN_1800072c0
+18003cf99	failed to encode file holder name	18000839c:180007eb0:FUN_180007eb0;1800083a3:180007eb0:FUN_180007eb0
+18003cfbb	GetFileAttributesW	1800089a8:180008630:FUN_180008630
+18003cfce	path must name a file	1800089cc:180008630:FUN_180008630;1800089d3:180008630:FUN_180008630
+18003cfe4	RmStartSession	1800086b2:180008630:FUN_180008630
+18003cff3	RmRegisterResources	180008704:180008630:FUN_180008630
+18003d007	RmGetList	180008729:180008630:FUN_180008630;1800087c2:180008630:FUN_180008630
+18003d011	file holders kept changing during RmGetList	180008975:180008630:FUN_180008630;18000897c:180008630:FUN_180008630
+18003d03d	 failed: 	18000b4f5:18000b4b0:FUN_18000b4b0;180008cdf:180008ca0:FUN_180008ca0
+18003d047	vector too long	180009334:180009330:FUN_180009330
+18003d057	executablePath	180009650:180009570:FUN_180009570
+18003d066	process	1800096ba:180009570:FUN_180009570
+18003d076	status	18000a0e3:18000a060:FUN_18000a060;180009749:180009570:FUN_180009570;18000a00f:180009e50:FUN_180009e50
+18003d081	error	18000a0b9:18000a060:FUN_18000a060
+18003d087	operation	18000a129:18000a060:FUN_18000a060
+18003d11c	bad variant access	18000a200:18000a200:FUN_18000a200
+18003d12f	inherited	180009f47:180009e50:FUN_180009e50
+18003d139	policy	180009f82:180009e50:FUN_180009e50
+18003d140	label	18000a031:180009e50:FUN_180009e50
+18003d146	GetModuleFileNameW	180009b6c:1800097d0:FUN_1800097d0;180009b7c:1800097d0:FUN_1800097d0;180009b56:1800097d0:FUN_1800097d0
+18003d159	OpenProcessToken	1800098a9:1800097d0:FUN_1800097d0;1800098b0:1800097d0:FUN_1800097d0
+18003d16a	GetTokenInformation	180009888:1800097d0:FUN_1800097d0;18000988f:1800097d0:FUN_1800097d0;180009995:1800097d0:FUN_1800097d0;18000999c:1800097d0:FUN_1800097d0;18000997b:1800097d0:FUN_1800097d0;180009982:1800097d0:FUN_1800097d0
+18003d17e	TokenIntegrityLevel.Sid	180009960:1800097d0:FUN_1800097d0;180009967:1800097d0:FUN_1800097d0
+18003d196	GetNamedSecurityInfoW	180009c13:1800097d0:FUN_1800097d0;180009b7c:1800097d0:FUN_1800097d0
+18003d1ac	IsValidAcl	180009d19:1800097d0:FUN_1800097d0
+18003d1b7	GetAce	180009d42:1800097d0:FUN_1800097d0
+18003d1be	SYSTEM_MANDATORY_LABEL_ACE.Sid	180009cad:1800097d0:FUN_1800097d0
+18003d207	BBad pid	
+18003d210	dll basename is empty	18000b006:18000a930:FUN_18000a930;18000afae:18000a930:FUN_18000a930
+18003d226	OpenProcess	18000b057:18000a930:FUN_18000a930;18000fd14:18000fc40:FUN_18000fc40;18000d203:18000ccb0:FUN_18000ccb0;18000ca4b:18000c7f0:FUN_18000c7f0
+18003d232	FreeLibrary	18000a9e5:18000a930:FUN_18000a930;18000ae9b:18000a930:FUN_18000a930
+18003d23e	kernel32.dll	18000a9d8:18000a930:FUN_18000a930;18000d376:18000ccb0:FUN_18000ccb0;18000c8c4:18000c7f0:FUN_18000c7f0
+18003d258	GetProcAddress(FreeLibrary) failed	18000b1a8:18000a930:FUN_18000a930;18000b13b:18000a930:FUN_18000a930
+18003d280	snowluma_prepare_unload_v1	18000ad7c:18000a930:FUN_18000a930;18000ad83:18000a930:FUN_18000a930;18000ed31:18000eb50:FUN_18000eb50;18000ed38:18000eb50:FUN_18000eb50;18000ed65:18000eb50:FUN_18000eb50
+18003d29b	Invalid prepare-unload export (image retained)	18000b230:18000a930:FUN_18000a930;18000b1f4:18000a930:FUN_18000a930
+18003d2ca	CreateRemoteThread	18000b269:18000a930:FUN_18000a930;18000cc2d:18000c7f0:FUN_18000c7f0
+18003d2dd	remote FreeLibrary returned 0	18000b381:18000a930:FUN_18000a930
+18003d2fb	Module not found in target process	18000b117:18000a930:FUN_18000a930
+18003d31e	dll path is empty	18000c9fd:18000c7f0:FUN_18000c7f0;18000cde3:18000ccb0:FUN_18000ccb0;18000cd98:18000ccb0:FUN_18000ccb0;18000c9b8:18000c7f0:FUN_18000c7f0
+18003d330	VirtualAllocEx	18000cace:18000c7f0:FUN_18000c7f0
+18003d33f	WriteProcessMemory	18000cb51:18000c7f0:FUN_18000c7f0
+18003d352	LoadLibraryW	18000c8d1:18000c7f0:FUN_18000c7f0;18000c92a:18000c7f0:FUN_18000c7f0
+18003d35f	GetProcAddress(LoadLibraryW) failed	18000cbca:18000c7f0:FUN_18000c7f0
+18003d383	LoadLibrary failed in target. Likely cause: bad path or missing dependencies of the DLL.	18000c994:18000c7f0:FUN_18000c7f0
+18003d3dc	Failed to open DLL file	18000ce9e:18000ccb0:FUN_18000ccb0;18000cd6a:18000ccb0:FUN_18000ccb0
+18003d3f4	DLL file is empty	18000d1a6:18000ccb0:FUN_18000ccb0;18000cf7b:18000ccb0:FUN_18000ccb0
+18003d406	Failed to read DLL file	18000d18e:18000ccb0:FUN_18000ccb0;18000cff4:18000ccb0:FUN_18000ccb0
+18003d41e	VirtualAllocEx(image)	18000d2a8:18000ccb0:FUN_18000ccb0
+18003d434	Section raw range out of bounds	18000d482:18000ccb0:FUN_18000ccb0
+18003d454	Section virtual range out of bounds	18000d4cd:18000ccb0:FUN_18000ccb0
+18003d478	Invalid prepare-unload export	18000d289:18000ccb0:FUN_18000ccb0
+18003d496	Image at non-preferred base but relocations are stripped	18000d5aa:18000ccb0:FUN_18000ccb0
+18003d4cf	Failed to apply base relocations	18000d50d:18000ccb0:FUN_18000ccb0
+18003d4f0	WriteProcessMemory(image)	18000d54a:18000ccb0:FUN_18000ccb0
+18003d50a	GetModuleHandleW(kernel32) failed	18000d5ee:18000ccb0:FUN_18000ccb0
+18003d52c	ntdll.dll	18000fea9:18000fc40:FUN_18000fc40;18000d38f:18000ccb0:FUN_18000ccb0
+18003d540	GetModuleHandleA	18000d3d0:18000ccb0:FUN_18000ccb0
+18003d551	GetProcAddress	18000d3ea:18000ccb0:FUN_18000ccb0
+18003d560	VirtualProtect	18000d3fd:18000ccb0:FUN_18000ccb0
+18003d56f	FlushInstructionCache	18000d410:18000ccb0:FUN_18000ccb0
+18003d585	RtlAddFunctionTable	18000d42c:18000ccb0:FUN_18000ccb0
+18003d599	Failed to resolve kernel32 helpers	18000d87c:18000ccb0:FUN_18000ccb0
+18003d5bc	VirtualAllocEx(stub)	18000d8bf:18000ccb0:FUN_18000ccb0
+18003d5d1	WriteProcessMemory(stub)	18000d94a:18000ccb0:FUN_18000ccb0
+18003d5ea	WriteProcessMemory(data)	18000dbc9:18000ccb0:FUN_18000ccb0
+18003d603	VirtualProtectEx(stub)	18000dc31:18000ccb0:FUN_18000ccb0
+18003d61a	CreateRemoteThread(stub)	18000dc9e:18000ccb0:FUN_18000ccb0
+18003d633	GetExitCodeThread(map)	18000da4d:18000ccb0:FUN_18000ccb0
+18003d64a	WaitForSingleObject(map)	18000dcc5:18000ccb0:FUN_18000ccb0
+18003d663	remote host exited during load	18000dd0c:18000ccb0:FUN_18000ccb0
+18003d682	remote load timed out after 15000 ms	18000dd05:18000ccb0:FUN_18000ccb0;18000dd13:18000ccb0:FUN_18000ccb0
+18003d6a7	crashed during import resolution (IAT fixup)	18000de60:18000ccb0:FUN_18000ccb0;18000dec2:18000ccb0:FUN_18000ccb0
+18003d6d4	crashed during per-section VirtualProtect / FlushInstructionCache	18000de30:18000ccb0:FUN_18000ccb0
+18003d716	crashed while registering .pdata via RtlAddFunctionTable	18000de29:18000ccb0:FUN_18000ccb0
+18003d74f	crashed in an IMAGE_DIRECTORY_ENTRY_TLS callback (DLL_PROCESS_ATTACH)	18000de52:18000ccb0:FUN_18000ccb0
+18003d795	crashed inside DllMain (likely CRT init / static ctors)	18000de70:18000ccb0:FUN_18000ccb0
+18003d7cd	crashed while zeroing PE headers	18000de84:18000ccb0:FUN_18000ccb0
+18003d7ee	GetModuleHandleA returned nullptr for an imported DLL	18000de79:18000ccb0:FUN_18000ccb0
+18003d824	GetProcAddress returned nullptr for an imported symbol	18000db6d:18000ccb0:FUN_18000ccb0
+18003d85b	DllMain returned FALSE	18000de47:18000ccb0:FUN_18000ccb0
+18003d872	stub never ran (no status stored)	18000de8f:18000ccb0:FUN_18000ccb0
+18003d894	unknown status code	18000de96:18000ccb0:FUN_18000ccb0
+18003d8a8	Manual map stub failed: 	18000deaf:18000ccb0:FUN_18000ccb0
+18003d8c1	 [exit=0x	18000deca:18000ccb0:FUN_18000ccb0
+18003d8cb	 status=0x	18000df01:18000ccb0:FUN_18000ccb0
+18003d8d8	ManualMapHandle::base is 0	18000feea:18000fc40:FUN_18000fc40;18000fce7:18000fc40:FUN_18000fc40
+18003d8f3	VirtualAllocEx(unload stub)	18000ff51:18000fc40:FUN_18000fc40
+18003d90f	WriteProcessMemory(unload stub)	18000fff2:18000fc40:FUN_18000fc40
+18003d92f	RtlDeleteFunctionTable	18000febf:18000fc40:FUN_18000fc40
+18003d946	WriteProcessMemory(unload data)	180010197:18000fc40:FUN_18000fc40
+18003d966	VirtualProtectEx(unload stub)	18001020d:18000fc40:FUN_18000fc40
+18003d984	CreateRemoteThread(unload)	180010281:18000fc40:FUN_18000fc40
+18003d99f	manual map unload	1800100de:18000fc40:FUN_18000fc40
+18003d9b1	VirtualFreeEx(image)	18001015e:18000fc40:FUN_18000fc40
+18003d9c6	CreateRemoteThread(prepare unload)	18000b7e4:18000b6c0:FUN_18000b6c0
+18003d9e9	prepare unload	18000b714:18000b6c0:FUN_18000b6c0
+18003d9f8	prepare unload (image retained)	18000b758:18000b6c0:FUN_18000b6c0
+18003da1a	GetExitCodeThread(	18000bd7a:18000b8f0:FUN_18000b8f0
+18003da2d	remote 	18000b9b6:18000b8f0:FUN_18000b8f0
+18003da35	 timed out after 	18000b9d0:18000b8f0:FUN_18000b8f0
+18003da4b	WaitForSingleObject(	18000bb03:18000b8f0:FUN_18000b8f0
+18003da60	 failed	18000bbc5:18000b8f0:FUN_18000b8f0
+18003da68	waiting for remote 	18000ba7b:18000b8f0:FUN_18000b8f0
+18003de58	invalid string position	180011824:180011820:FUN_180011820
+18003de71	bad locale name	180011aed:180011a60:FUN_180011a60
+18003e0c8	bad cast	180011a2d:180011a20:FUN_180011a20;180011a34:180011a20:FUN_180011a20
+18003e188	File too small for IMAGE_DOS_HEADER	18003a60d:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e1ac	Bad DOS magic (not a PE)	18003a5a3:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e1c5	e_lfanew out of range	18003a557:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e1db	Bad NT signature (not a PE)	18003a898:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e1f7	DLL is not 64-bit; manual mapper supports x64 only	18003a57d:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e22a	Image is not a DLL (missing IMAGE_FILE_DLL)	18003a625:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e256	PE optional header sizes are invalid	18003a619:18003a1fd:FUN_18003a1fd;18003a89f:18003a1fd:FUN_18003a1fd
+18003e498	ios_base::badbit set	18000e90d:18000e800:FUN_18000e800;18000f9d5:18000f830:FUN_18000f830;18000e2c6:18000e0b0:FUN_18000e0b0;1800133fa:1800132d0:FUN_1800132d0;18000f6aa:18000f3f0:FUN_18000f3f0;180012577:180012480:FUN_180012480;18000e6db:18000e550:FUN_18000e550;18000e688:18000e550:FUN_18000e550;180013626:1800135b0:FUN_1800135b0;18001270f:1800126a0:FUN_1800126a0;1800169d2:1800167b0:FUN_1800167b0
+18003e4ad	ios_base::failbit set	18000e900:18000e800:FUN_18000e800;18000f9c8:18000f830:FUN_18000f830;18000e2b8:18000e0b0:FUN_18000e0b0;1800133ed:1800132d0:FUN_1800132d0;18000f69b:18000f3f0:FUN_18000f3f0;180012569:180012480:FUN_180012480;18000e6ce:18000e550:FUN_18000e550;18000e67b:18000e550:FUN_18000e550;180013618:1800135b0:FUN_1800135b0;180012701:1800126a0:FUN_1800126a0;1800169c5:1800167b0:FUN_1800167b0
+18003e4c3	ios_base::eofbit set	18000e8f9:18000e800:FUN_18000e800;18000e936:18000e800:FUN_18000e800;18000f9c1:18000f830:FUN_18000f830;18000f9fe:18000f830:FUN_18000f830;18000e2b1:18000e0b0:FUN_18000e0b0;18000e2ef:18000e0b0:FUN_18000e0b0;1800133e6:1800132d0:FUN_1800132d0;180013423:1800132d0:FUN_1800132d0;18000f694:18000f3f0:FUN_18000f3f0;18000f6d3:18000f3f0:FUN_18000f3f0;180012562:180012480:FUN_180012480;18001259a:180012480:FUN_180012480;18000e6c7:18000e550:FUN_18000e550;18000e704:18000e550:FUN_18000e550;18000e674:18000e550:FUN_18000e550;18000e6ab:18000e550:FUN_18000e550;180013611:1800135b0:FUN_1800135b0;18001364f:1800135b0:FUN_1800135b0;1800126fa:1800126a0:FUN_1800126a0;180012734:1800126a0:FUN_1800126a0;1800169be:1800167b0:FUN_1800167b0;1800169f5:1800167b0:FUN_1800167b0
+18003e5b8	iostream	180012930:180012930:FUN_180012930
+18003e5d0	iostream stream error	180012988:180012940:FUN_180012940
+18003ea90	node.exe	180052478:data
+18003eaa0	KERNEL32.DLL	1800170bc:18001709c:FUN_18001709c
+18003eac0	AcquireSRWLockExclusive	1800170d6:18001709c:FUN_18001709c
+18003ead8	ReleaseSRWLockExclusive	1800170eb:18001709c:FUN_18001709c
+18003ec80	bad allocation	180017f8c:180017f8c:FUN_180017f8c;180017f9b:180017f8c:FUN_180017f8c
+18003ec90	bad array new length	180017fb0:180017fb0:FUN_180017fb0;180017fbf:180017fb0:FUN_180017fb0
+18003f4c0	success	1800190cf:1800190c0:FUN_1800190c0
+18003f4c8	address family not supported	1800190e3:1800190c0:FUN_1800190c0;18003efe8:data
+18003f4e8	address in use	
+18003f4f8	address not available	
+18003f510	already connected	
+18003f528	argument list too long	
+18003f540	argument out of domain	
+18003f558	bad address	
+18003f568	bad file descriptor	
+18003f580	bad message	
+18003f590	broken pipe	
+18003f5a0	connection aborted	
+18003f5b8	connection already in progress	
+18003f5d8	connection refused	
+18003f5f0	connection reset	
+18003f608	cross device link	
+18003f620	destination address required	
+18003f640	device or resource busy	
+18003f658	directory not empty	
+18003f670	executable format error	
+18003f688	file exists	
+18003f698	file too large	
+18003f6a8	filename too long	
+18003f6c0	function not supported	
+18003f6d8	host unreachable	
+18003f6f0	identifier removed	
+18003f708	illegal byte sequence	
+18003f720	inappropriate io control operation	
+18003f748	interrupted	
+18003f758	invalid argument	
+18003f770	invalid seek	
+18003f780	io error	
+18003f790	is a directory	
+18003f7a0	message size	
+18003f7b0	network down	
+18003f7c0	network reset	
+18003f7d0	network unreachable	
+18003f7e8	no buffer space	
+18003f7f8	no child process	
+18003f810	no link	
+18003f818	no lock available	
+18003f830	no message available	
+18003f848	no message	
+18003f858	no protocol option	
+18003f870	no space on device	
+18003f888	no stream resources	
+18003f8a0	no such device or address	
+18003f8c0	no such device	
+18003f8d0	no such file or directory	
+18003f8f0	no such process	
+18003f900	not a directory	
+18003f910	not a socket	
+18003f920	not a stream	
+18003f930	not connected	
+18003f940	not enough memory	
+18003f958	not supported	
+18003f968	operation canceled	
+18003f980	operation in progress	
+18003f998	operation not permitted	
+18003f9b0	operation not supported	
+18003f9c8	operation would block	
+18003f9e0	owner dead	
+18003f9f0	permission denied	
+18003fa08	protocol error	
+18003fa18	protocol not supported	
+18003fa30	read only file system	
+18003fa48	resource deadlock would occur	
+18003fa68	resource unavailable try again	
+18003fa88	result out of range	
+18003faa0	state not recoverable	
+18003fab8	stream timeout	
+18003fac8	text file busy	
+18003fad8	timed out	
+18003fae8	too many files open in system	
+18003fb08	too many files open	
+18003fb20	too many links	
+18003fb30	too many symbolic link levels	
+18003fb50	value too large	
+18003fb60	wrong protocol type	
+18003fb78	unknown error	1800190db:1800190c0:FUN_1800190c0
+18003fca8	w+bx	18003fc28:data
+1800422d0	0123456789abcdefghijklmnopqrstuvwxyz	
+180042320	0123456789abcdefghijklmnopqrstuvwxyz	
+1800424e8	bad exception	18001cfa8:18001cfa8:FUN_18001cfa8;18001cfb7:18001cfa8:FUN_18001cfa8
+180042c10	__based(	
+180042c20	__cdecl	
+180042c28	__stdcall	
+180042c38	__thiscall	
+180042c48	__fastcall	
+180042c58	__vectorcall	
+180042c68	__preserve_none	
+180042c78	__clrcall	
+180042c90	__swift_1	
+180042ca0	__swift_2	
+180042cb0	__swift_3	
+180042cc8	__restrict	
+180042cd8	__unaligned	
+180042ce8	restrict(	
+180042d00	 delete	
+180042d28	operator	
+180042da8	`vftable'	
+180042db8	`vbtable'	
+180042de0	`local static guard'	
+180042df8	`string'	
+180042e08	`vbase destructor'	
+180042e20	`vector deleting destructor'	
+180042e40	`default constructor closure'	
+180042e60	`scalar deleting destructor'	
+180042e80	`vector constructor iterator'	
+180042ea0	`vector destructor iterator'	
+180042ec0	`vector vbase constructor iterator'	
+180042ee8	`virtual displacement map'	
+180042f08	`eh vector constructor iterator'	
+180042f30	`eh vector destructor iterator'	
+180042f50	`eh vector vbase constructor iterator'	
+180042f78	`copy constructor closure'	
+180042f98	`udt returning'	
+180042fb8	`local vftable'	
+180042fc8	`local vftable constructor closure'	
+180042ff8	 delete[]	
+180043008	`omni callsig'	
+180043018	`placement delete closure'	
+180043038	`placement delete[] closure'	
+180043058	`managed vector constructor iterator'	
+180043080	`managed vector destructor iterator'	
+1800430a8	`eh vector copy constructor iterator'	
+1800430d0	`eh vector vbase copy constructor iterator'	
+180043100	`dynamic initializer for '	
+180043120	`dynamic atexit destructor for '	
+180043148	`vector copy constructor iterator'	
+180043170	`vector vbase copy constructor iterator'	
+1800431a0	`managed vector copy constructor iterator'	
+1800431d0	`local static thread guard'	
+1800431f0	operator "" 	
+180043200	operator co_await	
+180043218	operator<=>	
+180043228	 Type Descriptor'	
+180043240	 Base Class Descriptor at (	
+180043260	 Base Class Array'	
+180043278	 Class Hierarchy Descriptor'	
+180043298	 Complete Object Locator'	
+1800432b8	`anonymous namespace'	
+1800432e8	api-ms-win-core-fibers-l1-1-1	1800432d0:data
+180043328	api-ms-win-core-synch-l1-2-0	1800432d8:data;1800453e8:data
+180043368	kernel32	1800432e0:data;180045430:data
+180043380	api-ms-	18001e0f1:18001e04c:FUN_18001e04c;180028cb3:180028c20:FUN_180028c20
+180043398	FlsAlloc	18001e1a5:18001e19c:__vcrt_FlsAlloc;18001e1b5:18001e19c:__vcrt_FlsAlloc
+1800433b0	FlsFree	18001e1ec:18001e1e4:__vcrt_FlsFree;18001e1ff:18001e1e4:__vcrt_FlsFree
+1800433c0	FlsGetValue	18001e234:18001e22c:__vcrt_FlsGetValue;18001e247:18001e22c:__vcrt_FlsGetValue
+1800433d8	FlsSetValue	18001e281:18001e274:__vcrt_FlsSetValue;18001e28a:18001e274:__vcrt_FlsSetValue
+1800433f0	InitializeCriticalSectionEx	18001e2da:18001e2c8:__vcrt_InitializeCriticalSectionEx;18001e2ed:18001e2c8:__vcrt_InitializeCriticalSectionEx
+180043558	(null)	180022c9d:180022c40:FUN_180022c40;180022ca4:180022c40:FUN_180022c40
+180043568	(null)	180022cbb:180022c40:FUN_180022c40;180022cc2:180022c40:FUN_180022c40;18002283e:1800227dc:FUN_1800227dc;18002284a:1800227dc:FUN_1800227dc
+180043698	mscoree.dll	180023890:180023874:FUN_180023874
+1800436b0	CorExitProcess	1800238a8:180023874:FUN_180023874
+180044c70	LC_ALL	
+180044c80	LC_COLLATE	1800279f1:180027984:_wsetlocale_get_all;180027c3b:180027b70:FUN_180027b70;180027c57:180027b70:FUN_180027b70;180044bf8:data
+180044c98	LC_CTYPE	180027a8d:180027984:_wsetlocale_get_all;180027c3b:180027b70:FUN_180027b70;180044c10:data
+180044cb0	LC_MONETARY	180044c28:data
+180044cc8	LC_NUMERIC	180044c40:data
+180044ce0	LC_TIME	180044c58:data
+180044ffc	Sunday	180044d58:data
+180045004	Monday	180044d60:data
+180045010	Tuesday	180044d68:data
+180045018	Wednesday	180044d70:data
+180045028	Thursday	180044d78:data
+180045034	Friday	180044d80:data
+180045040	Saturday	180044d88:data
+180045080	January	180044df0:data
+180045088	February	180044df8:data
+180045094	March	180044e00:data
+18004509c	April	180044e08:data
+1800450b4	August	180044e28:data
+1800450c0	September	180044e30:data
+1800450d0	October	180044e38:data
+1800450d8	November	180044e40:data
+1800450e8	December	180044e48:data
+180045100	MM/dd/yy	180044e60:data
+180045110	dddd, MMMM dd, yyyy	180044e68:data
+180045128	HH:mm:ss	180044e70:data
+180045170	Sunday	180044eb8:data
+180045180	Monday	180044ec0:data
+180045190	Tuesday	180044ec8:data
+1800451a0	Wednesday	180044ed0:data
+1800451b8	Thursday	180044ed8:data
+1800451d0	Friday	180044ee0:data
+1800451e0	Saturday	180044ee8:data
+180045258	January	180044f50:data
+180045268	February	180044f58:data
+180045280	March	180044f60:data
+180045290	April	180044f68:data
+1800452a0	June	180044f78:data
+1800452b0	July	180044f80:data
+1800452c0	August	180044f88:data
+1800452d0	September	180044f90:data
+1800452e8	October	180044f98:data
+1800452f8	November	180044fa0:data
+180045310	December	180044fa8:data
+180045338	MM/dd/yy	180044fc0:data
+180045350	dddd, MMMM dd, yyyy	180044fc8:data
+180045378	HH:mm:ss	180044fd0:data
+180045390	en-US	180044fd8:data
+180045460	api-ms-win-core-datetime-l1-1-1	1800453a0:data
+1800454a0	api-ms-win-core-fibers-l1-1-2	1800453a8:data
+1800454e0	api-ms-win-core-file-l1-2-4	1800453b0:data
+180045518	api-ms-win-core-file-l1-2-2	1800453b8:data
+180045550	api-ms-win-core-file-l2-1-4	1800453c0:data
+180045590	api-ms-win-core-localization-l1-2-1	1800453c8:data
+1800455e0	api-ms-win-core-localization-obsolete-l1-2-0	1800453d0:data
+180045640	api-ms-win-core-processthreads-l1-1-2	1800453d8:data
+180045690	api-ms-win-core-string-l1-1-0	1800453e0:data
+1800456d0	api-ms-win-core-sysinfo-l1-2-1	1800453f0:data
+180045710	api-ms-win-core-winrt-l1-1-0	1800453f8:data
+180045750	api-ms-win-core-xstate-l2-1-0	180045400:data
+180045790	api-ms-win-rtcore-ntuser-window-l1-1-0	180045408:data
+1800457e0	api-ms-win-security-systemfunctions-l1-1-0	180045410:data
+180045840	ext-ms-win-ntuser-dialogbox-l1-1-0	180045418:data
+180045890	ext-ms-win-ntuser-windowstation-l1-1-0	180045420:data
+1800458e0	advapi32	180045428:data
+1800458f8	kernelbase	180045438:data
+180045910	ntdll	180045440:data
+180045920	api-ms-win-appmodel-runtime-l1-1-2	180045448:data
+180045968	user32	180045450:data
+180045978	ext-ms-	180028cc6:180028c20:FUN_180028c20
+180045990	AreFileApisANSI	1800292d4:1800292b4:FUN_1800292b4;180028e56:180028e30:FUN_180028e30
+1800459a8	CompareStringEx	180028c01:180028be8:FUN_180028be8;180028c14:180028be8:FUN_180028be8
+1800459c0	EnumSystemLocalesEx	1800292f1:1800292b4:FUN_1800292b4;1800292ff:1800292b4:FUN_1800292b4;180028eaa:180028e7c:FUN_180028e7c;180028eb8:180028e7c:FUN_180028e7c
+1800459e0	FlsGetValue2	1800294a6:18002948c:FUN_18002948c;1800294b4:18002948c:FUN_18002948c
+1800459f8	GetDateFormatEx	18002931a:1800292b4:FUN_1800292b4;180029328:1800292b4:FUN_1800292b4
+180045a10	GetLocaleInfoEx	180029343:1800292b4:FUN_1800292b4;180029351:1800292b4:FUN_1800292b4;180028f7d:180028f4c:FUN_180028f4c;180028f8b:180028f4c:FUN_180028f4c
+180045a28	GetTimeFormatEx	18002936c:1800292b4:FUN_1800292b4;18002937a:1800292b4:FUN_1800292b4
+180045a40	GetUserDefaultLocaleName	180029395:1800292b4:FUN_1800292b4;1800293a3:1800292b4:FUN_1800292b4;180029001:180028fe0:FUN_180028fe0;18002900f:180028fe0:FUN_180028fe0
+180045a68	IsValidLocaleName	180029073:180029058:FUN_180029058;180029081:180029058:FUN_180029058;1800293be:1800292b4:FUN_1800292b4;1800293cc:1800292b4:FUN_1800292b4
+180045a88	LCMapStringEx	180029179:180029148:FUN_180029148;180029187:180029148:FUN_180029148;1800293e7:1800292b4:FUN_1800292b4;1800293f5:1800292b4:FUN_1800292b4
+180045aa0	LCIDToLocaleName	1800290f1:1800290c0:FUN_1800290c0;1800290ff:1800290c0:FUN_1800290c0;180029410:1800292b4:FUN_1800292b4;18002941e:1800292b4:FUN_1800292b4
+180045ac0	LocaleNameToLCID	18002925d:18002923c:FUN_18002923c;18002926b:18002923c:FUN_18002923c;180029439:1800292b4:FUN_1800292b4;180029447:1800292b4:FUN_1800292b4
+180045ad8	AppPolicyGetProcessTerminationMethod	180028def:180028dd4:FUN_180028dd4;180028dfd:180028dd4:FUN_180028dd4
+180045d0c	log10	180038e34:180038e30:FUN_180038e30;180038e41:180038e30:FUN_180038e30
+180045d68	floor	
+180045dc0	_nextafter	
+180045e60	NAN(SNAN)	180045e10:data
+180045e70	nan(snan)	180045e20:data
+180045e80	NAN(IND)	180045e30:data
+180045e90	nan(ind)	180045e40:data
+180045e9c	e+000	18002d035:18002cf28:FUN_18002cf28
+180045ec8	ja-JP	18002f4d6:18002f358:FUN_18002f358;18002f5c1:18002f358:FUN_18002f358;180045ea8:data
+180045ed8	zh-CN	18002f4d6:18002f358:FUN_18002f358;18002f5c1:18002f358:FUN_18002f358;180045eb0:data
+180045ee8	ko-KR	18002f4d6:18002f358:FUN_18002f358;18002f5c1:18002f358:FUN_18002f358;180045eb8:data
+180045ef8	zh-TW	18002f4d6:18002f358:FUN_18002f358;18002f5c1:18002f358:FUN_18002f358;180045ec0:data
+180045f38	UTF-8	1800313e2:180031184:__acrt_stdio_parse_mode<wchar_t>
+180045f48	UTF-16LEUNICODE	180031401:180031184:__acrt_stdio_parse_mode<wchar_t>
+180046508	american	180045f70:data
+180046520	american english	
+180046548	american-english	
+180046570	australian	
+180046588	belgian	
+180046598	canadian	
+1800465c0	chinese	
+1800465d0	chinese-hongkong	
+1800465f8	chinese-simplified	
+180046620	chinese-singapore	
+180046648	chinese-traditional	
+180046670	dutch-belgian	
+180046690	english-american	
+1800466b8	english-aus	
+1800466d0	english-belize	
+1800466f0	english-can	
+180046708	english-caribbean	
+180046730	english-ire	
+180046748	english-jamaica	
+180046768	english-nz	
+180046780	english-south africa	
+1800467b0	english-trinidad y tobago	
+1800467e8	english-uk	
+180046800	english-us	
+180046818	english-usa	
+180046830	french-belgian	
+180046850	french-canadian	
+180046870	french-luxembourg	
+180046898	french-swiss	
+1800468b8	german-austrian	
+1800468d8	german-lichtenstein	
+180046900	german-luxembourg	
+180046928	german-swiss	
+180046948	irish-english	
+180046968	italian-swiss	
+180046988	norwegian	
+1800469a0	norwegian-bokmal	
+1800469c8	norwegian-nynorsk	
+1800469f0	portuguese-brazilian	
+180046a20	spanish-argentina	
+180046a48	spanish-bolivia	
+180046a68	spanish-chile	
+180046a88	spanish-colombia	
+180046ab0	spanish-costa rica	
+180046ad8	spanish-dominican republic	
+180046b10	spanish-ecuador	
+180046b30	spanish-el salvador	
+180046b58	spanish-guatemala	
+180046b80	spanish-honduras	
+180046ba8	spanish-mexican	
+180046bc8	spanish-modern	
+180046be8	spanish-nicaragua	
+180046c10	spanish-panama	
+180046c30	spanish-paraguay	
+180046c58	spanish-peru	
+180046c78	spanish-puerto rico	
+180046ca0	spanish-uruguay	
+180046cc0	spanish-venezuela	
+180046ce8	swedish-finland	
+180046d08	swiss	
+180046d30	america	180046390:data
+180046d40	britain	
+180046d50	china	
+180046d70	england	
+180046d80	great britain	
+180046da0	holland	
+180046db0	hong-kong	
+180046dc8	new-zealand	
+180046de8	pr china	
+180046e00	pr-china	
+180046e18	puerto-rico	
+180046e40	south africa	
+180046e60	south korea	
+180046e78	south-africa	
+180046e98	south-korea	
+180046eb0	trinidad & tobago	
+180046ed8	united-kingdom	
+180046ef8	united-states	
+180046f18	utf8	18003332d:1800332f8:FUN_1800332f8;1800336d1:1800334c0:FUN_1800334c0
+180046f30	utf-8	180033340:1800332f8:FUN_1800332f8
+180048000	de-DE	
+180048180	sl-SI	
+180048288	hi-IN	
+180048320	bn-IN	
+180048330	pa-IN	
+180048350	ta-IN	
+180048360	te-IN	
+180048370	kn-IN	
+1800483a0	sa-IN	
+180048450	de-CH	
+1800484d0	sr-SP-Latn	
+180048510	se-SE	
+180048578	de-AT	
+1800485b8	sr-SP-Cyrl	
+180048640	fr-CH	
+180048690	de-LI	
+1800486d0	bs-BA-Latn	
+180048738	sr-BA-Latn	
+180049950	bn-in	
+180049960	bs-ba-latn	
+1800499b8	de-at	
+1800499c8	de-ch	
+1800499d8	de-de	
+1800499e8	de-li	
+180049c98	fr-ch	
+180049d08	hi-in	
+180049dc8	kn-in	
+180049ef8	pa-in	
+180049f88	sa-in	
+180049fb8	se-se	
+180049fd8	sl-si	
+18004a070	sr-ba-latn	
+18004a088	sr-sp-cyrl	
+18004a0a0	sr-sp-latn	
+18004a0f8	ta-in	
+18004a108	te-in	
+18004a248	1#INF	180034f97:180034e14:FUN_180034e14
+18004a250	1#QNAN	180034f87:180034e14:FUN_180034e14
+18004a258	1#SNAN	180034f7e:180034e14:FUN_180034e14
+18004a260	1#IND	180034f5b:180034e14:FUN_180034e14
+18004a268	CONOUT$	180037b92:180037b70:__dcrt_lowio_ensure_console_output_initialized;180037c41:180037be0:__dcrt_write_console
+18004c414	.text$unlikely	
+18004c5b4	.rdata	
+18004c600	.rdata$voltmd	
+18004c73c	.edata	
+18004c79c	.data	
+18004c7f4	.pdata	
+18004c804	.fptable	
+180052b6c	injector_addon.node	180052b3c:data
+180052b80	napi_register_module_v1	180052b60:data
+180052b98	node_api_module_get_api_version_v1	180052b64:data
+18005300a	RmStartSession	
+18005301c	RmRegisterResources	
+180053032	RmGetList	
+18005303e	RmEndSession	
+18005304c	RstrtMgr.DLL	
+18005305c	OpenProcessToken	
+180053070	GetTokenInformation	
+180053086	IsValidSid	
+180053094	GetSidSubAuthorityCount	
+1800530ae	GetSidIdentifierAuthority	
+1800530ca	GetNamedSecurityInfoW	
+1800530e2	IsValidAcl	
+1800530f0	GetAce	
+1800530fa	GetSidSubAuthority	
+18005310e	ADVAPI32.dll	
+18005311e	CreateToolhelp32Snapshot	
+18005313a	Process32FirstW	
+18005314c	Process32NextW	
+18005315e	Module32FirstW	
+180053170	Module32NextW	
+180053180	CloseHandle	
+18005318e	WideCharToMultiByte	
+1800531a4	GetFileAttributesW	
+1800531ba	GetLastError	
+1800531ca	GetCurrentProcessId	
+1800531e0	GetCurrentProcess	
+1800531f4	GetModuleFileNameW	
+18005320a	LocalFree	
+180053216	OpenProcess	
+180053224	GetModuleHandleW	
+180053238	GetProcAddress	
+18005324a	ReadProcessMemory	
+18005325e	CreateRemoteThread	
+180053274	WaitForSingleObject	
+18005328a	GetExitCodeThread	
+18005329e	TerminateThread	
+1800532b0	VirtualAllocEx	
+1800532c2	WriteProcessMemory	
+1800532d8	VirtualFreeEx	
+1800532e8	RtlLookupFunctionEntry	
+180053302	GetSystemInfo	
+180053312	VirtualProtectEx	
+180053326	FlushInstructionCache	
+18005333e	GetExitCodeProcess	
+180053354	RaiseException	
+180053366	VirtualProtect	
+180053378	VirtualQuery	
+180053388	FreeLibrary	
+180053396	LoadLibraryExA	
+1800533a6	KERNEL32.dll	
+1800533b6	ReleaseSRWLockExclusive	
+1800533d0	AcquireSRWLockExclusive	
+1800533ea	WakeAllConditionVariable	
+180053406	SleepConditionVariableSRW	
+180053422	RtlCaptureContext	
+180053436	RtlVirtualUnwind	
+18005344a	UnhandledExceptionFilter	
+180053466	SetUnhandledExceptionFilter	
+180053484	TerminateProcess	
+180053498	IsProcessorFeaturePresent	
+1800534b4	IsDebuggerPresent	
+1800534c8	GetStartupInfoW	
+1800534da	QueryPerformanceCounter	
+1800534f4	GetCurrentThreadId	
+18005350a	GetSystemTimeAsFileTime	
+180053524	InitializeSListHead	
+18005353a	EncodePointer	
+18005354a	DecodePointer	
+18005355a	EnterCriticalSection	
+180053572	LeaveCriticalSection	
+18005358a	InitializeCriticalSectionEx	
+1800535a8	DeleteCriticalSection	
+1800535c0	MultiByteToWideChar	
+1800535d6	LCMapStringEx	
+1800535e6	GetStringTypeW	
+1800535f8	GetCPInfo	
+180053604	RtlUnwindEx	
+180053612	RtlPcToFileHeader	
+180053626	InterlockedFlushSList	
+18005363e	SetLastError	
+18005364e	InitializeCriticalSectionAndSpinCount	
+180053676	TlsAlloc	
+180053682	TlsGetValue	
+180053690	TlsSetValue	
+18005369e	TlsFree	
+1800536a8	LoadLibraryExW	
+1800536ba	ExitProcess	
+1800536c8	GetModuleHandleExW	
+1800536de	HeapFree	
+1800536ea	HeapAlloc	
+1800536f6	FlsAlloc	
+180053702	FlsGetValue	
+180053710	FlsSetValue	
+18005371e	FlsFree	
+180053728	LCMapStringW	
+180053738	GetLocaleInfoW	
+18005374a	IsValidLocale	
+18005375a	GetUserDefaultLCID	
+180053770	EnumSystemLocalesW	
+180053786	GetStdHandle	
+180053796	GetFileType	
+1800537a4	WriteFile	
+1800537b0	GetConsoleOutputCP	
+1800537c6	GetConsoleMode	
+1800537d8	GetFileSizeEx	
+1800537e8	SetFilePointerEx	
+1800537fc	ReadFile	
+180053808	ReadConsoleW	
+180053818	FlushFileBuffers	
+18005382c	FindClose	
+180053838	FindFirstFileExW	
+18005384c	FindNextFileW	
+18005385c	IsValidCodePage	
+18005386e	GetACP	
+180053878	GetOEMCP	
+180053884	GetCommandLineA	
+180053896	GetCommandLineW	
+1800538a8	GetEnvironmentStringsW	
+1800538c2	FreeEnvironmentStringsW	
+1800538dc	GetProcessHeap	
+1800538ee	HeapReAlloc	
+1800538fc	SetStdHandle	
+18005390c	HeapSize	
+180053918	CreateFileW	
+180053926	WriteConsoleW	
+180053936	SetEndOfFile	
+180053946	RtlUnwind	
+180054010	.?AV?$_Ref_count_obj2@UProcessEnumerator@addon@nnphook@@@std@@	
+180054060	.?AV_Ref_count_base@std@@	
+180054090	.?AVexception@std@@	
+1800540c0	.?AVbad_array_new_length@std@@	
+1800540f0	.?AVbad_alloc@std@@	
+180054120	.?AVruntime_error@std@@	
+180054150	.?AV?$_Ref_count_obj2@UAsyncEnvironment@addon@nnphook@@@std@@	
+1800541a0	.?AVbad_variant_access@std@@	
+1800541d0	.?AV?$basic_ifstream@DU?$char_traits@D@std@@@std@@	
+180054220	.?AV?$basic_istream@DU?$char_traits@D@std@@@std@@	
+180054270	.?AV?$basic_ios@DU?$char_traits@D@std@@@std@@	
+1800542b0	.?AVios_base@std@@	
+1800542e0	.?AV?$_Iosb@H@std@@	
+180054310	.?AV?$basic_filebuf@DU?$char_traits@D@std@@@std@@	
+180054360	.?AV?$basic_streambuf@DU?$char_traits@D@std@@@std@@	
+1800543b0	.?AV?$codecvt@DDU_Mbstatet@@@std@@	
+1800543f0	.?AVcodecvt_base@std@@	
+180054420	.?AVfacet@locale@std@@	
+180054450	.?AV_Facet_base@std@@	
+180054480	.?AU_Crt_new_delete@std@@	
+1800544b0	.?AVbad_cast@std@@	
+1800544e0	.?AV?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@	
+180054540	.?AV?$basic_ostream@DU?$char_traits@D@std@@@std@@	
+180054590	.?AV?$basic_stringbuf@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@	
+1800545f0	.?AVfailure@ios_base@std@@	
+180054620	.?AVsystem_error@std@@	
+180054650	.?AV_System_error@std@@	
+180054690	.?AV_Iostream_error_category2@std@@	
+1800546d0	.?AVerror_category@std@@	
+180054700	.?AV?$ctype@D@std@@	
+180054730	.?AUctype_base@std@@	
+180054760	.?AV?$num_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@	
+1800547c0	.?AV?$numpunct@D@std@@	
+180054f1a	abcdefghijklmnopqrstuvwxyz	
+180054f3a	ABCDEFGHIJKLMNOPQRSTUVWXYZ	
+180055141	abcdefghijklmnopqrstuvwxyz	
+180055161	ABCDEFGHIJKLMNOPQRSTUVWXYZ	
+1800554e0	.?AVlogic_error@std@@	
+180055508	.?AVlength_error@std@@	
+180055530	.?AVout_of_range@std@@	
+180055558	.?AVbad_exception@std@@	
+180055580	.?AVtype_info@@	
+1800555a0	.?AV_Locimp@locale@std@@	
+18005c060	<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\r\n<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>\r\n  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">\r\n    <security>\r\n      <requestedPrivileges>\r\n        <requestedExecutionLevel level='asInvoker' uiAccess='false' />\r\n      </requestedPrivileges>\r\n    </security>\r\n  </trustInfo>\r\n</assembly>\r\n	
+ff000002d0		
+ff000002ee		
+ff00001268		
+ff00001710	00000000-0000-0000-0000-000000000000	

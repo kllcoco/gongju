@@ -1,0 +1,284 @@
+address	value	references
+1800123b8	Unknown exception	180002965:180002960:FUN_180002960
+1800123e8	bad allocation	180002810:180002810:FUN_180002810;18000281f:180002810:FUN_180002810
+180012410	bad array new length	180002870:180002870:FUN_180002870;18000287f:180002870:FUN_180002870
+1800125b8	bad exception	180006288:180006288:FUN_180006288;180006297:180006288:FUN_180006288
+180012ce0	__based(	
+180012cf0	__cdecl	
+180012cf8	__stdcall	
+180012d08	__thiscall	
+180012d18	__fastcall	
+180012d28	__vectorcall	
+180012d38	__preserve_none	
+180012d48	__clrcall	
+180012d60	__swift_1	
+180012d70	__swift_2	
+180012d80	__swift_3	
+180012d98	__restrict	
+180012da8	__unaligned	
+180012db8	restrict(	
+180012dd0	 delete	
+180012df8	operator	
+180012e80	`vftable'	
+180012e90	`vbtable'	
+180012eb8	`local static guard'	
+180012ed0	`string'	
+180012ee0	`vbase destructor'	
+180012ef8	`vector deleting destructor'	
+180012f18	`default constructor closure'	
+180012f38	`scalar deleting destructor'	
+180012f58	`vector constructor iterator'	
+180012f78	`vector destructor iterator'	
+180012f98	`vector vbase constructor iterator'	
+180012fc0	`virtual displacement map'	
+180012fe0	`eh vector constructor iterator'	
+180013008	`eh vector destructor iterator'	
+180013028	`eh vector vbase constructor iterator'	
+180013050	`copy constructor closure'	
+180013070	`udt returning'	
+180013090	`local vftable'	
+1800130a0	`local vftable constructor closure'	
+1800130d0	 delete[]	
+1800130e0	`omni callsig'	
+1800130f0	`placement delete closure'	
+180013110	`placement delete[] closure'	
+180013130	`managed vector constructor iterator'	
+180013158	`managed vector destructor iterator'	
+180013180	`eh vector copy constructor iterator'	
+1800131a8	`eh vector vbase copy constructor iterator'	
+1800131d8	`dynamic initializer for '	
+1800131f8	`dynamic atexit destructor for '	
+180013220	`vector copy constructor iterator'	
+180013248	`vector vbase copy constructor iterator'	
+180013278	`managed vector copy constructor iterator'	
+1800132a8	`local static thread guard'	
+1800132c8	operator "" 	
+1800132d8	operator co_await	
+1800132f0	operator<=>	
+180013300	 Type Descriptor'	
+180013318	 Base Class Descriptor at (	
+180013338	 Base Class Array'	
+180013350	 Class Hierarchy Descriptor'	
+180013370	 Complete Object Locator'	
+180013390	`anonymous namespace'	
+1800133c0	api-ms-win-core-fibers-l1-1-1	1800133a8:data
+180013400	api-ms-win-core-synch-l1-2-0	1800133b0:data;1800139a8:data
+180013440	kernel32	1800133b8:data;1800139f0:data
+180013458	api-ms-	18000b38b:18000b2f8:FUN_18000b2f8;1800073d1:18000732c:FUN_18000732c
+180013470	FlsAlloc	180007485:18000747c:__vcrt_FlsAlloc;180007495:18000747c:__vcrt_FlsAlloc
+180013488	FlsFree	1800074cc:1800074c4:__vcrt_FlsFree;1800074df:1800074c4:__vcrt_FlsFree
+180013498	FlsGetValue	180007514:18000750c:__vcrt_FlsGetValue;180007527:18000750c:__vcrt_FlsGetValue
+1800134b0	FlsSetValue	180007561:180007554:__vcrt_FlsSetValue;18000756a:180007554:__vcrt_FlsSetValue
+1800134c8	InitializeCriticalSectionEx	1800075ba:1800075a8:__vcrt_InitializeCriticalSectionEx;1800075cd:1800075a8:__vcrt_InitializeCriticalSectionEx
+180013618	mscoree.dll	180007c70:180007c54:FUN_180007c54
+180013630	CorExitProcess	180007c88:180007c54:FUN_180007c54
+180013918	ja-JP	18000adce:18000ac50:FUN_18000ac50;18000aeb9:18000ac50:FUN_18000ac50;1800138f8:data
+180013928	zh-CN	18000adce:18000ac50:FUN_18000ac50;18000aeb9:18000ac50:FUN_18000ac50;180013900:data
+180013938	ko-KR	18000adce:18000ac50:FUN_18000ac50;18000aeb9:18000ac50:FUN_18000ac50;180013908:data
+180013948	zh-TW	18000adce:18000ac50:FUN_18000ac50;18000aeb9:18000ac50:FUN_18000ac50;180013910:data
+180013a20	api-ms-win-core-datetime-l1-1-1	180013960:data
+180013a60	api-ms-win-core-fibers-l1-1-2	180013968:data
+180013aa0	api-ms-win-core-file-l1-2-4	180013970:data
+180013ad8	api-ms-win-core-file-l1-2-2	180013978:data
+180013b10	api-ms-win-core-file-l2-1-4	180013980:data
+180013b50	api-ms-win-core-localization-l1-2-1	180013988:data
+180013ba0	api-ms-win-core-localization-obsolete-l1-2-0	180013990:data
+180013c00	api-ms-win-core-processthreads-l1-1-2	180013998:data
+180013c50	api-ms-win-core-string-l1-1-0	1800139a0:data
+180013c90	api-ms-win-core-sysinfo-l1-2-1	1800139b0:data
+180013cd0	api-ms-win-core-winrt-l1-1-0	1800139b8:data
+180013d10	api-ms-win-core-xstate-l2-1-0	1800139c0:data
+180013d50	api-ms-win-rtcore-ntuser-window-l1-1-0	1800139c8:data
+180013da0	api-ms-win-security-systemfunctions-l1-1-0	1800139d0:data
+180013e00	ext-ms-win-ntuser-dialogbox-l1-1-0	1800139d8:data
+180013e50	ext-ms-win-ntuser-windowstation-l1-1-0	1800139e0:data
+180013ea0	advapi32	1800139e8:data
+180013eb8	kernelbase	1800139f8:data
+180013ed0	ntdll	180013a00:data
+180013ee0	api-ms-win-appmodel-runtime-l1-1-2	180013a08:data
+180013f28	user32	180013a10:data
+180013f38	ext-ms-	18000b39e:18000b2f8:FUN_18000b2f8
+180013f50	AreFileApisANSI	18000b52e:18000b508:FUN_18000b508
+180013f68	FlsGetValue2	18000b72a:18000b710:FUN_18000b710;18000b738:18000b710:FUN_18000b710
+180013f80	LCMapStringEx	18000b5b9:18000b588:FUN_18000b588;18000b5c7:18000b588:FUN_18000b588
+180013f98	LocaleNameToLCID	18000b69d:18000b67c:FUN_18000b67c;18000b6ab:18000b67c:FUN_18000b67c
+180013fb0	AppPolicyGetProcessTerminationMethod	18000b4c7:18000b4ac:FUN_18000b4ac;18000b4d5:18000b4ac:FUN_18000b4ac
+1800142bc	Sunday	180014018:data
+1800142c4	Monday	180014020:data
+1800142d0	Tuesday	180014028:data
+1800142d8	Wednesday	180014030:data
+1800142e8	Thursday	180014038:data
+1800142f4	Friday	180014040:data
+180014300	Saturday	180014048:data
+180014340	January	1800140b0:data
+180014348	February	1800140b8:data
+180014354	March	1800140c0:data
+18001435c	April	1800140c8:data
+180014374	August	1800140e8:data
+180014380	September	1800140f0:data
+180014390	October	1800140f8:data
+180014398	November	180014100:data
+1800143a8	December	180014108:data
+1800143c0	MM/dd/yy	180014120:data
+1800143d0	dddd, MMMM dd, yyyy	180014128:data
+1800143e8	HH:mm:ss	180014130:data
+180014430	Sunday	180014178:data
+180014440	Monday	180014180:data
+180014450	Tuesday	180014188:data
+180014460	Wednesday	180014190:data
+180014478	Thursday	180014198:data
+180014490	Friday	1800141a0:data
+1800144a0	Saturday	1800141a8:data
+180014518	January	180014210:data
+180014528	February	180014218:data
+180014540	March	180014220:data
+180014550	April	180014228:data
+180014560	June	180014238:data
+180014570	July	180014240:data
+180014580	August	180014248:data
+180014590	September	180014250:data
+1800145a8	October	180014258:data
+1800145b8	November	180014260:data
+1800145d0	December	180014268:data
+1800145f8	MM/dd/yy	180014280:data
+180014610	dddd, MMMM dd, yyyy	180014288:data
+180014638	HH:mm:ss	180014290:data
+180014650	en-US	180014298:data
+180015d10	de-DE	
+180015e90	sl-SI	
+180015f98	hi-IN	
+180016030	bn-IN	
+180016040	pa-IN	
+180016060	ta-IN	
+180016070	te-IN	
+180016080	kn-IN	
+1800160b0	sa-IN	
+180016160	de-CH	
+1800161e0	sr-SP-Latn	
+180016220	se-SE	
+180016288	de-AT	
+1800162c8	sr-SP-Cyrl	
+180016350	fr-CH	
+1800163a0	de-LI	
+1800163e0	bs-BA-Latn	
+180016448	sr-BA-Latn	
+180017660	bn-in	
+180017670	bs-ba-latn	
+1800176c8	de-at	
+1800176d8	de-ch	
+1800176e8	de-de	
+1800176f8	de-li	
+1800179a8	fr-ch	
+180017a18	hi-in	
+180017ad8	kn-in	
+180017c08	pa-in	
+180017c98	sa-in	
+180017cc8	se-se	
+180017ce8	sl-si	
+180017d80	sr-ba-latn	
+180017d98	sr-sp-cyrl	
+180017db0	sr-sp-latn	
+180017e08	ta-in	
+180017e18	te-in	
+1800181d0	CONOUT$	18000f871:18000f810:__dcrt_write_console;18000f7c2:18000f7a0:__dcrt_lowio_ensure_console_output_initialized
+18001a274	.rdata	
+18001a2ac	.rdata$voltmd	
+18001a350	.edata	
+18001a3b0	.data	
+18001a3f4	.pdata	
+18001a404	.fptable	
+18001be62	snowluma_windows_resident_dispatch.dll	18001be3c:data
+18001be89	nnp_resident_dispatch_win	18001be5c:data
+18001c14a	AcquireSRWLockExclusive	
+18001c164	SetLastError	
+18001c174	ReleaseSRWLockExclusive	
+18001c18e	VirtualAlloc	
+18001c19e	VirtualProtect	
+18001c1b0	GetLastError	
+18001c1c0	VirtualFree	
+18001c1cc	KERNEL32.dll	
+18001c1dc	QueryPerformanceCounter	
+18001c1f6	GetCurrentProcessId	
+18001c20c	GetCurrentThreadId	
+18001c222	GetSystemTimeAsFileTime	
+18001c23c	InitializeSListHead	
+18001c252	RtlCaptureContext	
+18001c266	RtlLookupFunctionEntry	
+18001c280	RtlVirtualUnwind	
+18001c294	IsDebuggerPresent	
+18001c2a8	UnhandledExceptionFilter	
+18001c2c4	SetUnhandledExceptionFilter	
+18001c2e2	GetStartupInfoW	
+18001c2f4	IsProcessorFeaturePresent	
+18001c310	GetModuleHandleW	
+18001c324	RtlUnwindEx	
+18001c332	InterlockedFlushSList	
+18001c34a	RtlPcToFileHeader	
+18001c35e	RaiseException	
+18001c370	EncodePointer	
+18001c380	EnterCriticalSection	
+18001c398	LeaveCriticalSection	
+18001c3b0	DeleteCriticalSection	
+18001c3c8	InitializeCriticalSectionAndSpinCount	
+18001c3f0	TlsAlloc	
+18001c3fc	TlsGetValue	
+18001c40a	TlsSetValue	
+18001c418	TlsFree	
+18001c422	FreeLibrary	
+18001c430	GetProcAddress	
+18001c442	LoadLibraryExW	
+18001c454	GetCurrentProcess	
+18001c468	ExitProcess	
+18001c476	TerminateProcess	
+18001c48a	GetModuleHandleExW	
+18001c4a0	GetModuleFileNameW	
+18001c4b6	HeapFree	
+18001c4c2	HeapAlloc	
+18001c4ce	FindClose	
+18001c4da	FindFirstFileExW	
+18001c4ee	FindNextFileW	
+18001c4fe	IsValidCodePage	
+18001c510	GetACP	
+18001c51a	GetOEMCP	
+18001c526	GetCPInfo	
+18001c532	GetCommandLineA	
+18001c544	GetCommandLineW	
+18001c556	MultiByteToWideChar	
+18001c56c	WideCharToMultiByte	
+18001c582	GetEnvironmentStringsW	
+18001c59c	FreeEnvironmentStringsW	
+18001c5b6	FlsAlloc	
+18001c5c2	FlsGetValue	
+18001c5d0	FlsSetValue	
+18001c5de	FlsFree	
+18001c5e8	InitializeCriticalSectionEx	
+18001c606	LCMapStringW	
+18001c616	GetProcessHeap	
+18001c628	GetStdHandle	
+18001c638	GetFileType	
+18001c646	GetStringTypeW	
+18001c658	HeapSize	
+18001c664	HeapReAlloc	
+18001c672	SetStdHandle	
+18001c682	FlushFileBuffers	
+18001c696	WriteFile	
+18001c6a2	GetConsoleOutputCP	
+18001c6b8	GetConsoleMode	
+18001c6ca	SetFilePointerEx	
+18001c6de	CreateFileW	
+18001c6ec	CloseHandle	
+18001c6fa	WriteConsoleW	
+18001d27a	abcdefghijklmnopqrstuvwxyz	
+18001d29a	ABCDEFGHIJKLMNOPQRSTUVWXYZ	
+18001d4a1	abcdefghijklmnopqrstuvwxyz	
+18001d4c1	ABCDEFGHIJKLMNOPQRSTUVWXYZ	
+18001dab0	.?AVbad_alloc@std@@	
+18001dad8	.?AVexception@std@@	
+18001db00	.?AVbad_array_new_length@std@@	
+18001db30	.?AVbad_exception@std@@	
+18001db58	.?AVtype_info@@	
+180022060	<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\r\n<assembly xmlns='urn:schemas-microsoft-com:asm.v1' manifestVersion='1.0'>\r\n  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">\r\n    <security>\r\n      <requestedPrivileges>\r\n        <requestedExecutionLevel level='asInvoker' uiAccess='false' />\r\n      </requestedPrivileges>\r\n    </security>\r\n  </trustInfo>\r\n</assembly>\r\n	
+ff000002d0		
+ff000002ee		
+ff00001268		
+ff00001710	00000000-0000-0000-0000-000000000000	

@@ -1,0 +1,32 @@
+[
+  {
+    "TimeCreated": "2026-11-10T09:21:02.6363555+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\toolchain\\node.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\fixture_host.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  },
+  {
+    "TimeCreated": "2026-11-10T09:19:00.0379192+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\HP\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\powershell\\pwsh.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\resident_tests.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  },
+  {
+    "TimeCreated": "2026-11-10T09:18:59.7737782+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\HP\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\powershell\\pwsh.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\resident_tests.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  },
+  {
+    "TimeCreated": "2026-11-10T09:18:59.6573866+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Users\\HP\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\native\\powershell\\pwsh.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\resident_tests.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  },
+  {
+    "TimeCreated": "2026-11-10T09:18:27.040702+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\ctest.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\resident_tests.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  },
+  {
+    "TimeCreated": "2026-11-10T09:18:26.125745+02:00",
+    "Id": 3077,
+    "Message": "Code Integrity determined that a process (\\Device\\HarddiskVolume3\\Program Files (x86)\\Microsoft Visual Studio\\18\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\ctest.exe) attempted to load \\Device\\HarddiskVolume3\\Users\\HP\\Documents\\Codex\\2026-11-10\\snowluma-2\\outputs\\SnowLuma-v2.4.0-native-recovery\\build\\Release\\resident_tests.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6})."
+  }
+]
