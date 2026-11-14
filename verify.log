@@ -1,0 +1,36 @@
+Verifies
+Verified using v1 scheme (JAR signing): false
+Verified using v2 scheme (APK Signature Scheme v2): true
+Verified using v3 scheme (APK Signature Scheme v3): false
+Verified using v3.1 scheme (APK Signature Scheme v3.1): false
+Verified using v3.2 scheme (APK Signature Scheme v3.2): false
+Verified using v4 scheme (APK Signature Scheme v4): false
+Verified for SourceStamp: false
+Number of signers: 1
+V2 Signer: certificate DN: CN=Android Debug, O=Android, C=US
+V2 Signer: certificate SHA-256 digest: a02ef72e765dfef1b6d2a755d84bd7d5908720eb5639e80a1733dd92e67a3f0f
+V2 Signer: certificate SHA-1 digest: 0a16c764c836b7e660e1f12c123d97872923d237
+V2 Signer: certificate MD5 digest: e9b567401bc399fad6331f3b9cb60f1d
+V2 Signer: key algorithm: RSA
+V2 Signer: key size (bits): 2048
+V2 Signer: public key SHA-256 digest: 014db342bead22daf442a9a416e5fb4e694cdc46afc480c6c224f7458ab4e58e
+V2 Signer: public key SHA-1 digest: 4add7fa4d3e602106eb76b038423e53ee1939396
+V2 Signer: public key MD5 digest: fd761d954c5aff1d59f56a142feddd07
+package: name='cn.llmjourney.dict' versionCode='1' versionName='1.0.1' platformBuildVersionName='14' platformBuildVersionCode='34' compileSdkVersion='34' compileSdkVersionCodename='14'
+minSdkVersion:'29'
+targetSdkVersion:'34'
+application-label:'大模型字典'
+application-icon-160:'res/BW.xml'
+application-icon-65534:'res/BW.xml'
+application: label='大模型字典' icon='res/BW.xml'
+launchable-activity: name='cn.llmjourney.dict.MainActivity'  label='' icon=''
+feature-group: label=''
+  uses-feature: name='android.hardware.faketouch'
+  uses-implied-feature: name='android.hardware.faketouch' reason='default feature for all apps'
+main
+supports-screens: 'small' 'normal' 'large' 'xlarge'
+supports-any-density: 'true'
+locales: '--_--'
+densities: '160' '65534'
+94
+ba230fff75bd109673aaabb759e1232a3e3dd226491b2b155d6c9c4aa55ec938  /home/runner/work/gongju/gongju/llm-dict.apk
