@@ -17,6 +17,7 @@ var S = { q: '', showN: 30, tq: '', fs: store.get('fs', 1), theme: store.get('th
 var FS = [['小', 15], ['标准', 17], ['大', 19], ['特大', 21]];
 function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
 function norm(s) { try { s = s.normalize('NFKC'); } catch (e) {} return s.toLowerCase(); }
+function optL(l, c) { return /^(ex|ans|why|goal|fast|app)$/.test(l.kind) || (c && !/^\d+$/.test(c.n)); }
 function chLabel(c) { return /^\d+$/.test(c.n) ? '第 ' + c.n + ' 章' : '附录 ' + c.n; }
 function splitNo(t) { var m = /^([0-9A-G]+(?:\.\d+)+)\s+(.*)$/.exec(t); return m ? [m[1], m[2]] : ['', t]; }
 function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toast.t); toast.t = setTimeout(function () { toastEl.classList.remove('show'); }, 1400); }
@@ -514,24 +515,25 @@ function lno(l) { return l.kind === 'kp' ? l.no : ''; }
 function pageCourse(isBack) {
   setBar({ title: '<b>课程</b>' });
   var nx = nextLesson(), due = dueQuizzes().length, html = '';
-  if (nx) html += '<button class="cta" data-go="l/' + nx.l.no + '"><small>' + (Object.keys(CDONE).length ? '接着学' : '从这里开始') + '</small>' + (lno(nx.l) ? lno(nx.l) + '　' : '第 ' + nx.c.n + ' 章　') + esc(nx.l.t) + '</button>';
+  if (nx) html += '<button class="cta" data-go="l/' + nx.l.no + '"><small>' + (Object.keys(CDONE).length ? '接着学' : '从这里开始') + '</small>' + (lno(nx.l) ? lno(nx.l) + '　' : chLabel(nx.c) + '　') + esc(nx.l.t) + '</button>';
   else html += '<p class="note" style="padding-top:16px">这几章都学完了。</p>';
   if (due) html += '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>';
   var X = D.exams, fdone = X.final.filter(function (p) { return (EX[p.id] || {}).done; }).length;
-  html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return L.l.kind === 'ex' || L.l.kind === 'ans' || CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
+  html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return optL(L.l, L.c) || CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
   var lastP = -1;
   D.course.forEach(function (c) {
     var d = c.lessons.filter(function (l) { return CDONE[l.no]; }).length, pi = -1;
     D.parts.forEach(function (p, k) { if (+c.n >= p[2] && +c.n <= p[3]) pi = k; });
-    if (pi !== lastP && pi >= 0) { lastP = pi; html += '<div class="sh" style="position:static">第' + D.parts[pi][0] + '篇　' + esc(D.parts[pi][1]) + '</div>'; }
-    html += '<button class="row" data-go="cc/' + c.n + '"><span class="t"><span class="no">第 ' + c.n + ' 章</span>' + esc(c.t) + '</span><span class="m">' + d + ' / ' + c.lessons.length + ' 课' + bar2(d, c.lessons.length) + '</span></button>';
+    if (!/^\d+$/.test(c.n)) pi = 99;
+    if (pi !== lastP && pi >= 0) { lastP = pi; html += '<div class="sh" style="position:static">' + (pi === 99 ? '附录与进阶（不影响解锁卷子）' : '第' + D.parts[pi][0] + '篇　' + esc(D.parts[pi][1])) + '</div>'; }
+    html += '<button class="row" data-go="cc/' + c.n + '"><span class="t"><span class="no">' + chLabel(c) + '</span>' + esc(c.t) + '</span><span class="m">' + d + ' / ' + c.lessons.length + ' 课' + bar2(d, c.lessons.length) + '</span></button>';
   });
-  html += '<p class="note" style="margin-top:16px">全书 ' + D.course.length + ' 章，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。紫色的“补充”不是教材原文，是小白试读以后加的提示：在哪敲、缺什么文件、屏幕上应该看到什么，以及课文里的笔误。每章学完会开启这一章的阶段密封卷。</p>';
+  html += '<p class="note" style="margin-top:16px">全书 ' + D.course.filter(function (c) { return /^\d+$/.test(c.n); }).length + ' 章加 ' + D.course.filter(function (c) { return !/^\d+$/.test(c.n); }).length + ' 个附录，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。紫色的“补充”不是教材原文，是小白试读以后加的提示：在哪敲、缺什么文件、屏幕上应该看到什么，以及课文里的笔误。每章学完会开启这一章的阶段密封卷。</p>';
   show('<div class="rows0">' + html + '</div>', isBack);
 }
 function pageCourseCh(isBack, n) {
   var c = null; D.course.forEach(function (x) { if (x.n === n) c = x; }); if (!c) return nav('course', true);
-  setBar({ back: true, title: '第 ' + c.n + ' 章' });
+  setBar({ back: true, title: chLabel(c) });
   var html = '<h1 class="ct">' + esc(c.t) + '</h1><p class="note" style="margin-top:6px">' + esc(c.intro) + '</p>' + (c.gl && c.gl.length ? '<div class="item gl"><div class="glb" hidden>' + c.gl.map(function (g) { return '<p><b>' + esc(g[0]) + '</b>　' + esc(g[1]) + '</p>'; }).join('') + '</div><button class="tog" data-act="tog" data-t="这一章会碰到的词（' + c.gl.length + ' 个，每个一句话）">这一章会碰到的词（' + c.gl.length + ' 个，每个一句话）</button></div>' : '') + '<div class="sh" style="position:static">这一章的地图</div><div class="tree">';
   c.lessons.forEach(function (l) {
     html += '<button class="lz' + (CDONE[l.no] ? ' done' : '') + '" data-go="l/' + l.no + '">' + (lno(l) ? '<span class="no">' + l.no + '</span>' : '') + '<span class="lt">' + esc(l.t) + '</span><span class="ck">' + (CDONE[l.no] ? '学过了' : l.p.length + ' 个点') + '</span></button>' +
@@ -559,13 +561,13 @@ function blocksHtml(bl, st) {
 }
 function pageLesson(isBack, no) {
   var L = LESSONS[LIDX[no]]; if (!L) return nav('course', true);
-  setBar({ back: true, title: '第 ' + L.c.n + ' 章　' + esc(L.c.t), aa: true });
+  setBar({ back: true, title: chLabel(L.c) + '　' + esc(L.c.t), aa: true });
   var want = top();
   loadK(L.c.n, function (kd) {
     if (top() !== want) return;
     var d = kd ? kd.lessons[L.k] : null;
     if (!d) { show('<div class="empty"><b>这一课没有打开</b>返回再点一次。</div>', false); return; }
-    var st = { no: no, n: 0 }, html = '<article class="entry lesson' + (TERSE ? ' terse' : '') + '"><div class="crumb">' + esc(lno(L.l) || '第 ' + L.c.n + ' 章') + '</div><h1 class="hw">' + esc(d.t) + '</h1>' + (d.intro ? '<p class="why">' + esc(d.intro) + '</p>' : '');
+    var st = { no: no, n: 0 }, html = '<article class="entry lesson' + (TERSE ? ' terse' : '') + '"><div class="crumb">' + esc(lno(L.l) || chLabel(L.c)) + '</div><h1 class="hw">' + esc(d.t) + '</h1>' + (d.intro ? '<p class="why">' + esc(d.intro) + '</p>' : '');
     html += '<div class="seg" style="margin-top:14px;width:max-content"><button data-act="terse" data-v="0" class="' + (TERSE ? '' : 'on') + '">完整讲解</button><button data-act="terse" data-v="1" class="' + (TERSE ? 'on' : '') + '">只看要点</button></div>';
     if (d.pts.length > 1) html += '<div class="toc2"><div class="cap" style="margin:0 0 4px">这一课有 ' + d.pts.length + ' 部分</div>' + d.pts.map(function (p, k) { return '<button data-act="jump" data-to="pt-' + k + '">' + (k + 1) + '. ' + esc(p.t) + '</button>'; }).join('') + '</div>';
     if (d.lead.length) html += '<div style="margin-top:18px">' + blocksHtml(d.lead, st) + '</div>';
@@ -581,7 +583,7 @@ function pageLesson(isBack, no) {
 }
 function finHtml(L) {
   var i = LIDX[L.l.no], nx = LESSONS[i + 1], due = dueQuizzes().length;
-  function nm(x) { return (lno(x.l) ? lno(x.l) + '　' : (x.c !== L.c ? '第 ' + x.c.n + ' 章　' : '')) + esc(x.l.t); }
+  function nm(x) { return (lno(x.l) ? lno(x.l) + '　' : (x.c !== L.c ? chLabel(x.c) + '　' : '')) + esc(x.l.t); }
   if (!CDONE[L.l.no]) return '<button class="cta" data-act="done" data-no="' + L.l.no + '"><small>都看懂了，“想一想”也答过了</small>学完这一课</button>';
   return '<p class="note" style="margin-top:24px">这一课已经学过了。</p>' + (due ? '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>' : '') + (nx ? '<button class="cta" data-go="l/' + nx.l.no + '" data-rep="1"><small>下一课</small>' + nm(nx) + '</button>' : '<button class="cta" data-go="course" data-rep="1"><small>这几章都学完了</small>回到课程</button>');
 }
@@ -606,13 +608,13 @@ function xPaper(id) { try { return JSON.parse(decodeURIComponent(escape(atob(XD[
 function xInfo(id) {
   var X = D.exams, r = null, AB = 'ABCDEF';
   Object.keys(X.stage).forEach(function (ch) { X.stage[ch].forEach(function (p, j) {
-    if (p.id !== id) return; var c = courseCh(ch), left = c ? c.lessons.filter(function (l) { return l.kind !== 'ex' && l.kind !== 'ans' && !CDONE[l.no]; }).length : 1;
+    if (p.id !== id) return; var c = courseCh(ch), left = c ? c.lessons.filter(function (l) { return !optL(l, c) && !CDONE[l.no]; }).length : 1;
     r = { p: p, name: '第 ' + ch + ' 章　阶段卷 ' + AB[j], open: true, why: '', next: X.stage[ch][j + 1], home: 'cc/' + ch };
     if (left) { r.open = false; r.why = '学完第 ' + ch + ' 章才开启，还差 ' + left + ' 课'; }
     else if (j && !(EX[X.stage[ch][j - 1].id] || {}).done) { r.open = false; r.why = '做完阶段卷 ' + AB[j - 1] + ' 才开启'; }
   }); });
   X.final.forEach(function (p, j) {
-    if (p.id !== id) return; var left = LESSONS.filter(function (L) { return L.l.kind !== 'ex' && L.l.kind !== 'ans' && !CDONE[L.l.no]; }).length;
+    if (p.id !== id) return; var left = LESSONS.filter(function (L) { return !optL(L.l, L.c) && !CDONE[L.l.no]; }).length;
     r = { p: p, name: '结业卷　第 ' + (j + 1) + ' 套', open: true, why: '', next: X.final[j + 1], home: 'fx' };
     if (left) { r.open = false; r.why = '学完第 91 章才开启，还差 ' + left + ' 课'; }
     else if (j && !(EX[X.final[j - 1].id] || {}).done) { r.open = false; r.why = '做完第 ' + j + ' 套才开启'; }
