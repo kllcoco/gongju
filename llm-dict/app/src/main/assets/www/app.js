@@ -99,8 +99,11 @@ function hit(text, w, word) {
   while (p >= 0) { var b = p > 0 ? text.charCodeAt(p - 1) : 32, okb = !(b >= 97 && b <= 122) && !(b >= 48 && b <= 57); if (okb) { var a = text.charCodeAt(p + w.length); if (!(a >= 97 && a <= 122) || w.length >= 4) return 2; } p = text.indexOf(w, p + 1); }
   return 1;
 }
+var OPTQ = /^(--?[A-Za-z0-9+][A-Za-z0-9_\-]*|-)$/;
 function parseQ(q) {
-  var raw = norm(q).trim(), groups = [], nums = [];
+  var opts = [], rest = [];
+  String(q).replace(/[\uFF01-\uFF5E]/g, function (c) { return String.fromCharCode(c.charCodeAt(0) - 0xFEE0); }).replace(/\u3000/g, ' ').trim().split(/\s+/).forEach(function (t, k, arr) { if (OPTQ.test(t) && (t !== '-' || arr.length > 1) || (t === '--' && arr.length > 1)) opts.push(t); else if (t) rest.push(t); });
+  var raw = norm(rest.join(' ')).trim(), groups = [], nums = [];
   raw.split(/\s+/).forEach(function (tok) {
     if (!tok) return;
     (tok.match(/[一-鿿]+|[^一-鿿]+/g) || []).forEach(function (w) {
@@ -127,7 +130,7 @@ function parseQ(q) {
     if (/\d[+\-*\/=]\d/.test(g.w)) g.alts.push(g.w.replace(/([+\-*\/=])/g, ' $1 '));
   });
   if (groups.length > 1 && ALIAS[whole]) { var g2 = { w: whole, alts: [whole], wholeOnly: 1 }; ALIAS[whole].slice(0, 2).forEach(function (ti) { TA[ti][1].concat(TA[ti][0]).slice(0, 3).forEach(function (a) { if (g2.alts.indexOf(a) < 0) g2.alts.push(a); }); }); groups = [g2]; }
-  return { raw: raw, groups: groups, nums: nums };
+  return { raw: raw, groups: groups, nums: nums, opts: opts };
 }
 function scoreAlt(i, w, word) {
   var k, cov, sc = 0;
@@ -143,8 +146,16 @@ function scoreAlt(i, w, word) {
   if (sc >= 28 && hit(CHL[i], w, word) === 2) sc += 8 + (FSEC[i] ? 22 : 0) + (FSEC[i] && FIRST[i] ? 6 : 0);
   return [sc, 0];
 }
+var EO = {}; (function () { for (var k in D.eo) EO[k] = ' ' + D.eo[k] + ' '; })();
+/* 词条里有没有这个选项：40=原样出现 25=合写在一串字母里（-lt 里的 -t） 0=没有 */
+function optIn(i, o) {
+  var s = EO[i]; if (!s) return o === '-' ? 1 : 0;
+  if (s.indexOf(' ' + o + ' ') >= 0) return 40;
+  if (/^-[A-Za-z0-9]$/.test(o) && new RegExp(' -[A-Za-z]*' + o.charAt(1) + '[A-Za-z]* ').test(s.replace(/ -[A-Za-z]{6,} /g, ' '))) return 25;
+  return 0;
+}
 function runSearch(P) {
-  var out = [], G = P.groups, i, j, a;
+  var out = [], G = P.groups, i, j, a, O = P.opts || [];
   for (i = 0; i < E.length; i++) {
     if (E[i][3] !== 'kp') continue;
     var total = 0, where = 0, ok = true;
@@ -152,6 +163,7 @@ function runSearch(P) {
       for (j = 0; j < P.nums.length; j++) { var nq = P.nums[j], no = NO[i]; if (no === nq) total += 200; else if (no.indexOf(nq + '.') === 0) total += 150; else if (SECN[i][0] === nq) total += 120; else { ok = false; break; } }
       if (!ok) continue;
     }
+    for (j = 0; j < O.length && ok; j++) { var os = optIn(i, O[j]); if (!os) ok = false; else total += os; }
     for (j = 0; j < G.length && ok; j++) {
       var best = null;
       for (a = 0; a < G[j].alts.length; a++) { var w = G[j].alts[a], r = scoreAlt(i, w, isWord(w)); if (r) { var v = r[0] * (a ? 0.9 : 1); if (!best || v > best[0]) best = [v, r[1]]; } }
@@ -167,18 +179,19 @@ var VOCAB = null;
 function vocab() { if (VOCAB) return VOCAB; var set = {}; NAMEL.concat(SECL).forEach(function (t) { (t.match(/[a-z][a-z0-9]{2,}/g) || []).forEach(function (w) { set[w] = 1; }); }); Object.keys(ALIAS).forEach(function (w) { if (isWord(w) && w.length > 2) set[w] = 1; }); return (VOCAB = Object.keys(set)); }
 function search(q) {
   var P = parseQ(q), res = { terms: [], ents: [], near: false, ts: [] };
-  if (!P.groups.length && !P.nums.length) return res;
-  P.groups.forEach(function (g) { g.alts.forEach(function (a) { res.ts.push(a); }); }); P.nums.forEach(function (n) { res.ts.push(n); });
+  res.P = P;
+  if (!P.groups.length && !P.nums.length && !P.opts.length) return res;
+  P.groups.forEach(function (g) { g.alts.forEach(function (a) { res.ts.push(a); }); }); P.nums.forEach(function (n) { res.ts.push(n); }); P.opts.forEach(function (o) { res.ts.push(o.toLowerCase()); });
   // 术语
   var whole = P.raw.replace(/\s+/g, ' ');
   TA.forEach(function (a, i) {
     var all = a[0].concat(a[1]), sc = 0;
-    if (all.indexOf(whole) >= 0) sc = 100; else if (P.groups.length && !P.nums.length) { sc = 40; for (var j = 0; j < P.groups.length; j++) { var w = P.groups[j].w, h = 0; all.forEach(function (x) { if (x === w) h = Math.max(h, 3); else if (hit(x, w, isWord(w)) === 2) h = Math.max(h, 2); }); if (!h) { sc = 0; break; } sc += h * 5; } }
+    if (P.opts.length) return; if (whole && all.indexOf(whole) >= 0) sc = 100; else if (P.groups.length && !P.nums.length) { sc = 40; for (var j = 0; j < P.groups.length; j++) { var w = P.groups[j].w, h = 0; all.forEach(function (x) { if (x === w) h = Math.max(h, 3); else if (hit(x, w, isWord(w)) === 2) h = Math.max(h, 2); }); if (!h) { sc = 0; break; } sc += h * 5; } }
     if (sc > 0) res.terms.push([sc, i]);
   });
   res.terms.sort(function (x, y) { return y[0] - x[0] || x[1] - y[1]; });
   res.ents = runSearch(P);
-  if (res.ents.length || P.nums.length) return res;
+  if (res.ents.length || P.nums.length || P.opts.length) return res;
   // 放宽 1：去掉同义词替换掉的那部分以外的字、英文拼错
   var changed = false, G2 = P.groups.map(function (g) {
     var w = g.w;
@@ -220,6 +233,58 @@ function termRow(i, ts, badge) {
   var t = D.terms[i], to = t[5] >= 0 ? t[5] : -1;
   return '<' + (to >= 0 ? 'button' : 'div') + ' class="row term"' + (to >= 0 ? ' data-go="e/' + to + '"' : '') + '><span class="t">' + hl(t[0], ts) + '<span class="zh">' + hl(t[1], ts) + '</span>' + (badge ? '<span class="badge">术语</span>' : '') + '</span><span class="d">' + t[2] + '</span><span class="m">' + esc(t[3]) + (to >= 0 ? '<span class="go">看讲解 ›</span>' : '') + '</span></' + (to >= 0 ? 'button' : 'div') + '>';
 }
+/* ---------- 命令和选项 ---------- */
+var CMDI = {}; D.cmds.forEach(function (c, i) { CMDI[c[0]] = i; });
+function optOf(ci, o) { var L = D.cmds[ci][2]; for (var k = 0; k < L.length; k++) if (L[k][0] === o) return L[k][1]; return null; }
+function optRow(cmd, o, mean, extra) { return '<button class="row opt" data-go="cmd/' + encodeURIComponent(cmd) + '"><span class="t"><code>' + esc(cmd + ' ' + o) + '</code></span><span class="d">' + esc(mean) + '</span>' + (extra ? '<span class="m">' + extra + '</span>' : '') + '</button>'; }
+function cmdCandidates(P) {   // 查询里写了命令名的话，只看那个命令
+  var w = P.raw; if (!w) return null;
+  var out = []; D.cmds.forEach(function (c, i) { if (c[0] === w) out.push(i); });
+  if (!out.length) { var f = P.groups.length ? P.groups[0].w : ''; D.cmds.forEach(function (c, i) { if (c[0] === f || c[0].split(' ')[0] === f) out.push(i); }); }
+  return out.length ? out : null;
+}
+function optCards(P) {
+  var html = '', cand = cmdCandidates(P), all = cand || D.cmds.map(function (c, i) { return i; });
+  P.opts.forEach(function (o) {
+    var rows = [], n = 0;
+    all.forEach(function (ci) { var m = optOf(ci, o); if (m) { rows.push(optRow(D.cmds[ci][0], o, m, esc(D.cmds[ci][1]))); n++; } });
+    // 一串字母合写：拆开，一个字母一个字母解释
+    if (!n && /^-[A-Za-z]{2,}$/.test(o)) {
+      all.forEach(function (ci) {
+        var letters = o.slice(1).split(''), ms = letters.map(function (x) { return optOf(ci, '-' + x); });
+        if (D.cmds[ci][0] !== '[' && ms.every(Boolean) && letters.every(function (x, k) { return letters.indexOf(x) === k; })) { rows.push('<div class="row opt"><span class="t"><code>' + esc(D.cmds[ci][0] + ' ' + o) + '</code>　是 ' + letters.length + ' 个选项合在一起写</span>' + letters.map(function (x, k) { return '<span class="d"><code>-' + x + '</code>　' + esc(ms[k]) + '</span>'; }).join('') + '<span class="m"><button class="lnk" data-go="cmd/' + encodeURIComponent(D.cmds[ci][0]) + '">' + esc(D.cmds[ci][0]) + ' 的全部选项</button></span></div>'); n++; }
+      });
+    }
+    D.tbo.forEach(function (t) { if (t[0] === o && (!cand || cand.some(function (ci) { return D.cmds[ci][0].split(' ')[0] === t[1].split(' ')[0]; }))) { rows.push('<button class="row opt" data-go="e/' + t[3] + '"><span class="t"><code>' + esc(t[1] + ' ' + o) + '</code></span><span class="d">' + esc(t[2]) + '</span><span class="m">教材 ' + esc(E[t[3]][0]) + '</span></button>'); n++; } });
+    // 大小写不同的提醒
+    var other = [], alt = o.length === 2 ? (o.charAt(1) === o.charAt(1).toLowerCase() ? '-' + o.charAt(1).toUpperCase() : '-' + o.charAt(1).toLowerCase()) : null;
+    if (alt && alt !== o) all.forEach(function (ci) { var m = optOf(ci, alt); if (m && other.length < 4) other.push(optRow(D.cmds[ci][0], alt, m, '')); });
+    html += '<div class="count">选项 <code>' + esc(o) + '</code>' + (cand ? '' : '：' + n + ' 个命令里有') + '</div>';
+    html += n ? '<div class="rows">' + foldRows(rows, 8) + '</div>' : '<p class="note">速查表里没有收这个选项。可以在终端里敲 <code>命令 --help</code> 看它的说明。</p>';
+    if (other.length) html += '<div class="count">注意大小写：<code>' + esc(alt) + '</code> 是另一个选项</div><div class="rows">' + other.join('') + '</div>';
+  });
+  return html;
+}
+function foldRows(rows, n) { if (rows.length <= n + 1) return rows.join(''); return rows.slice(0, n).join('') + '<div hidden>' + rows.slice(n).join('') + '</div><button class="tog" style="width:auto;margin:10px 18px" data-act="tog" data-t="再看 ' + (rows.length - n) + ' 个">再看 ' + (rows.length - n) + ' 个</button>'; }
+function cmdCard(ci) {
+  var c = D.cmds[ci];
+  return '<div class="count">命令</div><div class="rows"><button class="row opt" data-go="cmd/' + encodeURIComponent(c[0]) + '"><span class="t"><code>' + esc(c[0]) + '</code></span><span class="d">' + esc(c[1]) + '</span><span class="m">' + c[2].length + ' 个选项<span class="go">看全部 ›</span></span></button></div>';
+}
+function pageCmds(isBack) {
+  setBar({ back: stacks[curTab].length > 1, title: '<b>命令选项速查</b>' });
+  show('<p class="sub" style="padding-top:14px">' + D.cmds.length + ' 个命令。这部分是补充内容，不是教材原文；按 Linux 上的常见用法写的。也可以直接在“查词”里搜 <code>-t</code>、<code>ls -lt</code>、<code>tar -czvf</code>。</p><div class="rows">' + D.cmds.map(function (c) { return '<button class="row opt" data-go="cmd/' + encodeURIComponent(c[0]) + '"><span class="t"><code>' + esc(c[0]) + '</code></span><span class="d" style="-webkit-line-clamp:1">' + esc(c[1]) + '</span></button>'; }).join('') + '</div>', isBack);
+}
+function pageCmd(isBack, name) {
+  var ci = CMDI[name]; if (ci == null) return nav('cmds', true);
+  var c = D.cmds[ci];
+  setBar({ back: true, title: '命令选项速查', aa: true });
+  var html = '<article class="entry"><h1 class="hw"><code style="background:none;padding:0">' + esc(c[0]) + '</code></h1><div class="gist">' + esc(c[1]) + '</div>';
+  if (c[3] >= 0) html += '<button class="pitlink" style="background:var(--blue-bg);color:var(--blue)" data-go="e/' + c[3] + '"><span>教材里的讲解：' + esc(E[c[3]][0]) + '</span><span>›</span></button>';
+  html += c[2].length ? '<table class="opts" style="margin-top:18px"><tbody>' + c[2].map(function (o) { return '<tr><td><code>' + esc(o[0]) + '</code></td><td>' + esc(o[1]) + '</td></tr>'; }).join('') + '</tbody></table>' : '<p class="note">这个命令平时基本不带选项。</p>';
+  var tb = D.tbo.filter(function (t) { return t[1].split(' ')[0] === c[0].split(' ')[0]; });
+  if (tb.length) html += '<div class="sh" style="position:static;margin-top:26px">教材里还出现过</div><table class="opts"><tbody>' + tb.map(function (t) { return '<tr><td><code>' + esc(t[0]) + '</code></td><td>' + esc(t[2]) + '</td></tr>'; }).join('') + '</tbody></table>';
+  show(html + '<p class="note" style="margin-top:18px">补充内容，不是教材原文。不同系统上个别选项会有出入，拿不准时敲 <code>' + esc(c[0].split(' ')[0]) + ' --help</code> 核对。</p></article>', isBack);
+}
 function chByN(n) { for (var i = 0; i < CH.length; i++) if (CH[i].n === String(n)) return CH[i]; return null; }
 
 /* ---------- 页面栈：每个底部标签各有一摞，切换时各自记住位置 ---------- */
@@ -243,6 +308,8 @@ function render(isBack) {
   else if (p[0] === 'terms') pageTerms(isBack);
   else if (p[0] === 'me') pageMe(isBack);
   else if (p[0] === 'mine') pageMine(isBack);
+  else if (p[0] === 'cmds') pageCmds(isBack);
+  else if (p[0] === 'cmd') pageCmd(isBack, decodeURIComponent(r.slice(4)));
   else if (p[0] === 'c') pageChapter(isBack, p[1], p[2]);
   else if (p[0] === 'e') pageEntry(isBack, +p[1]);
 }
@@ -266,16 +333,21 @@ function updateResults() {
   if (!q) {
     var rec = recentIds().slice(0, 6), html = '';
     if (rec.length) { var c0 = CH[E[rec[0]][1]]; html += '<div class="cap">接着看</div><div class="tiles"><button class="wide2" data-tabgo="toc" data-go="c/' + c0.n + '">' + chLabel(c0) + '　' + esc(c0.t) + '</button></div>'; }
-    html += '<div class="cap">常用</div><div class="tiles"><button class="v wide2" data-tabgo="me" data-go="mine">我常错的 ' + D.mine.length + ' 条<small style="color:inherit;font-weight:400">来自你的学习笔记</small></button></div>';
+    html += '<div class="cap">常用</div><div class="tiles"><button data-tabgo="toc" data-go="cmds">命令选项速查<small>搜 -t、ls -lt 也行</small></button><button data-tabgo="toc" data-go="terms">术语表<small>' + D.terms.length + ' 个词</small></button><button class="v wide2" data-tabgo="me" data-go="mine">我常错的 ' + D.mine.length + ' 条<small style="color:inherit;font-weight:400">来自你的学习笔记</small></button></div>';
     if (rec.length) html += '<div class="cap">最近查过</div><div class="rows">' + rec.map(function (i) { return entRow(i, [], 0); }).join('') + '</div>';
     html += '<div class="cap">按部分翻</div><div class="tiles">' + D.parts.map(function (p, i) { return '<button data-tabgo="toc" data-go="toc/' + i + '">' + esc(p[1]) + '<small>第' + p[0] + '部分</small></button>'; }).join('') + '</div>';
     res.innerHTML = html; return;
   }
   var m = /^第?\s*(\d+)\s*章$/.exec(norm(q)), html2 = '';
   if (m && chByN(m[1])) { res.innerHTML = '<div class="count">章节</div>' + chRow(chByN(m[1])); return; }
-  var r = search(q), ts = r.ts, exact = r.terms.filter(function (x) { return x[0] >= 100; }).slice(0, 1), part = r.terms.filter(function (x) { return x[0] < 100; }).slice(0, 2);
+  var r = search(q), ts = r.ts, P = r.P, pre = '';
+  if (P && P.opts.length) pre = optCards(P);
+  else if (P && P.raw && CMDI[P.raw] != null) pre = cmdCard(CMDI[P.raw]);
+  var exact = r.terms.filter(function (x) { return x[0] >= 100; }).slice(0, 1), part = r.terms.filter(function (x) { return x[0] < 100; }).slice(0, 2);
+  if (pre && !r.ents.length) { res.innerHTML = pre; return; }
   if (!r.terms.length && !r.ents.length) { res.innerHTML = '<div class="empty"><b>没有查到“' + esc(q) + '”</b>少打几个字，或者换个说法再试。' + (!warmed ? '正文还在准备，稍等会自动再搜一次。' : '') + '<button class="btn" data-tab="toc">去目录里翻</button></div>'; return; }
-  html2 += r.near ? '<div class="near">没有完全一样的，下面是最接近的 ' + r.ents.length + ' 个</div>' : '<div class="count">' + r.ents.length + ' 个知识点</div>';
+  html2 += pre;
+  html2 += r.near ? '<div class="near">没有完全一样的，下面是最接近的 ' + r.ents.length + ' 个</div>' : '<div class="count">' + (pre ? '教材里用到的地方：' : '') + r.ents.length + ' 个知识点</div>';
   html2 += '<div class="rows">' + exact.map(function (x) { return termRow(x[1], ts, true); }).join('') + r.ents.slice(0, S.showN).map(function (x) { return entRow(x[1], ts, x[2]); }).join('') +
     (r.ents.length <= S.showN ? part.map(function (x) { return termRow(x[1], ts, true); }).join('') : '') + '</div>';
   if (r.ents.length > S.showN) html2 += '<button class="btn" data-act="more">再显示 ' + Math.min(50, r.ents.length - S.showN) + ' 个</button>';
@@ -292,7 +364,7 @@ function pageToc(isBack, part) {
     var rows = ''; for (var n = p[2]; n <= p[3]; n++) { var c = chByN(n); if (c) rows += chRow(c); }
     if (rows) html += '<div class="part" id="part-' + i + '"><b>第' + p[0] + '部分</b>' + esc(p[1]) + '</div>' + rows;
   });
-  html += '<div class="part" id="part-x"><b>附录</b>速查</div><button class="ch" data-go="terms"><span class="n">A</span><span class="t">术语表</span><span class="c">' + D.terms.length + ' 个</span></button>' + CH.filter(function (c) { return !/^\d+$/.test(c.n) && c.n !== 'A'; }).map(chRow).join('');
+  html += '<div class="part" id="part-x"><b>附录</b>速查</div><button class="ch" data-go="terms"><span class="n">A</span><span class="t">术语表</span><span class="c">' + D.terms.length + ' 个</span></button><button class="ch" data-go="cmds"><span class="n">›</span><span class="t">命令选项速查</span><span class="c">' + D.cmds.length + ' 个命令</span></button>' + CH.filter(function (c) { return !/^\d+$/.test(c.n) && c.n !== 'A'; }).map(chRow).join('');
   show(html, isBack);
   if (!isBack && part != null) jumpTo('part-' + part);
 }
@@ -428,7 +500,7 @@ function pageMe(isBack) {
   html += '<div class="sh">我常错的</div><div class="rows"><button class="row" data-go="mine"><span class="t">我的易错清单</span><span class="d">' + D.mine.length + ' 条，来自学习笔记。查到相关知识点时会排在最前面提醒。</span></button></div>';
   html += '<div class="sh">显示</div><div class="set"><span>字号</span><div class="seg">' + FS.map(function (f, i) { return '<button data-act="fs" data-i="' + i + '" class="' + (S.fs === i ? 'on' : '') + '">' + f[0] + '</button>'; }).join('') + '</div></div>' +
     '<div class="set"><span>外观</span><div class="seg">' + [['auto', '跟随系统'], ['light', '浅色'], ['dark', '深色']].map(function (t) { return '<button data-act="theme" data-t="' + t[0] + '" class="' + (S.theme === t[0] ? 'on' : '') + '">' + t[1] + '</button>'; }).join('') + '</div></div>';
-  html += '<div class="sh">内容从哪来</div><p class="note">全部来自《从零到大模型研发》白话版教材，共 ' + st.kp + ' 个知识点、' + D.terms.length + ' 个术语，离线可用。只收知识点：面试题、章节小结、小练习、学习方法和求职类内容没有放进来。</p>' +
+  html += '<div class="sh">内容从哪来</div><p class="note">全部来自《从零到大模型研发》白话版教材，共 ' + st.kp + ' 个知识点、' + D.terms.length + ' 个术语，离线可用。另有 ' + D.cmds.length + ' 个命令的选项速查，是补充内容。只收知识点：面试题、章节小结、小练习、学习方法和求职类内容没有放进来。</p>' +
     '<p class="note">案例：' + st.case_own + ' 条是教材自带的代码或表格，' + st.case_quiz + ' 条用教材的自测题当例子，' + (st.case_sup || 0) + ' 条是按教材要点补写的（标着“补充”），' + st.case_sib + ' 条借的是旁边知识点的例子。</p>' +
     '<p class="note">容易出错的内容：' + (st.pit_own + st.pit_table) + ' 条是教材原文；' + st.pit_sup + ' 条（第 2 到 6 章和附录 C）是按教材补写的，标着“补充”；' + st.pit_sib + ' 条显示的是旁边知识点的易错点，页面上会注明；其余 ' + st.pit_ch + ' 条教材没有单独写，给的是本章常见误区的入口。</p>';
   show(html, isBack);

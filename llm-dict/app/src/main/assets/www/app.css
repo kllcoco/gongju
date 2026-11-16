@@ -167,3 +167,11 @@ button:active{opacity:.6}
 .tiles .v{background:var(--violet-bg);color:var(--violet);font-weight:650}
 .near{font-size:13.5px;color:var(--ink2);padding:10px 0 2px}
 .entry{text-wrap:pretty;overflow-wrap:anywhere}
+
+.row.opt .t code{font-size:.95em;background:var(--blue-bg);color:var(--blue);padding:.15em .45em}
+.row.opt .d code{background:var(--code-bg)}
+.row.opt .d{-webkit-line-clamp:unset;display:block}
+.count code{font-size:1em}
+table.opts td{font-size:1em;padding:9px 12px 9px 0}
+table.opts td:first-child{white-space:nowrap;width:1%;vertical-align:top}
+table.opts td:first-child code{background:var(--blue-bg);color:var(--blue)}
