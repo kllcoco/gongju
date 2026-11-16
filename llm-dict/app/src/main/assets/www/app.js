@@ -526,7 +526,7 @@ function pageCourse(isBack) {
     if (pi !== lastP && pi >= 0) { lastP = pi; html += '<div class="sh" style="position:static">第' + D.parts[pi][0] + '篇　' + esc(D.parts[pi][1]) + '</div>'; }
     html += '<button class="row" data-go="cc/' + c.n + '"><span class="t"><span class="no">第 ' + c.n + ' 章</span>' + esc(c.t) + '</span><span class="m">' + d + ' / ' + c.lessons.length + ' 课' + bar2(d, c.lessons.length) + '</span></button>';
   });
-  html += '<p class="note" style="margin-top:16px">全书 ' + D.course.length + ' 章，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。紫色的“补充”不是教材原文，是给第一次学的人加的提示，目前只有第 2 到 5 章有。每章学完会开启这一章的阶段密封卷。</p>';
+  html += '<p class="note" style="margin-top:16px">全书 ' + D.course.length + ' 章，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。紫色的“补充”不是教材原文，是小白试读以后加的提示：在哪敲、缺什么文件、屏幕上应该看到什么，以及课文里的笔误。每章学完会开启这一章的阶段密封卷。</p>';
   show('<div class="rows0">' + html + '</div>', isBack);
 }
 function pageCourseCh(isBack, n) {
