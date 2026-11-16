@@ -313,6 +313,8 @@ function render(isBack) {
   else if (p[0] === 'cc') pageCourseCh(isBack, p[1]);
   else if (p[0] === 'l') pageLesson(isBack, p[1]);
   else if (p[0] === 'rv') pageReview(isBack);
+  else if (p[0] === 'fc') pageFlash(isBack);
+  else if (p[0] === 'log') pageLog(isBack);
   else if (p[0] === 'fx') pageFinal(isBack);
   else if (p[0] === 'x') pageExam(isBack, p[1]);
   else if (p[0] === 'cmds') pageCmds(isBack);
@@ -514,10 +516,10 @@ function bar2(done, total) { return '<span class="pbar"><i style="width:' + (tot
 function lno(l) { return l.kind === 'kp' ? l.no : ''; }
 function pageCourse(isBack) {
   setBar({ title: '<b>课程</b>' });
-  var nx = nextLesson(), due = dueQuizzes().length, html = '';
+  var nx = nextLesson(), due = fcStats(Date.now()).due, html = '';
   if (nx) html += '<button class="cta" data-go="l/' + nx.l.no + '"><small>' + (Object.keys(CDONE).length ? '接着学' : '从这里开始') + '</small>' + (lno(nx.l) ? lno(nx.l) + '　' : chLabel(nx.c) + '　') + esc(nx.l.t) + '</button>';
   else html += '<p class="note" style="padding-top:16px">这几章都学完了。</p>';
-  if (due) html += '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>';
+  html += '<button class="cta' + (due ? '' : ' alt') + '" data-go="fc"><small>' + (due ? '开新课之前，先把到期的卡刷完' : '按记忆规律安排的复习') + '</small>' + (due ? '闪卡复习 ' + due + ' 张' : '闪卡复习') + '</button><button class="row" data-go="log"><span class="t"><span class="no">日志</span>学习日志</span><span class="m">每天学了什么、每章掌握到哪一步</span></button>';
   var X = D.exams, fdone = X.final.filter(function (p) { return (EX[p.id] || {}).done; }).length;
   html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return optL(L.l, L.c) || CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
   var lastP = -1;
@@ -582,10 +584,10 @@ function pageLesson(isBack, no) {
   });
 }
 function finHtml(L) {
-  var i = LIDX[L.l.no], nx = LESSONS[i + 1], due = dueQuizzes().length;
+  var i = LIDX[L.l.no], nx = LESSONS[i + 1], due = fcStats(Date.now()).due;
   function nm(x) { return (lno(x.l) ? lno(x.l) + '　' : (x.c !== L.c ? chLabel(x.c) + '　' : '')) + esc(x.l.t); }
   if (!CDONE[L.l.no]) return '<button class="cta" data-act="done" data-no="' + L.l.no + '"><small>都看懂了，“想一想”也答过了</small>学完这一课</button>';
-  return '<p class="note" style="margin-top:24px">这一课已经学过了。</p>' + (due ? '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>' : '') + (nx ? '<button class="cta" data-go="l/' + nx.l.no + '" data-rep="1"><small>下一课</small>' + nm(nx) + '</button>' : '<button class="cta" data-go="course" data-rep="1"><small>这几章都学完了</small>回到课程</button>');
+  return '<p class="note" style="margin-top:24px">这一课已经学过了。</p>' + (due ? '<button class="cta alt" data-go="fc"><small>开新课之前</small>先刷 ' + due + ' 张到期的闪卡</button>' : '') + (nx ? '<button class="cta" data-go="l/' + nx.l.no + '" data-rep="1"><small>下一课</small>' + nm(nx) + '</button>' : '<button class="cta" data-go="course" data-rep="1"><small>这几章都学完了</small>回到课程</button>');
 }
 function pageReview(isBack) {
   setBar({ back: true, title: '<b>复习</b>', aa: true });
@@ -595,6 +597,237 @@ function pageReview(isBack) {
   var qs = ks.map(function (k) { return lessonQuizzes(k.L)[k.i]; }).filter(Boolean);
   if (!qs.length) { show('<div class="empty"><b>现在没有到期要复习的题</b>学完新课、或者过几天再来。</div><button class="cta" data-go="course" data-rep="1">回到课程</button>', false); return; }
   show('<article class="entry lesson"><p class="why" style="margin-top:16px">' + qs.length + ' 道题，新旧章节混着出。先自己答，再点开看答案，然后老实选“答对了”还是“答错了”。答错的过几天会再出。</p>' + qs.map(function (q) { return cquiz(q, true); }).join('') + '<button class="cta" data-go="course" data-rep="1">答完了，回到课程</button></article>', isBack);
+}
+
+/* ---------- 闪卡：FSRS 间隔重复 + 学习日志 ----------
+   FSRS（自由间隔重复调度）是目前公开评测里预测遗忘最准的算法，比经典的艾宾浩斯固定间隔、SM-2 都好：
+   它给每张卡记两个数——稳定性 S（记忆能保持多少天）和难度 D（1～10），每次复习按你选的“忘了/有点难/记得/很简单”更新，
+   在你“快要忘、但还没忘”（回想概率降到 90%）的时候再出这张卡。记得不牢的卡 S 小，自然出得勤。
+   卡片只存“来源 + 调度状态”，正文显示时从课里取；在安卓 App 里另存一份纯文本给通知栏用。 */
+var FSRS_W = [0.4872, 1.4003, 3.7145, 13.8206, 5.1618, 1.2298, 0.8975, 0.031, 1.6474, 0.1367, 1.0461, 2.1072, 0.0793, 0.3246, 1.587, 0.2272, 2.8755];
+var FSRS_F = 19 / 81, FSRS_DECAY = -0.5, MIN = 60000, HOUR = 3600000;
+function fsClampD(d) { return Math.min(10, Math.max(1, d)); }
+function fsD0(g) { return fsClampD(FSRS_W[4] - (g - 3) * FSRS_W[5]); }
+function fsR(days, s) { return Math.pow(1 + FSRS_F * days / s, FSRS_DECAY); }
+function fsGrade(c, g, now) {
+  var W = FSRS_W;
+  if (!c.st) { c.s = W[g - 1]; c.d = fsD0(g); }
+  else {
+    var r = fsR(Math.max(0, now - c.last) / DAY, c.s);
+    if (g === 1) c.s = Math.min(c.s, W[11] * Math.pow(c.d, -W[12]) * (Math.pow(c.s + 1, W[13]) - 1) * Math.exp(W[14] * (1 - r)));
+    else c.s = c.s * (Math.exp(W[8]) * (11 - c.d) * Math.pow(c.s, -W[9]) * (Math.exp(W[10] * (1 - r)) - 1) * (g === 2 ? W[15] : 1) * (g === 4 ? W[16] : 1) + 1);
+    c.d = fsClampD(W[7] * fsD0(4) + (1 - W[7]) * (c.d - W[6] * (g - 3)));
+  }
+  c.s = Math.max(0.1, c.s); c.reps = (c.reps || 0) + 1; c.last = now; c.t = now;
+  if (g === 1) { c.lapses = (c.lapses || 0) + 1; c.st = 2; c.due = now + 10 * MIN; }
+  else { c.st = 1; c.due = now + Math.min(365, Math.max(1, Math.round(c.s))) * DAY; }
+  return c;
+}
+function fsRet(c, now) { return !c.st ? 0 : fsR(Math.max(0, now - c.last) / DAY, c.s); }
+function fsLevel(c) { return !c || !c.st ? 0 : c.st === 2 || c.s < 3 ? 1 : c.s < 21 ? 2 : 3; }  // 0 新学 1 不牢 2 巩固中 3 已掌握
+var FS_LV = ['新学', '不牢', '巩固中', '已掌握'];
+
+var NB = window.AndroidBridge && AndroidBridge.fcLoad ? AndroidBridge : null;
+var FC = { c: {}, cfg: { on: false, q0: 22, q1: 8, cap: 20 }, made: {}, nlog: [] };
+var LOGS = store.get('logs', []);
+function fcParse(s) { try { var o = JSON.parse(s || '{}'); o.c = o.c || {}; o.cfg = o.cfg || FC.cfg; o.made = o.made || {}; o.nlog = o.nlog || []; return o; } catch (e) { return null; } }
+function fcImportLog(list) {
+  if (!list || !list.length) return;
+  var seen = {}; LOGS.forEach(function (x) { seen[x.t + x.id] = 1; });
+  list.forEach(function (x) { if (!seen[x.t + x.id]) { LOGS.push(x); seen[x.t + x.id] = 1; } });
+  LOGS.sort(function (a, b) { return a.t - b.t; }); store.set('logs', LOGS);
+}
+function fcLoad() {
+  var o = NB ? fcParse(NB.fcLoad()) : fcParse(JSON.stringify(store.get('fc', null) || FC));
+  if (o) FC = o;
+  fcImportLog(FC.nlog); FC.nlog = [];
+}
+function fcSave() {
+  if (NB) {
+    var cur = fcParse(NB.fcLoad());
+    if (cur) {
+      fcImportLog(cur.nlog);
+      Object.keys(cur.c).forEach(function (id) { var a = cur.c[id], b = FC.c[id]; if (!b || (a.t || 0) > (b.t || 0)) FC.c[id] = a; });
+      Object.keys(cur.made).forEach(function (k) { FC.made[k] = 1; });
+    }
+    FC.nlog = []; NB.fcSave(JSON.stringify(FC));
+  } else {
+    var lite = { c: {}, cfg: FC.cfg, made: FC.made, nlog: [] };
+    Object.keys(FC.c).forEach(function (id) { var c = FC.c[id], x = {}; for (var k in c) if (k !== 'ft' && k !== 'bt') x[k] = c[k]; lite.c[id] = x; });
+    store.set('fc', lite);
+  }
+}
+window.__fcReload = function () { fcLoad(); var r = top() && top().r; if (r === 'fc' || r === 'log' || r === 'course') nav(r, true); };
+window.__fcPerm = function (ok) { FC.cfg.on = !!ok; fcSave(); toast(ok ? '已打开闪卡通知' : '没有通知权限，通知闪卡没有打开'); if (top().r === 'fc') nav('fc', true); };
+fcLoad();
+
+function fcPlain(html) {
+  var d = document.createElement('div'); d.innerHTML = html;
+  [].forEach.call(d.querySelectorAll('.mx'), function (m) { var a = m.querySelector('annotation'); m.textContent = ' ' + (a ? a.textContent : m.textContent).trim() + ' '; });
+  [].forEach.call(d.querySelectorAll('p,li,tr,pre,br,h4'), function (e) { e.appendChild(document.createTextNode('\n')); });
+  var t = d.textContent.replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
+  return t.length > 420 ? t.slice(0, 418) + '…' : t;
+}
+/* 一课能出哪些卡：每道“想一想”一张（问题 / 答案），每个要点框一张（这一部分讲了什么 / 要点） */
+function cardsOf(L) {
+  var d = lessonData(L), out = []; if (!d || /^(ex|ans|why|goal|fast)$/.test(L.l.kind)) return out;
+  var nq = 0, nk = 0, label = (lno(L.l) || chLabel(L.c)) + '　' + L.l.t;
+  function scan(bl, name) { bl.forEach(function (b) {
+    if (b[0] === 'q') out.push({ id: L.l.no + '#q' + (nq++), src: label, f: b[1].q, b: b[1].a });
+    else if (b[0] === 'k') out.push({ id: L.l.no + '#k' + (nk++), src: label, f: '<p>“' + esc(name) + '”这一部分，最要紧的一句话是什么？</p>', b: b[1] });
+  }); }
+  scan(d.lead, L.l.t); d.pts.forEach(function (p) { scan(p.b, p.t); });
+  return out;
+}
+function fcMake(L, now) {
+  if (FC.made[L.l.no]) return 0;
+  var n = 0;
+  cardsOf(L).forEach(function (x, i) {
+    if (FC.c[x.id]) return;
+    var c = { l: L.l.no, src: x.src, st: 0, due: now + HOUR + i * MIN, t: now };
+    if (NB) { c.ft = fcPlain(x.f); c.bt = fcPlain(x.b); }
+    FC.c[x.id] = c; n++;
+  });
+  FC.made[L.l.no] = 1; return n;
+}
+function fcLog(e) { LOGS.push(e); store.set('logs', LOGS); }
+/* 学过但还没出卡的课（以前学的、或者在网页版学的）：打开闪卡页时补出来 */
+function fcBackfill(cb) {
+  var todo = LESSONS.filter(function (L) { return CDONE[L.l.no] && !FC.made[L.l.no] && !/^(ex|ans|why|goal|fast)$/.test(L.l.kind); });
+  if (!todo.length) return cb();
+  var need = {}, left = 0;
+  todo.forEach(function (L) { if (!KC[L.c.n] && !need[L.c.n]) { need[L.c.n] = 1; left++; } });
+  function go() { var now = Date.now(); todo.forEach(function (L) { if (lessonData(L)) fcMake(L, now); }); fcSave(); cb(); }
+  if (!left) return go();
+  Object.keys(need).forEach(function (n) { loadK(n, function () { if (--left === 0) go(); }); });
+}
+function fcDue(now) {
+  var ids = Object.keys(FC.c).filter(function (id) { return FC.c[id].due <= now; });
+  // 新卡和到期卡混着出，回想概率越低（越快要忘）越先出；同一课的卡不挨着
+  ids.sort(function (a, b) { return fsRet(FC.c[a], now) - fsRet(FC.c[b], now); });
+  var out = [], last = '';
+  while (ids.length) { var j = 0; while (j < ids.length - 1 && FC.c[ids[j]].l === last) j++; last = FC.c[ids[j]].l; out.push(ids.splice(j, 1)[0]); }
+  return out;
+}
+function fcStats(now) {
+  var s = { all: 0, due: 0, lv: [0, 0, 0, 0], next: 0 };
+  Object.keys(FC.c).forEach(function (id) { var c = FC.c[id]; s.all++; s.lv[fsLevel(c)]++; if (c.due <= now) s.due++; else if (!s.next || c.due < s.next) s.next = c.due; });
+  return s;
+}
+function fcWhen(t) { var m = Math.round((t - Date.now()) / MIN); return m < 60 ? Math.max(1, m) + ' 分钟后' : m < 1440 ? Math.round(m / 60) + ' 小时后' : Math.round(m / 1440) + ' 天后'; }
+function fcLessonOf(id) { var no = id.split('#')[0], i = LIDX[no]; return i == null ? null : LESSONS[i]; }
+
+var FCS = { id: null, flip: false };
+function pageFlash(isBack) {
+  setBar({ back: true, title: '<b>闪卡复习</b>', aa: true });
+  var want = top();
+  fcBackfill(function () {
+    if (top() !== want) return;
+    var now = Date.now(), st = fcStats(now), due = fcDue(now);
+    if (!FCS.id || !FC.c[FCS.id] || FC.c[FCS.id].due > now) { FCS.id = due[0] || null; FCS.flip = false; }
+    var html = '<div class="fcbar"><div><b>' + st.due + '</b><span>现在要复习</span></div><div><b>' + st.lv[1] + '</b><span>不牢</span></div><div><b>' + st.lv[2] + '</b><span>巩固中</span></div><div><b>' + st.lv[3] + '</b><span>已掌握</span></div></div>';
+    if (!st.all) html += '<div class="empty"><b>还没有闪卡</b>每学完一课、点“学完这一课”，这一课的“想一想”和要点就会变成闪卡，按记忆规律安排复习。</div>';
+    else if (!FCS.id) html += '<div class="empty"><b>现在没有要复习的卡</b>下一张在' + fcWhen(st.next) + '。到时间' + (FC.cfg.on && NB ? '会在通知栏弹出来。' : '回来这里刷。') + '</div>';
+    else {
+      var L = fcLessonOf(FCS.id);
+      if (L && !KC[L.c.n]) { show('<div class="empty">正在准备卡片……</div>', false); loadK(L.c.n, function () { if (top() === want) pageFlash(isBack); }); return; }
+      var x = L ? cardsOf(L).filter(function (y) { return y.id === FCS.id; })[0] : null, c = FC.c[FCS.id];
+      if (!x) { delete FC.c[FCS.id]; fcSave(); FCS.id = null; return pageFlash(isBack); }
+      html += '<div class="fcard' + (FCS.flip ? ' flip' : '') + '"><div class="fsrc">' + esc(x.src) + '<span>' + FS_LV[fsLevel(c)] + (c.lapses ? '，忘过 ' + c.lapses + ' 次' : '') + '</span></div><div class="ff">' + fix(x.f) + '</div>' +
+        (FCS.flip ? '<div class="fb">' + fix(x.b) + '</div>' : '') + '</div>';
+      if (!FCS.flip) html += '<button class="cta" data-act="fcflip"><small>先在心里答一遍，再翻面</small>翻面看答案</button>';
+      else html += '<p class="note" style="margin:14px 0 8px">和答案比一比，老实选：</p><div class="fcg">' + [[1, '忘了', '10 分钟后再来'], [2, '有点难', ''], [3, '记得', ''], [4, '很简单', '']].map(function (g) {
+        var tmp = JSON.parse(JSON.stringify(c)); fsGrade(tmp, g[0], now);
+        return '<button data-act="fcg" data-g="' + g[0] + '"><b>' + g[1] + '</b><small>' + (g[0] === 1 ? g[2] : fcWhen(tmp.due).replace('后', '后再见')) + '</small></button>';
+      }).join('') + '</div><button class="lnk" data-go="l/' + c.l + '" style="margin-top:10px">回到这一课看原文</button>';
+    }
+    html += '<div class="sh" style="position:static">通知栏闪卡</div>';
+    if (!NB) html += '<p class="note">通知栏闪卡只在安卓 App 里有。网页版请回来这里刷。</p>';
+    else {
+      html += '<div class="set"><span>到时间就在通知栏弹卡</span><div class="seg"><button data-act="fcon" data-v="1" class="' + (FC.cfg.on ? 'on' : '') + '">开</button><button data-act="fcon" data-v="0" class="' + (FC.cfg.on ? '' : 'on') + '">关</button></div></div>' +
+        '<div class="set"><span>每天最多弹几张</span><div class="seg">' + [10, 20, 40, 80].map(function (n) { return '<button data-act="fccap" data-v="' + n + '" class="' + (FC.cfg.cap === n ? 'on' : '') + '">' + n + '</button>'; }).join('') + '</div></div>' +
+        '<div class="set"><span>晚上不打扰</span><div class="seg">' + [[22, 8, '22 点到 8 点'], [23, 7, '23 点到 7 点'], [0, 0, '不设']].map(function (q) { return '<button data-act="fcq" data-a="' + q[0] + '" data-b="' + q[1] + '" class="' + (FC.cfg.q0 === q[0] && FC.cfg.q1 === q[1] ? 'on' : '') + '">' + q[2] + '</button>'; }).join('') + '</div></div>' +
+        '<button class="cta alt" data-act="fctest"><small>看看通知栏里长什么样</small>现在弹一张</button>';
+    }
+    html += '<p class="note" style="margin-top:18px">怎么排的：用 FSRS 间隔重复算法。每张卡记着“这条记忆能保持多少天”，在你回想概率快降到 90% 的时候再出它。选“忘了”的卡 10 分钟后再来，以后出得更勤；选“很简单”的卡间隔拉长得快。连续记得、间隔超过 21 天的算“已掌握”。新学的课 1 小时后出第一轮。</p><button class="row" data-go="log"><span class="t">学习日志</span><span class="m">每天学了什么、复习了多少、每章掌握到哪一步</span></button>';
+    show(html, isBack);
+  });
+}
+function pageLog(isBack) {
+  setBar({ back: true, title: '<b>学习日志</b>' });
+  fcBackfill(function () {
+    var now = Date.now(), days = {}, html = '';
+    LESSONS.forEach(function (L) { var t = CDONE[L.l.no]; if (!t) return; var k = new Date(t).toDateString(); (days[k] = days[k] || { t: t, learn: [], rv: 0, ok: 0 }).learn.push(L); });
+    LOGS.forEach(function (x) { if (x.k !== 'rv') return; var k = new Date(x.t).toDateString(); var d = (days[k] = days[k] || { t: x.t, learn: [], rv: 0, ok: 0 }); d.rv++; if (x.g > 1) d.ok++; });
+    var ks = Object.keys(days).sort(function (a, b) { return days[b].t - days[a].t; });
+    var st = fcStats(now);
+    html += '<div class="fcbar"><div><b>' + Object.keys(CDONE).length + '</b><span>学过的课</span></div><div><b>' + LOGS.filter(function (x) { return x.k === 'rv'; }).length + '</b><span>复习过的卡</span></div><div><b>' + st.lv[3] + '</b><span>已掌握的卡</span></div><div><b>' + st.due + '</b><span>现在该复习</span></div></div>';
+    if (st.due) html += '<button class="cta" data-go="fc"><small>到期的卡不复习，过几天就忘</small>去复习 ' + st.due + ' 张</button>';
+    html += '<div class="sh" style="position:static">每章掌握到哪一步</div><div class="rows0">';
+    D.course.forEach(function (c) {
+      var ids = Object.keys(FC.c).filter(function (id) { var L = fcLessonOf(id); return L && L.c === c; }); if (!ids.length) return;
+      var lv = [0, 0, 0, 0]; ids.forEach(function (id) { lv[fsLevel(FC.c[id])]++; });
+      var weak = ids.filter(function (id) { return fsLevel(FC.c[id]) === 1; }).length;
+      html += '<button class="row" data-go="cc/' + c.n + '"><span class="t"><span class="no">' + chLabel(c) + '</span>' + esc(c.t) + '</span><span class="m">' + ids.length + ' 张卡：已掌握 ' + lv[3] + '，巩固中 ' + lv[2] + '，不牢 ' + lv[1] + '，没复习过 ' + lv[0] + (weak ? '　<b style="color:var(--red)">有 ' + weak + ' 张不牢</b>' : '') + '</span></button>';
+    });
+    html += '</div><div class="sh" style="position:static">导出</div><p class="note">把所有学习记录导出成一份文本：每章掌握情况、最不牢的卡、每天的记录，最后附一段原始数据。复习到一个阶段，把它发给 Claude，就能按你的情况出题。</p><button class="cta alt" data-act="logx"><small>' + (NB ? '保存到手机“下载”文件夹，并可以直接分享' : '下载成一个 txt 文件') + '</small>导出学习日志</button>' +
+      '<div class="sh" style="position:static">每天的记录</div>';
+    if (!ks.length) html += '<p class="note">还没有记录。学完一课、刷一张卡，这里就会记下一笔。</p>';
+    ks.slice(0, 60).forEach(function (k) {
+      var d = days[k], dt = new Date(d.t);
+      html += '<div class="logd"><b>' + (dt.getMonth() + 1) + ' 月 ' + dt.getDate() + ' 日</b><span>' + (d.learn.length ? '学了 ' + d.learn.length + ' 课' : '') + (d.learn.length && d.rv ? '，' : '') + (d.rv ? '复习 ' + d.rv + ' 张，记得 ' + Math.round(100 * d.ok / d.rv) + '%' : '') + '</span>' +
+        (d.learn.length ? '<p>' + d.learn.map(function (L) { return esc((lno(L.l) || chLabel(L.c)) + ' ' + L.l.t); }).join('；') + '</p>' : '') + '</div>';
+    });
+    show(html, isBack);
+  });
+}
+
+
+/* ---------- 导出学习日志：一份人能看懂的报告 + 一段给 Claude 读的原始数据 ---------- */
+function fcDate(t, full) { var d = new Date(t), p = function (n) { return (n < 10 ? '0' : '') + n; }; return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + (full ? ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) : ''); }
+function fcExport(cb) {
+  var now = Date.now(), ids = Object.keys(FC.c), st = fcStats(now);
+  var weak = ids.filter(function (id) { return fsLevel(FC.c[id]) === 1; }).sort(function (x, y) { return (FC.c[y].lapses || 0) - (FC.c[x].lapses || 0) || FC.c[x].s - FC.c[y].s; }).slice(0, 80);
+  var need = {}, left = 0;
+  weak.forEach(function (id) { var L = fcLessonOf(id); if (L && !KC[L.c.n] && !need[L.c.n]) { need[L.c.n] = 1; left++; } });
+  function build() {
+    var rv = LOGS.filter(function (x) { return x.k === 'rv'; }), wk = rv.filter(function (x) { return now - x.t < 7 * DAY; });
+    var L = [];
+    L.push('大模型字典 学习日志（导出时间 ' + fcDate(now, 1) + '）', '');
+    L.push('== 总览 ==');
+    L.push('学过的课：' + Object.keys(CDONE).length + ' 课（全书正文 ' + LESSONS.filter(function (x) { return !optL(x.l, x.c); }).length + ' 课）');
+    L.push('闪卡：共 ' + st.all + ' 张；已掌握 ' + st.lv[3] + '，巩固中 ' + st.lv[2] + '，不牢 ' + st.lv[1] + '，还没复习过 ' + st.lv[0] + '；现在到期 ' + st.due + ' 张');
+    L.push('复习：一共 ' + rv.length + ' 次；最近 7 天 ' + wk.length + ' 次' + (wk.length ? '，记得率 ' + Math.round(100 * wk.filter(function (x) { return x.g > 1; }).length / wk.length) + '%' : ''));
+    var sp = Object.keys(EX).filter(function (k) { return EX[k].done; });
+    if (sp.length) L.push('密封卷：' + sp.map(function (k) { var f = xInfo(k); return (f ? f.name : k) + ' ' + EX[k].s + '/' + EX[k].n; }).join('；'));
+    L.push('', '== 每章掌握情况 ==');
+    D.course.forEach(function (c) {
+      var done = c.lessons.filter(function (l) { return CDONE[l.no]; }).length; if (!done) return;
+      var cs = ids.filter(function (id) { var x = fcLessonOf(id); return x && x.c === c; }), lv = [0, 0, 0, 0]; cs.forEach(function (id) { lv[fsLevel(FC.c[id])]++; });
+      L.push(chLabel(c) + ' ' + c.t + '：学了 ' + done + '/' + c.lessons.length + ' 课；卡 ' + cs.length + ' 张，已掌握 ' + lv[3] + '，巩固中 ' + lv[2] + '，不牢 ' + lv[1] + '，没复习过 ' + lv[0]);
+    });
+    L.push('', '== 不牢的卡（最该加强的，按忘的次数排） ==');
+    if (!weak.length) L.push('（没有）');
+    weak.forEach(function (id) {
+      var c = FC.c[id], x = fcLessonOf(id), card = x && lessonData(x) ? cardsOf(x).filter(function (y) { return y.id === id; })[0] : null;
+      L.push('- [' + (c.src || id) + '] 忘过 ' + (c.lapses || 0) + ' 次，复习 ' + (c.reps || 0) + ' 次，记忆约能保持 ' + (Math.round(c.s * 10) / 10) + ' 天');
+      L.push('  卡面：' + (c.ft || (card ? fcPlain(card.f) : id)).replace(/\n/g, ' '));
+    });
+    L.push('', '== 每天的记录 ==');
+    var days = {};
+    Object.keys(CDONE).forEach(function (no) { var k = fcDate(CDONE[no]); (days[k] = days[k] || { learn: [], rv: 0, ok: 0 }).learn.push(no); });
+    rv.forEach(function (x) { var k = fcDate(x.t), d = (days[k] = days[k] || { learn: [], rv: 0, ok: 0 }); d.rv++; if (x.g > 1) d.ok++; });
+    Object.keys(days).sort().reverse().forEach(function (k) {
+      var d = days[k];
+      L.push(k + '：' + (d.learn.length ? '学了 ' + d.learn.map(function (no) { var x = LESSONS[LIDX[no]]; return x ? (lno(x.l) || chLabel(x.c)) + ' ' + x.l.t : no; }).join('、') : '') + (d.learn.length && d.rv ? '；' : '') + (d.rv ? '复习 ' + d.rv + ' 张，记得 ' + Math.round(100 * d.ok / d.rv) + '%' : ''));
+    });
+    var raw = { v: 1, at: now, done: CDONE, cards: ids.map(function (id) { var c = FC.c[id]; return [id, c.st || 0, Math.round((c.s || 0) * 10) / 10, Math.round((c.d || 0) * 10) / 10, c.reps || 0, c.lapses || 0, c.last ? Math.round(c.last / MIN) : 0]; }),
+      reviews: rv.slice(-3000).map(function (x) { return [Math.round(x.t / MIN), x.id, x.g]; }), exams: EX };
+    L.push('', '== 原始数据（给 Claude 读的，不用看） ==', '卡片格式：[卡号, 状态 0新/1复习/2重学, 稳定性天数, 难度1-10, 复习次数, 忘的次数, 上次复习时间(分钟)]；复习格式：[时间(分钟), 卡号, 评分 1忘了/2有点难/3记得/4很简单]', JSON.stringify(raw));
+    cb(L.join('\n'));
+  }
+  if (!left) return build();
+  Object.keys(need).forEach(function (n) { loadK(n, function () { if (--left === 0) build(); }); });
 }
 
 /* ---------- 密封卷：平时不出现；学完才开；做完一套才开下一套；每套只做一次 ---------- */
@@ -740,12 +973,22 @@ document.addEventListener('click', function (ev) {
   else if (act === 'ans') { var a = t.parentNode.querySelector('.aa'); a.hidden = !a.hidden; t.textContent = a.hidden ? '看答案' : '收起答案'; }
   else if (act === 'grade') { var qz = t.closest('.quiz'), k2 = qz.getAttribute('data-k'), okv = t.getAttribute('data-v') === '1', st2 = CQ[k2] || { s: 0, t: 0 }; CQ[k2] = { s: okv ? st2.s + 1 : 0, t: Date.now() }; store.set('cq2', CQ); t.parentNode.innerHTML = '<span class="from">' + (okv ? (CQ[k2].s >= 3 ? '连续答对 3 次，这道题以后不再出了。' : '记下了：答对。过几天再考你一次。') : '记下了：答错。回上面把这个知识点再看一遍，过几天还会再出。') + '</span>'; }
   else if (act === 'terse') { TERSE = t.getAttribute('data-v') === '1'; store.set('terse', TERSE); var art = view.querySelector('.lesson'); if (art) art.classList.toggle('terse', TERSE); [].forEach.call(t.parentNode.children, function (b) { b.classList.toggle('on', b === t); }); }
-  else if (act === 'done') { var no2 = t.getAttribute('data-no'); CDONE[no2] = Date.now(); store.set('cdone', CDONE); document.getElementById('fin').innerHTML = finHtml(LESSONS[LIDX[no2]]); toast('已记为学过'); }
+  else if (act === 'done') { var no2 = t.getAttribute('data-no'); CDONE[no2] = Date.now(); store.set('cdone', CDONE); var nmk = fcMake(LESSONS[LIDX[no2]], Date.now()); fcLog({ k: 'learn', id: no2, t: Date.now() }); fcSave(); if (nmk) setTimeout(function () { toast('这一课出了 ' + nmk + ' 张闪卡，1 小时后第一次复习'); }, 1500); document.getElementById('fin').innerHTML = finHtml(LESSONS[LIDX[no2]]); toast('已记为学过'); }
   else if (act === 'xopen') { var xid = t.closest('.exam').getAttribute('data-x'), xf = xInfo(xid); if (xf && xf.open && !EX[xid]) { EX[xid] = { t0: Date.now(), a: [], n: xf.p.n }; store.set('ex', EX); } nav('x/' + xid, true); }
   else if (act === 'xpick') { var xid2 = t.closest('.exam').getAttribute('data-x'), xs = EX[xid2]; if (xs && !xs.done) { xs.a[+t.getAttribute('data-q')] = +t.getAttribute('data-o'); store.set('ex', EX); [].forEach.call(t.parentNode.querySelectorAll('.xo'), function (b) { b.classList.toggle('on', b === t); }); document.getElementById('xsub').innerHTML = xSubHtml(xs, xs.n); } }
   else if (act === 'xsub') { var xs2 = EX[t.closest('.exam').getAttribute('data-x')], un2 = 0; for (var xi = 0; xi < xs2.n; xi++) if (xs2.a[xi] == null) un2++; document.getElementById('xsub').innerHTML = '<p class="note" style="margin-top:20px"><b>先别急着交。</b>' + (un2 ? '还有 ' + un2 + ' 题没答。' : '') + '交卷以后不能改，也不能重做。从第 1 题起再检查一遍：题目问的是什么，自己选的是不是想选的那个。</p><button class="cta alt" data-act="xchk">回去检查</button><button class="cta" data-act="xsub2">检查过了，交卷</button>'; }
   else if (act === 'xchk') { var xs3 = EX[t.closest('.exam').getAttribute('data-x')], first = 0; for (var xj = 0; xj < xs3.n; xj++) if (xs3.a[xj] == null) { first = xj; break; } document.getElementById('xsub').innerHTML = xSubHtml(xs3, xs3.n); jumpTo('xq-' + first); }
   else if (act === 'xsub2') { var xid3 = t.closest('.exam').getAttribute('data-x'), xs4 = EX[xid3], xq = xPaper(xid3), sc = 0, tot = 0; if (xq && xs4 && !xs4.done) { xq.forEach(function (q, i) { if (q.x) return; tot++; if (xs4.a[i] === q.c) sc++; }); xs4.done = Date.now(); xs4.s = sc; xs4.n = tot; store.set('ex', EX); } nav('x/' + xid3, true); }
+  else if (act === 'logx') { toast('正在整理……'); fcExport(function (txt) { var name = 'llm-dict-log-' + fcDate(Date.now()) + '.txt';
+      if (NB && NB.fcExport) { var r1 = NB.fcExport(name, txt); toast(r1 === 'ok' ? '已保存到“下载”文件夹：' + name : '保存没成功，已复制到剪贴板'); if (r1 !== 'ok') NB.copy(txt); }
+      else { var bl = new Blob([txt], { type: 'text/plain;charset=utf-8' }), u = URL.createObjectURL(bl), a2 = document.createElement('a'); a2.href = u; a2.download = name; document.body.appendChild(a2); a2.click(); setTimeout(function () { URL.revokeObjectURL(u); a2.remove(); }, 1000); toast('已下载：' + name); }
+      window.__lastExport = txt; }); }
+  else if (act === 'fcflip') { FCS.flip = true; nav('fc', true); }
+  else if (act === 'fcg') { var g = +t.getAttribute('data-g'), c0 = FC.c[FCS.id]; if (c0) { var now0 = Date.now(); fcLog({ k: 'rv', id: FCS.id, g: g, t: now0, lv: fsLevel(c0) }); fsGrade(c0, g, now0); fcSave(); } FCS.id = null; FCS.flip = false; nav('fc', true); }
+  else if (act === 'fcon') { if (t.getAttribute('data-v') === '1') { if (NB.fcAsk) NB.fcAsk(); else window.__fcPerm(true); } else { FC.cfg.on = false; fcSave(); nav('fc', true); } }
+  else if (act === 'fccap') { FC.cfg.cap = +t.getAttribute('data-v'); fcSave(); nav('fc', true); }
+  else if (act === 'fcq') { FC.cfg.q0 = +t.getAttribute('data-a'); FC.cfg.q1 = +t.getAttribute('data-b'); fcSave(); nav('fc', true); }
+  else if (act === 'fctest') { fcSave(); var r0 = NB.fcTest(); toast(r0 === 'ok' ? '已经弹到通知栏了，下拉看看' : r0 === 'perm' ? '先把“到时间就在通知栏弹卡”打开' : '现在没有卡可以弹'); }
   else if (act === 'tog') { var box = t.previousElementSibling; box.hidden = !box.hidden; t.textContent = box.hidden ? t.getAttribute('data-t') : '收起'; }
   else if (act === 'copy') { var lines = t.parentNode.querySelector('pre').textContent.split('\n'), sh = t.parentNode.classList.contains('sh'); if (sh) lines = lines.filter(function (l) { return !/^\s*#/.test(l); }).map(function (l) { return l.replace(/^\$ /, ''); }); toast(copyText(lines.join('\n')) ? '已复制' : '复制不了，长按代码手动选'); }
   else if (act === 'clr') { S.q = ''; var q = document.getElementById('q'); q.value = ''; updateResults(); q.focus(); }
@@ -760,7 +1003,7 @@ function onResize() { var hh = window.visualViewport ? visualViewport.height : w
 if (window.visualViewport) visualViewport.addEventListener('resize', onResize); else window.addEventListener('resize', onResize);
 /* 给安卓返回键用：返回 true 表示自己处理了 */
 window.__back = function () { if (back()) return true; if (curTab !== 'home') { switchTab('home', false); return true; } if (S.q) { S.q = ''; render(false); return true; } return false; };
-window.__course = function () { return { done: CDONE, q: CQ, due: dueQuizzes().length, ex: EX }; };
+window.__course = function () { return { done: CDONE, q: CQ, due: dueQuizzes().length, ex: EX, fc: FC, logs: LOGS }; };
 window.__nav = nav; window.__top = function () { return top().r; }; window.__tab = function () { return curTab; }; window.__ready = function () { return warmed; };
 render(false);
 })();

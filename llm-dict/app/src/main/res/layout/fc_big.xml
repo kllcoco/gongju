@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="wrap_content"
+    android:orientation="vertical">
+    <TextView android:id="@+id/fc_src"
+        style="@android:style/TextAppearance.Material.Notification.Info"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:maxLines="1" android:ellipsize="end" />
+    <TextView android:id="@+id/fc_front"
+        style="@android:style/TextAppearance.Material.Notification.Title"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="4dp" android:maxLines="4" android:ellipsize="end" />
+    <ImageView android:id="@+id/fc_div"
+        android:layout_width="match_parent" android:layout_height="1dp"
+        android:layout_marginTop="8dp" android:layout_marginBottom="8dp"
+        android:src="@drawable/fc_line" android:scaleType="fitXY" android:visibility="gone" />
+    <TextView android:id="@+id/fc_back"
+        style="@android:style/TextAppearance.Material.Notification"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:maxLines="6" android:ellipsize="end" android:visibility="gone" />
+    <TextView android:id="@+id/fc_flip"
+        style="@android:style/TextAppearance.Material.Notification.Title"
+        android:layout_width="match_parent" android:layout_height="40dp"
+        android:layout_marginTop="10dp" android:background="@drawable/fc_btn"
+        android:gravity="center" android:text="翻面看答案" />
+    <LinearLayout android:id="@+id/fc_grades"
+        android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="10dp" android:orientation="horizontal" android:visibility="gone">
+        <TextView android:id="@+id/fc_g1" style="@android:style/TextAppearance.Material.Notification"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginEnd="6dp" android:background="@drawable/fc_btn"
+            android:gravity="center" android:maxLines="2" android:textColor="#D93025" />
+        <TextView android:id="@+id/fc_g2" style="@android:style/TextAppearance.Material.Notification"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginEnd="6dp" android:background="@drawable/fc_btn"
+            android:gravity="center" android:maxLines="2" />
+        <TextView android:id="@+id/fc_g3" style="@android:style/TextAppearance.Material.Notification"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:layout_marginEnd="6dp" android:background="@drawable/fc_btn"
+            android:gravity="center" android:maxLines="2" />
+        <TextView android:id="@+id/fc_g4" style="@android:style/TextAppearance.Material.Notification"
+            android:layout_width="0dp" android:layout_height="44dp" android:layout_weight="1"
+            android:background="@drawable/fc_btn"
+            android:gravity="center" android:maxLines="2" android:textColor="#188038" />
+    </LinearLayout>
+</LinearLayout>

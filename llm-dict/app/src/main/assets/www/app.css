@@ -236,3 +236,17 @@ html[data-theme=dark] .lesson .pit.mm .src{color:#f0c06a}
 .xcmp{display:grid;gap:8px;margin-top:10px}.xcmp>div{padding:10px 12px;border-radius:10px;line-height:1.55;overflow-wrap:anywhere}.xcmp small{display:block;font-size:12.5px;font-weight:700;margin-bottom:2px}
 .xcmp .r{background:rgba(12,122,91,.1)}.xcmp .r small{color:var(--green)}.xcmp .w{background:var(--red-bg)}.xcmp .w small{color:var(--red)}
 .xw{margin-top:10px;line-height:1.65}
+.fcbar{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:16px 0 14px}
+.fcbar>div{background:var(--bg2,rgba(127,127,127,.08));border-radius:10px;padding:10px 6px;text-align:center}
+.fcbar b{display:block;font-size:22px;font-variant-numeric:tabular-nums;color:var(--ink)}.fcbar span{font-size:12px;color:var(--ink3)}
+.fcard{border:1.5px solid var(--line);border-radius:14px;padding:16px;margin-top:6px;overflow-wrap:anywhere}
+.fcard .fsrc{font-size:12.5px;color:var(--ink3);display:flex;justify-content:space-between;gap:8px;margin-bottom:8px}
+.fcard .fsrc span{flex:none;color:var(--blue)}
+.fcard .ff{font-size:1.05em;font-weight:600;line-height:1.65}
+.fcard .fb{margin-top:14px;padding-top:14px;border-top:1.5px dashed var(--line);line-height:1.7}
+.fcard .ff p,.fcard .fb p{margin:.4em 0}
+.fcg{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.fcg button{border:1.5px solid var(--line);border-radius:10px;padding:10px 4px;text-align:center;line-height:1.3}
+.fcg button b{display:block;font-size:15px}.fcg button small{display:block;font-size:11.5px;color:var(--ink3);margin-top:2px}
+.fcg button[data-g="1"] b{color:var(--red)}.fcg button[data-g="4"] b{color:var(--green)}
+.logd{padding:12px 0;border-bottom:1px solid var(--line)}.logd b{margin-right:10px}.logd span{color:var(--ink3);font-size:14px}.logd p{margin:6px 0 0;font-size:14px;line-height:1.6;color:var(--ink2)}
