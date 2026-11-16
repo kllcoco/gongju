@@ -518,7 +518,7 @@ function pageCourse(isBack) {
   else html += '<p class="note" style="padding-top:16px">这几章都学完了。</p>';
   if (due) html += '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>';
   var X = D.exams, fdone = X.final.filter(function (p) { return (EX[p.id] || {}).done; }).length;
-  html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
+  html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return L.l.kind === 'ex' || L.l.kind === 'ans' || CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
   var lastP = -1;
   D.course.forEach(function (c) {
     var d = c.lessons.filter(function (l) { return CDONE[l.no]; }).length, pi = -1;
@@ -606,13 +606,13 @@ function xPaper(id) { try { return JSON.parse(decodeURIComponent(escape(atob(XD[
 function xInfo(id) {
   var X = D.exams, r = null, AB = 'ABCDEF';
   Object.keys(X.stage).forEach(function (ch) { X.stage[ch].forEach(function (p, j) {
-    if (p.id !== id) return; var c = courseCh(ch), left = c ? c.lessons.filter(function (l) { return !CDONE[l.no]; }).length : 1;
+    if (p.id !== id) return; var c = courseCh(ch), left = c ? c.lessons.filter(function (l) { return l.kind !== 'ex' && l.kind !== 'ans' && !CDONE[l.no]; }).length : 1;
     r = { p: p, name: '第 ' + ch + ' 章　阶段卷 ' + AB[j], open: true, why: '', next: X.stage[ch][j + 1], home: 'cc/' + ch };
     if (left) { r.open = false; r.why = '学完第 ' + ch + ' 章才开启，还差 ' + left + ' 课'; }
     else if (j && !(EX[X.stage[ch][j - 1].id] || {}).done) { r.open = false; r.why = '做完阶段卷 ' + AB[j - 1] + ' 才开启'; }
   }); });
   X.final.forEach(function (p, j) {
-    if (p.id !== id) return; var left = LESSONS.filter(function (L) { return !CDONE[L.l.no]; }).length;
+    if (p.id !== id) return; var left = LESSONS.filter(function (L) { return L.l.kind !== 'ex' && L.l.kind !== 'ans' && !CDONE[L.l.no]; }).length;
     r = { p: p, name: '结业卷　第 ' + (j + 1) + ' 套', open: true, why: '', next: X.final[j + 1], home: 'fx' };
     if (left) { r.open = false; r.why = '学完第 91 章才开启，还差 ' + left + ' 课'; }
     else if (j && !(EX[X.final[j - 1].id] || {}).done) { r.open = false; r.why = '做完第 ' + j + ' 套才开启'; }
