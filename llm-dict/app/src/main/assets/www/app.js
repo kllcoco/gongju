@@ -312,6 +312,8 @@ function render(isBack) {
   else if (p[0] === 'cc') pageCourseCh(isBack, p[1]);
   else if (p[0] === 'l') pageLesson(isBack, p[1]);
   else if (p[0] === 'rv') pageReview(isBack);
+  else if (p[0] === 'fx') pageFinal(isBack);
+  else if (p[0] === 'x') pageExam(isBack, p[1]);
   else if (p[0] === 'cmds') pageCmds(isBack);
   else if (p[0] === 'cmd') pageCmd(isBack, decodeURIComponent(r.slice(4)));
   else if (p[0] === 'c') pageChapter(isBack, p[1], p[2]);
@@ -486,7 +488,7 @@ function loadK(n, cb) {
 }
 var LESSONS = [], LIDX = {};
 D.course.forEach(function (c) { c.lessons.forEach(function (l, k) { LIDX[l.no] = LESSONS.length; LESSONS.push({ c: c, l: l, k: k }); }); });
-(function warmK(k) { if (k < D.course.length) loadK(D.course[k].n, function () { setTimeout(function () { warmK(k + 1); }, 20); }); })(0);
+function courseCh(n) { for (var i = 0; i < D.course.length; i++) if (D.course[i].n === n) return D.course[i]; return null; }
 var MINE_BY = {}; D.mine.forEach(function (m, i) { (m.e || []).forEach(function (id) { (MINE_BY[id] = MINE_BY[id] || []).push(i); }); });
 function lessonData(L) { var d = KC[L.c.n]; return d ? d.lessons[L.k] : null; }
 function nextLesson() { for (var i = 0; i < LESSONS.length; i++) if (!CDONE[LESSONS[i].l.no]) return LESSONS[i]; return null; }
@@ -499,7 +501,7 @@ function lessonQuizzes(L) {
 /* 到期该复习的题：只从学完的课里出；一周内问过的不出；连续答对 3 次的不再出 */
 function dueQuizzes() {
   var now = Date.now(), out = [];
-  LESSONS.forEach(function (L) { if (!CDONE[L.l.no]) return; lessonQuizzes(L).forEach(function (q) { var s = CQ[q.k]; if (s && (s.s >= 3 || now - s.t < 7 * DAY)) return; if (!s && now - CDONE[L.l.no] < DAY / 2) return; out.push(q); }); });
+  LESSONS.forEach(function (L) { var t0 = CDONE[L.l.no]; if (!t0) return; for (var i = 0; i < (L.l.q || 0); i++) { var k = L.l.no + '#' + i, s = CQ[k]; if (s && (s.s >= 3 || now - s.t < 7 * DAY)) continue; if (!s && now - t0 < DAY / 2) continue; out.push({ k: k, L: L, i: i }); } });
   return out;
 }
 function shuffle(a) { for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)), t = a[i]; a[i] = a[j]; a[j] = t; } return a; }
@@ -515,12 +517,16 @@ function pageCourse(isBack) {
   if (nx) html += '<button class="cta" data-go="l/' + nx.l.no + '"><small>' + (Object.keys(CDONE).length ? '接着学' : '从这里开始') + '</small>' + (lno(nx.l) ? lno(nx.l) + '　' : '第 ' + nx.c.n + ' 章　') + esc(nx.l.t) + '</button>';
   else html += '<p class="note" style="padding-top:16px">这几章都学完了。</p>';
   if (due) html += '<button class="cta alt" data-go="rv"><small>开新课之前</small>先复习 ' + Math.min(5, due) + ' 道题</button>';
-  html += '<div class="sh" style="position:static">章节</div>';
+  var X = D.exams, fdone = X.final.filter(function (p) { return (EX[p.id] || {}).done; }).length;
+  html += '<button class="row" data-go="fx"><span class="t"><span class="no">结业</span>密封卷 ' + X.ft + ' 套</span><span class="m">' + (LESSONS.every(function (L) { return CDONE[L.l.no]; }) ? '做完 ' + fdone + ' 套' : '学完第 91 章才开启') + '</span></button>';
+  var lastP = -1;
   D.course.forEach(function (c) {
-    var d = c.lessons.filter(function (l) { return CDONE[l.no]; }).length;
+    var d = c.lessons.filter(function (l) { return CDONE[l.no]; }).length, pi = -1;
+    D.parts.forEach(function (p, k) { if (+c.n >= p[2] && +c.n <= p[3]) pi = k; });
+    if (pi !== lastP && pi >= 0) { lastP = pi; html += '<div class="sh" style="position:static">第' + D.parts[pi][0] + '篇　' + esc(D.parts[pi][1]) + '</div>'; }
     html += '<button class="row" data-go="cc/' + c.n + '"><span class="t"><span class="no">第 ' + c.n + ' 章</span>' + esc(c.t) + '</span><span class="m">' + d + ' / ' + c.lessons.length + ' 课' + bar2(d, c.lessons.length) + '</span></button>';
   });
-  html += '<p class="note" style="margin-top:16px">现在有第 2 到 5 章，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。紫色的“补充”不是教材原文，是给第一次学的人加的提示：在哪个窗口敲、没有文件怎么练、屏幕上应该看到什么。每章最后有“动手实践”。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。</p>';
+  html += '<p class="note" style="margin-top:16px">全书 ' + D.course.length + ' 章，共 ' + LESSONS.length + ' 课，正文是完整的白话版教材。课里的“想一想”先自己答再看答案，然后选答对还是答错；学过的题隔几天会再考，连续答对 3 次就不再出。紫色的“补充”不是教材原文，是给第一次学的人加的提示，目前只有第 2 到 5 章有。每章学完会开启这一章的阶段密封卷。</p>';
   show('<div class="rows0">' + html + '</div>', isBack);
 }
 function pageCourseCh(isBack, n) {
@@ -531,7 +537,10 @@ function pageCourseCh(isBack, n) {
     html += '<button class="lz' + (CDONE[l.no] ? ' done' : '') + '" data-go="l/' + l.no + '">' + (lno(l) ? '<span class="no">' + l.no + '</span>' : '') + '<span class="lt">' + esc(l.t) + '</span><span class="ck">' + (CDONE[l.no] ? '学过了' : l.p.length + ' 个点') + '</span></button>' +
       (l.kind === 'kp' || l.kind === 'lab' ? '<ul>' + l.p.map(function (p) { return '<li><b>' + esc(p[0] === l.t ? '概览' : p[0]) + '</b>' + (p[1] ? '：' + esc(p[1].length > 46 ? p[1].slice(0, 46) + '…' : p[1]) : '') + '</li>'; }).join('') + '</ul>' : '<ul></ul>');
   });
-  show(html + '</div>', isBack);
+  html += '</div>';
+  var sp = D.exams.stage[c.n] || [];
+  if (sp.length) html += '<div class="sh" style="position:static">阶段密封卷</div><p class="note">学完这一章才开启，做完一套才开下一套。每套只能做一次。</p>' + sp.map(function (p) { return xRow(p.id); }).join('');
+  show(html, isBack);
 }
 function blocksHtml(bl, st) {
   return bl.map(function (b) {
@@ -578,10 +587,87 @@ function finHtml(L) {
 }
 function pageReview(isBack) {
   setBar({ back: true, title: '<b>复习</b>', aa: true });
-  if (D.course.some(function (c) { return !KC[c.n]; })) { show('<div class="empty">正在准备题目……</div>', false); return setTimeout(function () { if (top().r === 'rv') pageReview(false); }, 300); }
-  var qs = shuffle(dueQuizzes()).slice(0, 5);
+  var ks = shuffle(dueQuizzes()).slice(0, 5), want = top(), need = {}, left = 0;
+  ks.forEach(function (k) { if (!KC[k.L.c.n] && !need[k.L.c.n]) { need[k.L.c.n] = 1; left++; } });
+  if (left) { show('<div class="empty">正在准备题目……</div>', false); Object.keys(need).forEach(function (n) { loadK(n, function () { if (--left === 0 && top() === want) pageReview(isBack); }); }); return; }
+  var qs = ks.map(function (k) { return lessonQuizzes(k.L)[k.i]; }).filter(Boolean);
   if (!qs.length) { show('<div class="empty"><b>现在没有到期要复习的题</b>学完新课、或者过几天再来。</div><button class="cta" data-go="course" data-rep="1">回到课程</button>', false); return; }
   show('<article class="entry lesson"><p class="why" style="margin-top:16px">' + qs.length + ' 道题，新旧章节混着出。先自己答，再点开看答案，然后老实选“答对了”还是“答错了”。答错的过几天会再出。</p>' + qs.map(function (q) { return cquiz(q, true); }).join('') + '<button class="cta" data-go="course" data-rep="1">答完了，回到课程</button></article>', isBack);
+}
+
+/* ---------- 密封卷：平时不出现；学完才开；做完一套才开下一套；每套只做一次 ---------- */
+var EX = store.get('ex', {}), XD = window.__XPRE || null, xwait = null;
+window.DICT_EXAM = function (d) { XD = d; var w = xwait || []; xwait = null; w.forEach(function (f) { f(); }); };
+function loadX(cb) {
+  if (XD) return cb(); if (xwait) return xwait.push(cb); xwait = [cb];
+  var s = document.createElement('script'); s.src = 'data/x.js'; s.onerror = function () { var w = xwait || []; xwait = null; w.forEach(function (f) { f(); }); }; document.head.appendChild(s);
+}
+function xPaper(id) { try { return JSON.parse(decodeURIComponent(escape(atob(XD[id])))); } catch (e) { return null; } }
+function xInfo(id) {
+  var X = D.exams, r = null, AB = 'ABCDEF';
+  Object.keys(X.stage).forEach(function (ch) { X.stage[ch].forEach(function (p, j) {
+    if (p.id !== id) return; var c = courseCh(ch), left = c ? c.lessons.filter(function (l) { return !CDONE[l.no]; }).length : 1;
+    r = { p: p, name: '第 ' + ch + ' 章　阶段卷 ' + AB[j], open: true, why: '', next: X.stage[ch][j + 1], home: 'cc/' + ch };
+    if (left) { r.open = false; r.why = '学完第 ' + ch + ' 章才开启，还差 ' + left + ' 课'; }
+    else if (j && !(EX[X.stage[ch][j - 1].id] || {}).done) { r.open = false; r.why = '做完阶段卷 ' + AB[j - 1] + ' 才开启'; }
+  }); });
+  X.final.forEach(function (p, j) {
+    if (p.id !== id) return; var left = LESSONS.filter(function (L) { return !CDONE[L.l.no]; }).length;
+    r = { p: p, name: '结业卷　第 ' + (j + 1) + ' 套', open: true, why: '', next: X.final[j + 1], home: 'fx' };
+    if (left) { r.open = false; r.why = '学完第 91 章才开启，还差 ' + left + ' 课'; }
+    else if (j && !(EX[X.final[j - 1].id] || {}).done) { r.open = false; r.why = '做完第 ' + j + ' 套才开启'; }
+  });
+  if (r && EX[id]) r.open = true;
+  return r;
+}
+function xRow(id) {
+  var f = xInfo(id), st = EX[id]; if (!f) return '';
+  if (!f.open) return '<div class="row xlock"><span class="t">' + esc(f.name) + '</span><span class="m">未开启　' + esc(f.why) + '</span></div>';
+  return '<button class="row" data-go="x/' + id + '"><span class="t">' + esc(f.name) + '</span><span class="m">' + (st && st.done ? '已交卷　' + st.s + ' / ' + st.n : st ? '做到一半，接着做' : '已开启，还没拆封') + '</span></button>';
+}
+function pageFinal(isBack) {
+  setBar({ back: true, title: '<b>结业密封卷</b>' });
+  var X = D.exams, html = '<p class="note" style="padding-top:16px">一共 ' + X.ft + ' 套，是全书的收尾测试。第 91 章学完才开启第 1 套，做完一套才开下一套，每套只能做一次。卷子里的题，课文、复习题和字典里都不会出现。</p>';
+  if (X.final.length < X.ft) html += '<p class="note">现在已经出好 ' + X.final.length + ' 套' + (X.final.length ? '' : '：题目还没有写进这一版') + '。</p>';
+  for (var j = 0; j < X.ft; j++) html += X.final[j] ? xRow(X.final[j].id) : '<div class="row xlock"><span class="t">结业卷　第 ' + (j + 1) + ' 套</span><span class="m">未开启</span></div>';
+  show('<div class="rows0">' + html + '</div>', isBack);
+}
+function xSubHtml(st, n) {
+  var un = 0; for (var i = 0; i < n; i++) if (st.a[i] == null) un++;
+  return '<button class="cta" data-act="xsub"><small>' + (un ? '还有 ' + un + ' 题没答' : n + ' 题都答了') + '</small>交卷</button>';
+}
+function pageExam(isBack, id) {
+  var f = xInfo(id); if (!f) return nav('course', true);
+  setBar({ back: true, title: esc(f.name), aa: true });
+  var want = top();
+  loadX(function () {
+    if (top() !== want) return;
+    var qs = XD ? xPaper(id) : null, st = EX[id];
+    if (!qs) { show('<div class="empty"><b>卷子没有打开</b>返回再点一次。</div>', false); return; }
+    if (!st && !f.open) { show('<div class="empty"><b>这套卷还没开启</b>' + esc(f.why) + '。</div>', false); return; }
+    var html = '<article class="entry lesson exam" data-x="' + id + '">';
+    if (!st) {
+      html += '<h1 class="hw">' + esc(f.name) + '</h1><p class="why">' + qs.length + ' 道选择题。这是一套没见过的题，用来检查你是不是真的学会了。</p>' +
+        '<ul class="xrule"><li>拆封以后，这套卷就算用掉了，只能做这一次。</li><li>不翻课文，不查字典，不问别人。</li><li>中途可以退出，答过的会留着，回来接着做。</li><li>交卷以后才能看到对错和讲解。</li></ul>' +
+        '<button class="cta" data-act="xopen"><small>准备好了再点</small>拆封，开始做</button>';
+    } else if (!st.done) {
+      html += '<p class="why" style="margin-top:16px">' + qs.length + ' 道题，每题选一个。交卷前都可以改。</p>' + qs.map(function (q, i) {
+        return '<div class="xq" id="xq-' + i + '"><div class="xn">第 ' + (i + 1) + ' 题</div><div class="qq">' + fix(q.q) + '</div>' + q.o.map(function (o, k) { return '<button class="xo' + (st.a[i] === k ? ' on' : '') + '" data-act="xpick" data-q="' + i + '" data-o="' + k + '"><b>' + 'ABCD'[k] + '</b><span>' + o + '</span></button>'; }).join('') + '</div>';
+      }).join('') + '<div id="xsub">' + xSubHtml(st, qs.length) + '</div>';
+    } else {
+      var wrong = {};
+      html += '<h1 class="hw">' + esc(f.name) + '</h1><div class="xscore"><b>' + st.s + '</b> / ' + st.n + '<span>答对的题数</span></div>' + qs.map(function (q, i) {
+        var me = st.a[i], ok = me === q.c; if (!ok && !q.x) wrong[q.r] = 1;
+        return '<div class="xq ' + (q.x ? 'void' : ok ? 'ok' : 'no') + '"><div class="xn">第 ' + (i + 1) + ' 题　' + (q.x ? '作废，不计分：' + esc(q.x) : ok ? '答对了' : '答错了') + '</div><div class="qq">' + fix(q.q) + '</div>' +
+          '<div class="xcmp"><div class="' + (ok ? 'r' : 'w') + '"><small>你选的</small>' + (me == null ? '没有作答' : 'ABCD'[me] + '　' + q.o[me]) + '</div>' + (ok ? '' : '<div class="r"><small>正确答案</small>' + 'ABCD'[q.c] + '　' + q.o[q.c] + '</div>') + '</div>' +
+          '<div class="xw">' + q.w + '</div><div class="from"><button class="lnk" data-go="l/' + q.r + '">出自 ' + q.r + '，回去看这一课</button></div></div>';
+      }).join('');
+      var wl = Object.keys(wrong);
+      html += (wl.length ? '<p class="note" style="margin-top:20px">答错的题出自：' + wl.join('、') + '。同一课里错了不止一次的，说明这一课还没掌握，建议整课重学，不只是看这道题的讲解。</p>' : '<p class="note" style="margin-top:20px">全对。</p>') +
+        (f.next ? '<button class="cta" data-go="x/' + f.next.id + '" data-rep="1"><small>下一套已经开启</small>去看下一套</button>' : '') + '<button class="cta alt" data-go="' + f.home + '" data-rep="1">回去</button>';
+    }
+    show(html + '</article>', isBack);
+  });
 }
 
 /* ---------- 术语表 ---------- */
@@ -653,6 +739,11 @@ document.addEventListener('click', function (ev) {
   else if (act === 'grade') { var qz = t.closest('.quiz'), k2 = qz.getAttribute('data-k'), okv = t.getAttribute('data-v') === '1', st2 = CQ[k2] || { s: 0, t: 0 }; CQ[k2] = { s: okv ? st2.s + 1 : 0, t: Date.now() }; store.set('cq2', CQ); t.parentNode.innerHTML = '<span class="from">' + (okv ? (CQ[k2].s >= 3 ? '连续答对 3 次，这道题以后不再出了。' : '记下了：答对。过几天再考你一次。') : '记下了：答错。回上面把这个知识点再看一遍，过几天还会再出。') + '</span>'; }
   else if (act === 'terse') { TERSE = t.getAttribute('data-v') === '1'; store.set('terse', TERSE); var art = view.querySelector('.lesson'); if (art) art.classList.toggle('terse', TERSE); [].forEach.call(t.parentNode.children, function (b) { b.classList.toggle('on', b === t); }); }
   else if (act === 'done') { var no2 = t.getAttribute('data-no'); CDONE[no2] = Date.now(); store.set('cdone', CDONE); document.getElementById('fin').innerHTML = finHtml(LESSONS[LIDX[no2]]); toast('已记为学过'); }
+  else if (act === 'xopen') { var xid = t.closest('.exam').getAttribute('data-x'), xf = xInfo(xid); if (xf && xf.open && !EX[xid]) { EX[xid] = { t0: Date.now(), a: [], n: xf.p.n }; store.set('ex', EX); } nav('x/' + xid, true); }
+  else if (act === 'xpick') { var xid2 = t.closest('.exam').getAttribute('data-x'), xs = EX[xid2]; if (xs && !xs.done) { xs.a[+t.getAttribute('data-q')] = +t.getAttribute('data-o'); store.set('ex', EX); [].forEach.call(t.parentNode.querySelectorAll('.xo'), function (b) { b.classList.toggle('on', b === t); }); document.getElementById('xsub').innerHTML = xSubHtml(xs, xs.n); } }
+  else if (act === 'xsub') { var xs2 = EX[t.closest('.exam').getAttribute('data-x')], un2 = 0; for (var xi = 0; xi < xs2.n; xi++) if (xs2.a[xi] == null) un2++; document.getElementById('xsub').innerHTML = '<p class="note" style="margin-top:20px"><b>先别急着交。</b>' + (un2 ? '还有 ' + un2 + ' 题没答。' : '') + '交卷以后不能改，也不能重做。从第 1 题起再检查一遍：题目问的是什么，自己选的是不是想选的那个。</p><button class="cta alt" data-act="xchk">回去检查</button><button class="cta" data-act="xsub2">检查过了，交卷</button>'; }
+  else if (act === 'xchk') { var xs3 = EX[t.closest('.exam').getAttribute('data-x')], first = 0; for (var xj = 0; xj < xs3.n; xj++) if (xs3.a[xj] == null) { first = xj; break; } document.getElementById('xsub').innerHTML = xSubHtml(xs3, xs3.n); jumpTo('xq-' + first); }
+  else if (act === 'xsub2') { var xid3 = t.closest('.exam').getAttribute('data-x'), xs4 = EX[xid3], xq = xPaper(xid3), sc = 0, tot = 0; if (xq && xs4 && !xs4.done) { xq.forEach(function (q, i) { if (q.x) return; tot++; if (xs4.a[i] === q.c) sc++; }); xs4.done = Date.now(); xs4.s = sc; xs4.n = tot; store.set('ex', EX); } nav('x/' + xid3, true); }
   else if (act === 'tog') { var box = t.previousElementSibling; box.hidden = !box.hidden; t.textContent = box.hidden ? t.getAttribute('data-t') : '收起'; }
   else if (act === 'copy') { var lines = t.parentNode.querySelector('pre').textContent.split('\n'), sh = t.parentNode.classList.contains('sh'); if (sh) lines = lines.filter(function (l) { return !/^\s*#/.test(l); }).map(function (l) { return l.replace(/^\$ /, ''); }); toast(copyText(lines.join('\n')) ? '已复制' : '复制不了，长按代码手动选'); }
   else if (act === 'clr') { S.q = ''; var q = document.getElementById('q'); q.value = ''; updateResults(); q.focus(); }
@@ -667,7 +758,7 @@ function onResize() { var hh = window.visualViewport ? visualViewport.height : w
 if (window.visualViewport) visualViewport.addEventListener('resize', onResize); else window.addEventListener('resize', onResize);
 /* 给安卓返回键用：返回 true 表示自己处理了 */
 window.__back = function () { if (back()) return true; if (curTab !== 'home') { switchTab('home', false); return true; } if (S.q) { S.q = ''; render(false); return true; } return false; };
-window.__course = function () { return { done: CDONE, q: CQ, due: dueQuizzes().length }; };
-window.__nav = nav; window.__top = function () { return top().r; }; window.__tab = function () { return curTab; }; window.__ready = function () { return warmed && D.course.every(function (c) { return KC[c.n]; }); };
+window.__course = function () { return { done: CDONE, q: CQ, due: dueQuizzes().length, ex: EX }; };
+window.__nav = nav; window.__top = function () { return top().r; }; window.__tab = function () { return curTab; }; window.__ready = function () { return warmed; };
 render(false);
 })();

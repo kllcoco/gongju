@@ -58,11 +58,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete llm-dict-latest --yes --cleanup-tag || true
-          cp "$GITHUB_WORKSPACE/llm-dict/web/llm-dict.html" llm-dict.html
+          python3 "$GITHUB_WORKSPACE/llm-dict/web/build.py" "$GITHUB_WORKSPACE/llm-dict/app/src/main/assets/www" llm-dict.html
           gh release create llm-dict-latest llm-dict.apk llm-dict.html \
             --target "$GITHUB_SHA" \
             --title "大模型字典（最新版）" \
-            --notes "离线知识点字典 + 第 2 到 5 章课程。安卓手机下载 llm-dict.apk 安装；电脑上下载 llm-dict.html 用浏览器打开，内容相同。构建编号 $GITHUB_RUN_NUMBER。"
+            --notes "离线知识点字典 + 全书 91 章课程 + 密封卷。安卓手机下载 llm-dict.apk 安装；电脑上下载 llm-dict.html 用浏览器打开，内容相同。构建编号 $GITHUB_RUN_NUMBER。"
 
       - name: 把构建结果记到 llm-dict-buildlog 分支
         if: always()

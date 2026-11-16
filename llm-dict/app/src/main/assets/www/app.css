@@ -223,3 +223,16 @@ html[data-theme=dark] .lesson .pit.mm .src{color:#f0c06a}
 .item.sup p{margin:.5em 0}.item.sup p:last-child{margin-bottom:0}.item.sup code{background:rgba(127,127,127,.15)}
 .item.sup .code{margin:8px 0}.item.sup ul,.item.sup ol{margin:.45em 0;padding-left:1.3em}.item.sup li{margin:.3em 0}
 .item.gl{margin-top:14px}.glb p{margin:0;padding:8px 0;border-bottom:1px solid var(--line);font-size:14.5px;line-height:1.55}.glb b{color:var(--ink)}
+.row.xlock{opacity:.55}.row.xlock .m{white-space:normal;text-align:right}
+.xrule{margin:14px 0 0;padding-left:1.3em;line-height:1.7}.xrule li{margin:.35em 0}
+.xq{margin-top:26px;padding-top:18px;border-top:1px solid var(--line)}
+.xn{font-size:13px;font-weight:700;color:var(--ink3);margin-bottom:6px}.xq.ok .xn{color:var(--green)}.xq.no .xn{color:var(--red)}
+.xq .qq{font-size:1.02em;line-height:1.65;font-weight:600}
+.xo{display:flex;gap:10px;align-items:baseline;width:100%;margin-top:10px;padding:12px 14px;border-radius:10px;border:1.5px solid var(--line);text-align:left;line-height:1.55;font-size:1em;overflow-wrap:anywhere}
+.xo b{flex:none;color:var(--ink3);font-variant-numeric:tabular-nums}.xo span{min-width:0}
+.xo.on{border-color:var(--blue);background:var(--blue-bg)}.xo.on b{color:var(--blue)}
+.exam code{background:rgba(127,127,127,.15);overflow-wrap:anywhere}
+.xscore{margin:14px 0 4px;font-size:22px;color:var(--ink3)}.xscore b{font-size:44px;color:var(--ink);font-variant-numeric:tabular-nums}.xscore span{display:block;font-size:13px}
+.xcmp{display:grid;gap:8px;margin-top:10px}.xcmp>div{padding:10px 12px;border-radius:10px;line-height:1.55;overflow-wrap:anywhere}.xcmp small{display:block;font-size:12.5px;font-weight:700;margin-bottom:2px}
+.xcmp .r{background:rgba(12,122,91,.1)}.xcmp .r small{color:var(--green)}.xcmp .w{background:var(--red-bg)}.xcmp .w small{color:var(--red)}
+.xw{margin-top:10px;line-height:1.65}
