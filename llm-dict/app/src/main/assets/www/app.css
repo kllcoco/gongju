@@ -175,3 +175,51 @@ button:active{opacity:.6}
 table.opts td{font-size:1em;padding:9px 12px 9px 0}
 table.opts td:first-child{white-space:nowrap;width:1%;vertical-align:top}
 table.opts td:first-child code{background:var(--blue-bg);color:var(--blue)}
+
+.cta{display:block;width:100%;margin-top:16px;padding:13px 16px;border-radius:12px;background:var(--blue);color:#fff;font-size:17px;font-weight:700;line-height:1.4}
+html[data-theme=dark] .cta{color:#0d1116}
+.cta small{display:block;font-size:12.5px;font-weight:500;opacity:.85}
+.cta.alt{background:var(--violet-bg);color:var(--violet)}
+html[data-theme=dark] .cta.alt{color:var(--violet)}
+.rows0 .row{margin:0 -18px;width:calc(100% + 36px)}
+.pbar{display:inline-block;vertical-align:middle;width:90px;height:5px;border-radius:3px;background:var(--line);margin-left:10px;overflow:hidden}
+.pbar i{display:block;height:100%;background:var(--green)}
+.tree .lz{display:flex;align-items:baseline;gap:10px;width:100%;padding:14px 0 6px;font-size:16.5px;font-weight:700}
+.tree .lz .no{color:var(--blue);font-variant-numeric:tabular-nums;font-weight:600;font-size:14.5px;flex:none}
+.tree .lz .lt{flex:1;line-height:1.4}
+.tree .lz .ck{flex:none;font-size:12.5px;font-weight:500;color:var(--ink3)}
+.tree .lz.done .ck{color:var(--green)}
+.tree ul{margin:0 0 6px 8px;padding:0 0 8px 16px;border-left:2px solid var(--line);list-style:none;border-bottom:1px solid var(--line)}
+.tree li{font-size:14px;line-height:1.6;color:var(--ink2);margin:3px 0}
+.tree li b{color:var(--ink);font-weight:600}
+.lesson .why{font-size:1em;color:var(--ink2);margin:8px 0 0;line-height:1.75}
+.toc2{margin-top:16px;padding:12px 14px;background:var(--bg);border-radius:10px}
+.toc2 button{display:block;width:100%;padding:7px 0;font-size:.92em;color:var(--blue);line-height:1.45}
+.pt{margin-top:34px;padding-top:6px;border-top:2px solid var(--ink)}
+.pth{margin:10px 0 10px}
+.pth .pk{font-size:13px;color:var(--blue);font-weight:600;font-variant-numeric:tabular-nums}
+.pth h2{font-size:1.24em;font-weight:800;line-height:1.35;margin:2px 0 0;text-wrap:balance}
+.bridge{background:var(--blue-bg);border-radius:10px;padding:11px 14px;margin-bottom:10px;font-size:.96em}
+.bridge>:first-child{margin-top:0}.bridge>:last-child{margin-bottom:0}
+.lab2{font-size:13.5px;font-weight:700;margin:18px 0 8px;color:var(--green)}
+.lab2.pit2{color:var(--red)}
+.grade{display:flex;gap:10px;margin-top:12px}
+.grade button{flex:1;height:44px;border-radius:8px;background:var(--bg);font-size:14.5px;font-weight:600;text-align:center;color:var(--green)}
+.grade button+button{color:var(--red)}
+
+.lesson.terse .full{display:none}
+.lesson .body{margin:10px 0}
+.lesson .gist{margin:6px 0 10px;padding:11px 14px;background:var(--blue-bg);border-radius:10px;font-size:1.02em}
+.lesson .item{margin:12px 0}
+.lesson .pit.mm{border-left-color:#b7791f;background:rgba(183,121,31,.1)}
+.lesson .pit.mm .src{color:#9a6508}
+html[data-theme=dark] .lesson .pit.mm .src{color:#f0c06a}
+.bridge .src2{display:block;font-size:13px;font-weight:700;color:var(--blue);margin-bottom:3px}
+.lesson h3{font-size:1.08em;margin:1.3em 0 .5em}
+.lesson h4{font-size:1em;margin:1.2em 0 .4em;padding-left:9px;border-left:3px solid var(--line)}
+.lesson .seg button{height:36px}
+.lesson .item.sup{background:var(--violet-bg);border-radius:10px;padding:12px 14px}
+.item.sup>.src{display:block;color:var(--violet);font-size:13px;font-weight:700;margin-bottom:4px}
+.item.sup p{margin:.5em 0}.item.sup p:last-child{margin-bottom:0}.item.sup code{background:rgba(127,127,127,.15)}
+.item.sup .code{margin:8px 0}.item.sup ul,.item.sup ol{margin:.45em 0;padding-left:1.3em}.item.sup li{margin:.3em 0}
+.item.gl{margin-top:14px}.glb p{margin:0;padding:8px 0;border-bottom:1px solid var(--line);font-size:14.5px;line-height:1.55}.glb b{color:var(--ink)}
