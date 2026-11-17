@@ -1142,6 +1142,15 @@ def is_privileged() -> bool:
         return False
 
 
+def _is_cgnat_literal(host: str) -> bool:
+    """A literal IPv4 in 100.64.0.0/10 (tailnet range; verified against `tailscale ip` when binding)."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(str(host)) in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        return False
+
+
 def _is_loopback_bind(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost") or (host not in ("tailscale",) and is_loopback_host(host))
 
@@ -1170,7 +1179,9 @@ def startup_safety_checks(cfg: Any, kind: str) -> List[str]:
             if not usable and not (kind == "hub" and cfg.nodes):
                 raise forbidden(f"refusing to listen on {host} with no tokens configured",
                                 hint="add a token first (hive node token add), or listen on 127.0.0.1")
-            if host != "tailscale" and not listen.tls.cert:
+            # an explicit 100.64/10 address is a tailnet bind like "tailscale": the server verifies it against
+            # `tailscale ip -4` at bind time and refuses to start on a mismatch (§5.9), so plaintext is allowed here
+            if host != "tailscale" and not _is_cgnat_literal(host) and not listen.tls.cert:
                 if not listen.allow_insecure_remote:
                     raise forbidden(f"refusing plaintext HTTP on {host}",
                                     hint="use --tailscale (WireGuard, no certificate), set listen.tls.cert/key, or "
@@ -1183,20 +1194,15 @@ def startup_safety_checks(cfg: Any, kind: str) -> List[str]:
             url = rel.hub_url or ""
             host = _host_of(url)
             if url.lower().startswith("http://") and not is_loopback_host(host):
-                if not (rel.allow_insecure and _is_tailnet_or_private(host, resolve=False)) and \
-                        not (rel.allow_insecure and not _is_public_literal(host)):
+                # §5.9: plaintext only to a private/tailnet host (private IP, *.ts.net, or a name that resolves only
+                # to private/loopback addresses) with allow_insecure; public http:// hosts stay refused
+                if not (rel.allow_insecure and _relay_insecure_ok(url, resolve=True)):
                     raise forbidden(f"relay hub URL {url} is plaintext to a non-local host",
-                                    hint="use https://, or relay.allow_insecure: true for a private/tailnet hub")
+                                    hint="use https://, or relay.allow_insecure: true for a private/tailnet hub "
+                                         "(private IP, *.ts.net, or a name that resolves only to private addresses)")
         if cfg.policy.preset == "full":
             warnings.append("policy preset 'full': agents may read and write anywhere this user can")
     return warnings
-
-
-def _is_public_literal(host: str) -> bool:
-    try:
-        return ip_category(host) == "public"
-    except HiveError:
-        return False
 
 
 # ---------------------------------------------------------------------------------------------------------------

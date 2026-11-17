@@ -350,3 +350,21 @@ by the lead or a line in DESIGN.md.
     `actions/node.py:node_info_result` with null fallbacks (P0 stubs give `{}`/`None`). On Windows a hand-started
     `hive node run` inside a job relaunches once through WMI and returns that node's exit code; `--supervise` runs the
     launcher loop. `run_node` returns 2 for config errors and 1 for startup failures.
+62. **WP1 review fixes (interpretations):** an explicit empty list fails closed: token `classes: []` = no classes,
+    `policy.allow_actions: []` allows no action (and contains execution), `policy.fs.roots: []` is a startup error
+    (`bad_request`). FileHolds also stop gated writes *around* a held file: `resolve_path(write=True, subtree=True)`
+    on a folder holding one, and `denied_under(…, write=True, rebase=dst)` when a held file lies below `dst`, refuse
+    with `conflict` rule `approved_input` (`FileHolds.held_keys()` added). Allowlist mode refuses an argv[0] with a
+    `..` component. An explicit 100.64/10 `listen.host` is verified against `tailscale_info()` at bind time and then
+    served like `"tailscale"` (tailnet socket, plaintext allowed, banner `tailscale (WireGuard)`); the
+    single-local-100.64/10-address fallback applies only inside WSL when no tailscale CLI can be run. Auth-`none`
+    routes answer a request with a body with 413 and close without reading it; a CORS preflight with a body closes
+    the connection. `SecretStore.has_values` re-stats secrets.json on every call. Error masking in step 10a sets
+    `meta.masked`. The hub's own listen/proxy ports (when a hub config exists on the machine) join the node's
+    `own_ports`.
+    - CONTRACT-REQUEST (WP1 → WP4): `EffectivePolicy.check_kill(...)` now returns a dict of audit extras instead of
+      None: `{"owner_unknown": True}` when `kill_own_user_only` is on and neither a POSIX uid nor an owner name
+      (`info["user"]`, compared without a `DOMAIN\` prefix, case-insensitive on Windows) is known; `{}` otherwise.
+      The proc.kill handler merges it into `ctx.audit_extra`. When the uid is missing the owner name is compared,
+      and on Windows a known owner of another user is refused (`other_user`). Callers that ignore the return value
+      keep working (the tests/helpers.py fake still returns None).

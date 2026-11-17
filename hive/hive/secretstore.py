@@ -370,7 +370,12 @@ class SecretStore:
 
     @property
     def has_values(self) -> bool:
-        """Any secret value is known (store, env import or passthrough present in env)."""
+        """Any secret value is known (store, env import or passthrough present in env).
+
+        Re-checks secrets.json first (one os.stat): NodeRuntime gates step-10a masking on this, so a secret the
+        owner just set with the CLI must be masked from the very next call.
+        """
+        self._reload()
         return bool(self._all())
 
     @property

@@ -389,6 +389,11 @@ class FileHolds:
         with self._lock:
             return path_key in self._count
 
+    def held_keys(self) -> List[str]:
+        """All currently held keys (PathGuard flags held files below a folder that is moved, copied over or deleted)."""
+        with self._lock:
+            return list(self._count)
+
     def paths(self, hold_id: str) -> List[str]:
         """Real paths of a hold (job records and service run state store them)."""
         with self._lock:

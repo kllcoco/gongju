@@ -151,6 +151,36 @@ def _literal_prefix(pattern: str) -> str:
     return "/".join(out)
 
 
+_CURRENT_USER: List[Optional[str]] = []
+
+
+def _current_user() -> Optional[str]:
+    """The node's own account name (cached): POSIX from the uid (not $USER), Windows ``getpass.getuser()``."""
+    if not _CURRENT_USER:
+        name: Optional[str] = None
+        try:
+            if IS_WINDOWS:  # pragma: no cover - Windows only
+                import getpass
+                name = getpass.getuser()
+            else:
+                import pwd
+                name = pwd.getpwuid(os.getuid()).pw_name
+        except Exception:  # noqa: BLE001
+            name = None
+        _CURRENT_USER.append(name or None)
+    return _CURRENT_USER[0]
+
+
+def _user_key(user: str) -> str:
+    """Comparable account name: ``DOMAIN\\user`` / ``user@domain`` stripped, case-insensitive on Windows."""
+    u = user.strip()
+    if "\\" in u:
+        u = u.rsplit("\\", 1)[1]
+    if IS_WINDOWS:  # pragma: no cover - Windows only
+        u = u.split("@", 1)[0].casefold()
+    return u
+
+
 def _is_wsl_drive_path(p: str) -> bool:
     return re.match(r"(?i)^/mnt/([a-z*]|\[[^\]]*\])(/|$)", p.replace("\\", "/")) is not None
 
@@ -214,7 +244,8 @@ class Policy:
         self.warnings: List[str] = []
         self.preset = getattr(cfg, "preset", "standard")
         self.read_only = bool(cfg.read_only)
-        self.allow_actions = tuple(cfg.allow_actions or ("*",))
+        # an explicit [] allows nothing (fail closed); only a missing value means the default ["*"]
+        self.allow_actions = tuple(cfg.allow_actions if cfg.allow_actions is not None else ("*",))
         self.deny_actions = tuple(cfg.deny_actions or ())
         fs = dict(cfg.fs or {})
         ex = dict(cfg.exec or {})
@@ -231,7 +262,14 @@ class Policy:
         self.hive_home = Path(os.path.expanduser(str(hive_home)))
         # roots
         self._roots: List[_Root] = []
-        for r in fs.get("roots") or [{"path": "~", "mode": "rw"}]:
+        roots_cfg = fs.get("roots")
+        if roots_cfg is None:
+            roots_cfg = [{"path": "~", "mode": "rw"}]
+        elif not roots_cfg:  # an explicit [] never widens to the home folder (fail closed, loudly)
+            raise bad_request("policy.fs.roots is empty: no folder would be reachable",
+                              hint="list at least one root, e.g. {\"path\": \"~\", \"mode\": \"ro\"}, or remove the key "
+                                   "for the default")
+        for r in roots_cfg:
             self._roots.append(self._make_root(str(r.get("path")), r.get("mode") or "rw"))
         self.unc_roots = any(rt.display.replace("/", "\\").startswith("\\\\") for rt in self._roots if not rt.star)
         # workdir
@@ -783,7 +821,24 @@ class EffectivePolicy:
                               rule="exec_path", hint=EXEC_PATH_HINT)
             if match_deny(self._service_code_patterns(), key):
                 return denied(f"path '{real}' is code of a managed service", rule="exec_path", hint=EXEC_PATH_HINT)
+            if self.holds is not None and self.holds.held(key):
+                return self._held_error(real)
         return None
+
+    @staticmethod
+    def _held_error(real: str) -> HiveError:
+        return conflict(f"'{real}' is in use by an approved command", rule="approved_input",
+                        hint="this file is in use by an approved command; wait until it finishes or stop it")
+
+    def _held_below(self, key: str) -> List[str]:
+        """Held keys at or below ``key`` (gated writes only): moving, deleting or copying over a folder that holds an
+        approved command's input would replace that input (§5.6 FileHolds, T16)."""
+        if not self._gated or self.holds is None:
+            return []
+        held_keys = getattr(self.holds, "held_keys", None)
+        if not callable(held_keys):
+            return []
+        return [k for k in held_keys() if self.p._under(k, key)]
 
     def resolve_path(self, path: str, *, write: bool = False, must_exist: bool = False,
                      subtree: bool = False) -> Path:
@@ -807,14 +862,13 @@ class EffectivePolicy:
         if root is None or (write and root.mode != "rw"):
             raise self._roots_error(real, write)
         # 7. denies (deny wins over roots)
-        err = self._deny_reason(key, real, write=write)
+        err = self._deny_reason(key, real, write=write)  # includes held files of approved calls (gated writes)
         if err is not None:
             raise err
-        if write and self._gated and self.holds is not None and self.holds.held(key):
-            raise conflict(f"'{real}' is in use by an approved command", rule="approved_input",
-                           hint="this file is in use by an approved command; wait until it finishes or stop it")
         # 8. subtree
         if subtree:
+            if write and self._held_below(key):  # moving/deleting a folder that holds an approved command's input
+                raise self._held_error(real)
             bad = self.denied_under(Path(real), write=write)
             if bad:
                 raise denied(f"'{real}' contains protected entries ({bad[0]}{', …' if len(bad) > 1 else ''})",
@@ -851,6 +905,12 @@ class EffectivePolicy:
                     return [lit]
         else:
             dst_real = self._real(os.path.abspath(os.path.expanduser(str(rebase))))
+        if write:
+            # held inputs of approved calls below the written tree (§5.6 FileHolds): the folder itself, or with rebase
+            # the destination (the source of a copy is only read; fs.move checks its source with subtree=True)
+            held = self._held_below(self.p._key_real(dst_real) if dst_real is not None else src_key)
+            if held:
+                return held[:20]
         count = 0
 
         def test(entry_real: str, rel: str) -> None:
@@ -907,6 +967,9 @@ class EffectivePolicy:
                 raise denied("this node only runs allow-listed programs given as argv (no shell)", rule="allowlist",
                              hint="pass argv=[program, args…] with shell omitted")
             first = str(command[0])
+            if ".." in re.split(r"[\\/]", first):  # "/opt/tools/../../bin/sh" would match a "/opt/tools/.*" rule
+                raise denied(f"program path '{first[:200]}' contains '..'", rule="command_allow",
+                             hint="name the program by its plain absolute path or by its name on the node PATH")
             resolved = self._resolve_exe(first)
             if resolved is None:
                 raise not_found(f"program '{first}' was not found on the node PATH")
@@ -1072,8 +1135,12 @@ class EffectivePolicy:
         return self.p.secrets.resolve_auth(name)
 
     # ------------------------------------------------------------------------------------------- process
-    def check_kill(self, pid: int, info: dict, *, protected: Mapping[int, str]) -> None:
-        """Kill guard (§5.4): protected pids, pid <= 4, kill_protect names, Hive processes, other users."""
+    def check_kill(self, pid: int, info: dict, *, protected: Mapping[int, str]) -> Dict[str, Any]:
+        """Kill guard (§5.4): protected pids, pid <= 4, kill_protect names, Hive processes, other users.
+
+        Returns audit extras for the proc.kill handler to merge into ``ctx.audit_extra``: ``{"owner_unknown": True}``
+        when ``kill_own_user_only`` is on but the owner could not be determined (allowed and audited, §5.4), else {}.
+        """
         if pid in (protected or {}):
             raise denied(f"process {pid} ({protected[pid]}) is managed by Hive", rule="protected_process",
                          hint="use job_stop / service_control")
@@ -1090,11 +1157,22 @@ class EffectivePolicy:
                          hint="use hive node stop, job_stop or service_control")
         if pid in self._special_pids():
             raise denied(f"process {pid} is a Hive watchdog/hub process", rule="kill_protect", hint=SECRET_HINT)
-        if self.p.kill_own_user_only and not IS_WINDOWS:
-            uid = info.get("uid")
-            if isinstance(uid, int) and uid != os.getuid():
-                raise denied(f"process {pid} belongs to another user", rule="other_user",
-                             hint="this node only stops processes of its own user")
+        if not self.p.kill_own_user_only:
+            return {}
+        other = denied(f"process {pid} belongs to another user", rule="other_user",
+                       hint="this node only stops processes of its own user")
+        uid = info.get("uid")
+        if not IS_WINDOWS and isinstance(uid, int) and not isinstance(uid, bool):
+            if uid != os.getuid():
+                raise other
+            return {}
+        user = info.get("user")
+        me = _current_user()
+        if isinstance(user, str) and user.strip() and me:
+            if _user_key(user) != _user_key(me):
+                raise other
+            return {}
+        return {"owner_unknown": True}
 
     def _special_pids(self) -> Set[int]:
         out: Set[int] = set()

@@ -100,7 +100,7 @@ def _entry_dict(entry: Any) -> Dict[str, Any]:
 
 def _classes_for(e: Dict[str, Any]) -> FrozenSet[str]:
     classes = e.get("classes")
-    if classes:
+    if classes is not None:  # §5.2: classes override role; an explicit [] means no classes (fail closed)
         return frozenset(c for c in classes if c in CLASSES)
     role = e.get("role") or "operator"
     return frozenset(ROLE_PRESETS.get(role, ROLE_PRESETS["readonly"]))

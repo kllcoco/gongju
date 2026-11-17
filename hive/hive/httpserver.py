@@ -195,6 +195,19 @@ def _in_cgnat(ip: str) -> bool:
         return False
 
 
+def _running_in_wsl() -> bool:
+    """Inside WSL2 (``wsl.is_wsl()``, or the kernel release while WP4's module is a stub)."""
+    try:
+        from . import wsl
+        return bool(wsl.is_wsl())
+    except Exception:  # noqa: BLE001 - WP4 not merged: own check
+        try:
+            import platform
+            return not IS_WINDOWS and "microsoft" in platform.release().lower()
+        except Exception:  # noqa: BLE001
+            return False
+
+
 def tailscale_info() -> Tuple[str, List[str], str]:
     """(tailnet IPv4, own names [MagicDNS name, short name], note) via ``tailscale``; WSL falls back to the Windows
     CLI through interop or the single local 100.64/10 address (§5.9). Raises HiveError when unavailable."""
@@ -220,13 +233,14 @@ def tailscale_info() -> Tuple[str, List[str], str]:
         raise HiveError("unavailable", f"tailnet address {ip} is not on a local interface (WSL NAT mode?)",
                         hint="in WSL NAT mode use relay mode (hub add-node --relay), or switch WSL to mirrored "
                              "networking", details={"reason": "connect", "maybe_executed": False})
-    if not ip and not _win:
+    # §5.9 (v5/v8): the single-local-100.64/10-address fallback exists only for WSL with interop off (no Linux CLI,
+    # and the Windows CLI cannot be run). Elsewhere carrier CGNAT and cloud-internal networks also use 100.64/10, so
+    # a missing CLI or a failing `tailscale ip -4` is a startup error.
+    if not ip and not _win and (cmd is None or via_windows) and _running_in_wsl():
         cands = [a for a in _local_ipv4s() if _in_cgnat(a)]
         if len(cands) == 1:
             ip = cands[0]
             note = f"tailscale.exe unreachable (interop off); using the only tailnet address {ip}"
-        elif cmd is None or via_windows or cands:
-            pass
     if not ip:
         raise HiveError("unavailable", "Tailscale is not available (tailscale ip -4 failed)",
                         hint="start Tailscale and log in (tailscale up), then start Hive again",
@@ -395,6 +409,22 @@ class ApiServer:
             if note:
                 self.log.warning("%s", note)
             plan = [(ip, "tailnet"), ("127.0.0.1", "main")]
+        elif _in_cgnat(host):
+            # §5.9: an explicit tailnet IP is accepted only if `tailscale ip` reports it (carrier CGNAT also uses
+            # 100.64/10; on WSL with interop off: the only 100.64/10 address on a local interface)
+            try:
+                ip, names, note = tailscale_info()
+            except HiveError as e:
+                raise HiveError("unavailable", f"cannot verify that {host} is this machine's tailnet address: "
+                                f"{e.message}", hint=e.hint, details={"reason": "connect", "maybe_executed": False})
+            if ip != host:
+                raise HiveError("unavailable", f"listen.host {host} is not this machine's tailnet address ({ip})",
+                                hint="use listen.host 'tailscale', or the address `tailscale ip -4` prints",
+                                details={"reason": "connect", "maybe_executed": False})
+            if note:
+                self.log.warning("%s", note)
+            self.tailnet_ip, self.tailnet_names = ip, names
+            plan = [(ip, "tailnet"), ("127.0.0.1", "main")]
         elif host in ("0.0.0.0", "::", ""):
             plan = [(host or "0.0.0.0", "main")]
         elif host == "localhost":
@@ -404,8 +434,6 @@ class ApiServer:
             try:
                 if not is_loopback_host(host):
                     plan.append(("127.0.0.1", "main"))
-                    if _in_cgnat(host):
-                        self.tailnet_ip = host
             except Exception:  # noqa: BLE001
                 pass
         return plan
@@ -431,8 +459,8 @@ class ApiServer:
             store = self.tokens()
             if len(store) == 0 and (self.relay_tokens is None or len(self.relay_tokens()) == 0):
                 raise forbidden(f"refusing to listen on {main_host} with no tokens configured")
-            if self._ssl is None and self.listen.host != "tailscale" and \
-                    not getattr(self.listen, "allow_insecure_remote", False):
+            tailnet = plan[0][1] == "tailnet"  # "tailscale" or a verified explicit tailnet IP: WireGuard transport
+            if self._ssl is None and not tailnet and not getattr(self.listen, "allow_insecure_remote", False):
                 raise forbidden(f"refusing plaintext HTTP on {main_host}",
                                 hint="use listen.host 'tailscale', TLS (listen.tls), or allow_insecure_remote")
         port = int(self.listen.port)
@@ -598,6 +626,8 @@ class ApiServer:
                     raise _Reject(400, bad_request(f"invalid {k} {v[:80]!r}"))
             # CORS preflight
             if method == "OPTIONS" and route.cors and route.auth == "none":
+                # a preflight body is never read: end the connection so it cannot parse as a next request
+                close = close or unread_body
                 req_h = headers.get("access-control-request-headers", "")
                 allow_h = req_h if req_h and CORS_HEADERS_RE.match(req_h) else "Authorization, Content-Type"
                 self._write(conn, 204, {"Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": allow_h,
@@ -615,6 +645,10 @@ class ApiServer:
             if ident is not None and not authed[0]:
                 authed[0] = True
                 self._preauth_add(peer, -1)
+            if ident is None and length > 0:
+                # §6.1: an unauthenticated body is never read (auth "none" routes take no body); close the connection
+                # so the unread bytes are not parsed as a next request
+                raise _Reject(413, HiveError("too_large", "this route takes no request body", status=413), close=True)
             limit = route.max_body if route.max_body is not None else self.max_body
             if length > limit:
                 raise _Reject(413, HiveError("too_large", f"request body larger than {limit} bytes",

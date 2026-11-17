@@ -370,6 +370,7 @@ class TestBinds(unittest.TestCase):
 
     def test_wsl_interop_off_single_tailnet_address(self):
         with mock.patch("shutil.which", return_value=None), mock.patch("os.path.exists", return_value=False), \
+                mock.patch.object(httpserver, "_running_in_wsl", return_value=True), \
                 mock.patch.object(httpserver, "_local_ipv4s", return_value=["172.20.1.2", "100.101.1.7"]):
             ip, names, note = httpserver.tailscale_info()
         self.assertEqual(ip, "100.101.1.7")

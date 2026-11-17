@@ -50,19 +50,35 @@ execution by design.** Read this page once before you give an agent a token. The
 3. For real isolation run the node as a dedicated OS user whose home holds the models; make the config owned by
    another user and read-only to it. On RunPod the pod is the boundary.
 4. `exec.mode=allowlist` for appliance nodes (e.g. only `nvidia-smi`, `ollama …`). Such a node (like one with exec
-   disabled, `shell.run` denied or not allowed) applies `fs.deny_write` to every token, operator and hub included.
-5. Use the `cautious` preset (or `--cautious` tokens) when agents browse the web; approve once or `--for 30m`. Put
-   data you cannot lose in read-only roots.
-6. Treat the hub's machine as the most sensitive one: give agents there `--cautious` tokens, or no exec at all.
+   disabled, `shell.run` in `policy.deny_actions`, or `shell.run` not matched by `policy.allow_actions`) applies
+   `fs.deny_write` to every token, operator and hub tokens included, so a file write cannot turn into code
+   execution at the next login.
+5. Use the `cautious` preset (or `--cautious` on `hive node token add` / `hive hub add-agent`) when agents browse
+   the web; approve once or `--for 30m`. Cautious stops unapproved code execution, not overwrites: put data you
+   cannot lose in read-only roots (`--root D:\photos:ro`).
+6. Treat the hub's machine as the most sensitive one: any agent with exec there can act as the hub (every node,
+   every approval, every auto-update pod). Give agents on the hub machine `--cautious` tokens, or run the hub on a
+   machine where agents get no exec. If the hub runs on the Windows GPU desktop, its WSL node counts as the hub's
+   machine: agents that run commands on the WSL node (e.g. `desk-wsl`) need `--cautious` hub tokens, or set
+   `[automount] enabled=false` in WSL.
 7. `hive node pause` / `panic`; review `hive audit tail`.
 8. Keep tokens in `hive node secret set` (bound to their hosts; `--no-exec` for tokens only downloads need), not in
    shell profiles or service `env`.
-9. Keep model servers inside the WSL node or containers; remember Docker group = root.
-10. Narrow the hub's token on nodes where a compromised hub would matter (`--role files`, or
-    `--classes read,write,net` to keep the model gateway), and `relay.role` on pods.
-11. Add your own autorun paths to `fs.deny_write` (e.g. a Makefile a cron job runs).
-12. One gateway (`models`) token per app, listing only the services that app needs.
-13. Add local admin APIs to `net.http_deny` as `HOST:PORT`.
+9. Keep model servers inside the WSL node or containers; disable WSL interop and automount if the WSL node should be
+   a boundary; remember Docker group = root.
+10. Prefer Tailscale Funnel (a real certificate) over self-signed hubs for pods.
+11. Narrow the hub's token on nodes where a compromised hub would matter (`hive node token add hub-home --kind hub
+    --role files`, or `--classes read,write,net` to keep the model gateway working: its passthrough is authorized as
+    `model.forward`, which needs `net`), and `relay.role` on pods. A narrowed `relay.role` turns `relay.auto_update`
+    off by default (upgrade such pods by hand), and `files`/`readonly` also turn off the model gateway on that pod
+    (it needs `net`): if chat apps use the pod, narrow it with `relay.deny_actions` instead.
+12. `fs.deny_write` keeps identities without `exec` from writing shell profiles, autostart folders and similar; the
+    built-in list covers common autoruns only, so add your own paths there (e.g. a project's `Makefile` that a cron
+    job runs).
+13. Gateway (`models`) tokens: one per app, listing only the services that app needs; revoke with
+    `hive gateway token revoke NAME`.
+14. If local admin APIs run on a node (Clash/Mihomo controller, Docker TCP socket), add them to `net.http_deny` as
+    `HOST:PORT` (e.g. `"127.0.0.1:9090"`): loopback GETs are open to every token with `net`.
 
 ## Stopping everything
 

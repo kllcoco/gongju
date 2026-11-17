@@ -162,6 +162,8 @@ class NodeRuntime:
                 log.warning("client config not readable for protected paths: %s", e.message)
             protected = cfgmod.protected_paths(cfg, hub_cfg, client_cfg)
             own_ports = [p for p in (cfg.listen.port, cfg.listen.proxy_port) if p] if cfg.listen.enabled else []
+            if hub_cfg is not None:  # §5.4 rule 5a: the hub's own ports are denied to net.http too
+                own_ports += [p for p in (hub_cfg.listen.port, hub_cfg.listen.proxy_port) if p and p not in own_ports]
             self.policy = Policy(cfg.policy, workdir=Path(cfg.workdir), data_dir=self.data_dir,
                                  hive_home=paths["home"], protected=protected, network=cfg.network,
                                  models=cfg.models, secrets=self.secrets, gateway=cfg.gateway, is_wsl=_is_wsl(),
@@ -496,7 +498,9 @@ class NodeRuntime:
             if gate_held:
                 self.gate.release()
         if err is not None and self.secrets is not None and self.secrets.has_values:
-            err = self._mask_error(err)
+            err, err_masked = self._mask_error(err)
+            if err_masked:
+                meta["masked"] = True
         ms = int((time.monotonic() - t0) * 1000)
         meta["duration_ms"] = ms
         if identity.kind in ("agent", "hub", "relay"):
@@ -570,14 +574,15 @@ class NodeRuntime:
         out = self._mask_value(None, result, flag)
         return out, flag[0]
 
-    def _mask_error(self, err: HiveError) -> HiveError:
+    def _mask_error(self, err: HiveError) -> Tuple[HiveError, bool]:
+        """(masked error, anything replaced) for step 10a; the flag sets ``meta.masked``."""
         flag = [False]
         msg = self._mask_value(None, err.message, flag)
         hint = self._mask_value(None, err.hint, flag) if err.hint else err.hint
         details = self._mask_value(None, err.details, flag)
         if not flag[0]:
-            return err
-        return HiveError(err.code, msg, details=details, hint=hint, status=getattr(err, "status", None))
+            return err, False
+        return HiveError(err.code, msg, details=details, hint=hint, status=getattr(err, "status", None)), True
 
     def cancel(self, request_id: str, identity: Identity) -> bool:
         """Cancel an in-flight call (own requests only; owner: any)."""
@@ -658,13 +663,29 @@ class NodeRuntime:
                 "arch": platform.machine(), "version": __version__, "gpus": gpus,
                 "gpus_summary": summary if summary else None, "tags": list(self.config.tags),
                 "description": self.config.description, "wsl": is_wsl,
-                "wsl_distros": [], "secrets": [n["name"] for n in self.secrets.names()] if self.secrets else [],
+                "wsl_distros": self._wsl_distros(), "secrets": [n["name"] for n in self.secrets.names()] if self.secrets else [],
                 "last_seen": iso_utc(), "last_call_at": iso_utc(self.last_call_at) if self.last_call_at else None,
                 "idle_s": round(idle, 1) if idle is not None else None,
                 "inflight": self.gate.inflight if self.gate else 0, "queued": self.gate.queued if self.gate else 0,
                 "identity_changed": False, "outdated": False, "preset": self.policy.preset if self.policy else None,
                 "auto_update": bool(self.config.relay.auto_update),
                 "max_timeout": self.policy.limits.exec_max_timeout if self.policy else None, "status": status}
+
+    def _wsl_distros(self) -> List[str]:
+        """§9.10 ``wsl_distros`` = node.info.wsl.distros or [] (same data as node.info; cached 30 s on Windows)."""
+        if not IS_WINDOWS:
+            return []
+        now = time.monotonic()  # pragma: no cover - Windows only
+        cached = getattr(self, "_wsl_distros_cache", None)
+        if cached is not None and now - cached[0] < 30.0:
+            return list(cached[1])
+        try:
+            from .actions.node import _wsl_block
+            names = [str(n) for n in ((_wsl_block(self) or {}).get("distros") or []) if n]
+        except Exception:  # noqa: BLE001
+            names = []
+        self._wsl_distros_cache = (now, names)
+        return list(names)
 
     def keepalive_pids(self) -> Dict[int, str]:
         """{pid: "wsl-keepalive:<distro>"} ({} when none)."""
@@ -919,8 +940,9 @@ def banner(rt: NodeRuntime, bound: List[Tuple[str, int]]) -> List[str]:
     cfg = rt.config
     if bound:
         scheme = "https" if cfg.listen.tls.cert else "http"
-        tls = "TLS" if cfg.listen.tls.cert else ("tailscale (WireGuard)" if cfg.listen.host == "tailscale"
-                                                  else "plaintext")
+        from .config import _is_cgnat_literal
+        tailnet = cfg.listen.host == "tailscale" or _is_cgnat_literal(cfg.listen.host)  # explicit IP: verified at bind
+        tls = "TLS" if cfg.listen.tls.cert else ("tailscale (WireGuard)" if tailnet else "plaintext")
         listen = ", ".join(f"{scheme}://{h}:{p}" for h, p in bound) + f" ({tls}, {len(rt.tokens)} tokens)"
     else:
         listen = "off"
