@@ -186,13 +186,18 @@ class TestNetStubs(unittest.TestCase):
             lsock.close()
 
 
-class TestWp2Stubs(unittest.TestCase):
+class TestWp2Real(unittest.TestCase):
+    """WP2 CONTRACT-REQUEST (PHASE0_NOTES): the WP2 stubs are real since the WP2 merge; these assert the neutral
+    values that remain off Windows / without a runtime (detailed behaviour is in the WP2 test files)."""
+
     def test_winapi(self):
-        self.assertEqual(winapi.spawn_mode(), "free")
-        self.assertIsNone(winapi.session_winlogon_ctime())
-        with self.assertRaises(HiveError) as cm:
-            winapi.relaunch_outside_job(["x"], {})
-        self.assertEqual((cm.exception.code, cm.exception.message), ("unsupported", "WMI relaunch not available yet"))
+        self.assertIn(winapi.spawn_mode(), winapi.SPAWN_MODES)
+        if not winapi.IS_WINDOWS:
+            self.assertEqual(winapi.spawn_mode(), "free")
+            self.assertIsNone(winapi.session_winlogon_ctime())
+            with self.assertRaises(HiveError) as cm:
+                winapi.relaunch_outside_job(["x"], {})
+            self.assertEqual(cm.exception.code, "unsupported")
 
     def test_proctree(self):
         self.assertIs(proctree.pid_alive, __import__("hive.util", fromlist=["x"]).pid_alive)
@@ -210,39 +215,43 @@ class TestWp2Stubs(unittest.TestCase):
         # a filesystem root as cwd (container WORKDIR "/") must not exclude every PATH entry
         self.assertIn(os.path.join(root, "usr", "local", "bin"), got)
         self.assertIn(os.path.join(root, "opt", "conda", "bin"), got)
-        self.assertIsNone(proctree.default_shell())
-        self.assertEqual(proctree.available_shells(), [])
+        self.assertIn(proctree.default_shell(), ("bash", "sh", "pwsh", "powershell"))
+        self.assertTrue(any(r["name"] == proctree.default_shell() for r in proctree.available_shells()))
         default = proctree.trusted_path().split(os.pathsep)
         home = str(Path.home())
         self.assertFalse(any(d == home or d.startswith(home + os.sep) for d in default))
         self.assertFalse(any(d.startswith(tempfile.gettempdir()) for d in default))
-        for fn in (lambda: proctree.spawn_shim({}, Path(".")), lambda: proctree.kill_tree(1),
-                   lambda: proctree.run_quick(["x"], timeout=1)):
-            with self.assertRaises(HiveError):
-                fn()
+        with self.assertRaises(HiveError):
+            proctree.run_quick(["hive-no-such-program-x"], timeout=1)
 
     def test_services(self):
         sm = services.ServiceManager(None)
-        # neutral for the NodeRuntime.start()/stop paths (§13.1 degrade before WP2 merges)
-        self.assertIsNone(sm.start())
-        self.assertIsNone(sm.shutdown())
         self.assertEqual(sm.managed_pids(), {})
         self.assertEqual(sm.endpoints(), [])
-        self.assertEqual(sm.policy_view(), {"endpoints": [], "code_dirs": []})
-        with self.assertRaises(HiveError):
+        with self.assertRaises(HiveError) as cm:
             sm.endpoint_for("qwen")
-        self.assertEqual(services.panic_offline(Path("."), "n_x"),
-                         {"jobs": [], "services": [], "containers": [], "errors": ["services module not available"]})
+        self.assertEqual(cm.exception.code, "not_found")
+        d = Path(tempfile.mkdtemp(prefix="hivepanic-"))
+        try:
+            out = services.panic_offline(d, "")
+            self.assertEqual(out, {"jobs": [], "services": [], "containers": [], "errors": []})
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
 
     def test_jobs(self):
         from hive import jobs
-        jm = jobs.JobManager(None)
-        self.assertIsNone(jm.start())
-        self.assertIsNone(jm.shutdown())
-        self.assertEqual(jm.managed_pids(), {})
-        with self.assertRaises(HiveError) as cm:
-            jm.get("j_abcdef")
-        self.assertEqual(cm.exception.code, "unsupported")
+        rt = helpers.FakeRuntime()
+        jm = jobs.JobManager(rt)
+        jm.start()
+        try:
+            self.assertEqual(jm.managed_pids(), {})
+            with self.assertRaises(HiveError) as cm:
+                jm.get("j_abcdef")
+            self.assertEqual(cm.exception.code, "not_found")
+        finally:
+            jm.shutdown()
+            rt.cleanup()
 
     def test_presetctx(self):
         d = Path(tempfile.mkdtemp(prefix="hivepreset-")).resolve()

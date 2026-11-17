@@ -273,7 +273,11 @@ class TestHttpRoutes(unittest.TestCase):
             self.assertEqual((b["result"]["identity"]["name"], b["result"]["approvals"], b["result"]["server"]["role"]),
                              ("test-agent", True, "node"))
             b = http(url + "/v1/actions", token=tok)[2]["result"]
-            self.assertEqual((b["node"], b["implemented"]), ("test-node", ["node.info"]))
+            # WP2 CONTRACT-REQUEST: other WPs' handlers are registered once merged; implemented = handlers present
+            from hive.actions import HANDLERS
+            self.assertEqual(b["node"], "test-node")
+            self.assertIn("node.info", b["implemented"])
+            self.assertTrue(all(n in HANDLERS for n in b["implemented"]))
             self.assertEqual(b["catalog_hash"], catalog.catalog_hash())
             self.assertEqual(http(url + "/v1/nodes", token=tok)[2]["result"]["nodes"][0]["name"], "test-node")
             self.assertEqual(http(url + "/v1/cancel", "POST", {"request_id": "r_none"}, token=tok)[2]["result"],

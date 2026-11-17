@@ -526,7 +526,8 @@ class NodeRuntime:
             except Exception:  # noqa: BLE001
                 caps = {}
             ctx = presets.PresetCtx(os=_platform_name(), node_id=self.node_id, policy=eff,
-                                    secret_names=[n["name"] for n in self.secrets.names()],
+                                    # WP2 CONTRACT-REQUEST: only exec-allowed secrets can be auto-added (vllm HF_TOKEN)
+                                    secret_names=[n["name"] for n in self.secrets.names() if n.get("exec", True)],
                                     docker=bool(caps.get("docker")), mask=self.secrets.mask)
             service = None
             if action in ("service.start", "service.restart") and not isinstance(self.services, _Unavailable):

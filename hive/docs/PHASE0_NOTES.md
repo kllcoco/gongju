@@ -368,3 +368,72 @@ by the lead or a line in DESIGN.md.
       The proc.kill handler merges it into `ctx.audit_extra`. When the uid is missing the owner name is compared,
       and on Windows a known owner of another user is refused (`other_user`). Callers that ignore the return value
       keep working (the tests/helpers.py fake still returns None).
+
+## WP2 hand-off (contract requests and interpretations)
+
+63. **CONTRACT-REQUEST (WP2 → P0 tests):** `test_stubs.TestWp2Stubs` became `TestWp2Real` (the neutral values that
+    remain off Windows / without a runtime: `spawn_mode()` "free", `relaunch_outside_job` `unsupported` off Windows,
+    `endpoint_for` → `not_found`, `panic_offline` on an empty data dir → empty lists). `test_node.TestHttpRoutes`
+    no longer pins `implemented == ["node.info"]`: it asserts `node.info` is listed and every listed action has a
+    handler (WP2 registers shell/job/service handlers).
+64. **CONTRACT-REQUEST (WP2 → WP1 `node.py`):** `NodeRuntime._review` passes `PresetCtx.secret_names` filtered to
+    secrets with `exec` allowed (one-line change), so the review's auto-added `HF_TOKEN` matches what `define`
+    stores (`ServiceManager._preset_ctx` uses the same filter; §5.13 "the secret exists with exec allowed").
+65. **CONTRACT-REQUEST (WP2, additive signatures):**
+    - `proctree.ShellPlan` gains `files: Dict[str, bytes] = {}`: the PowerShell `-File` fallback (> 30 000 encoded
+      chars) refers to `{run_dir}/command.ps1`; callers pass `plan.files` as `start_job(extra_files=…)`.
+    - `proctree.build_argv(argv, node_path, *, cwd=None)`: a relative argv[0] with a separator (`./run.sh`) resolves
+      against the command cwd (never the node's own cwd); bare names still use `node_path` only.
+    - `winapi.relaunch_outside_job(argv, env, *, data_dir=None)`: `data_dir` defaults to the directory of the
+      `--config` file in `argv` (§14 `data_dir: null` rule), else the cwd; it holds `run/relaunch-env.json` and is
+      the relaunched process's CurrentDirectory. WP1's call without it keeps working.
+    - `JobManager.get(job_id, tail_lines=20)`; extra JobManager helpers `wait_final`, `record`, `run_dir`, `info`,
+      `request_stop`, `mark_ephemeral`, `is_final`; module helpers `jobs.prepare_command` (CommandGuard + argv
+      building + child env shared by shell.run/job.start), `jobs.read_log` (shared by job.logs/service.logs),
+      `jobs.keep_awake_warnings`; `proctree.which`, `shell_path`, `resolve_shell`, `reap_detached`,
+      `adopt_popens`; `presets.describe()` (data for `guide('presets')`, WP6), `candidate_words`, `bind_files`,
+      `docker_volume`; `ServiceManager.runtime(name)`; `services.check_base_url`.
+66. **Interpretations (WP2):**
+    - `proctree.run_quick` raises `timeout` (maybe_executed False, tree killed) on timeout and `not_found` for a
+      missing program instead of returning a code; output is capped per stream at `max_output`.
+    - Shells (`default_shell`, `build_shell_argv`) resolve through `trusted_path()` plus the fixed system shell
+      folders (`/bin`, `/usr/bin`, …; Windows `System32`, `WindowsPowerShell\v1.0`, `PowerShell\7`, Git Bash), never
+      a folder inside an rw root; `available_shells` probes `--version` only for bash/zsh/pwsh.
+    - `exec.shells` is checked against the resolved shell (`auto` resolves first).
+    - shell.run output is cleaned with `clean_terminal_text`; the 25 %/75 % cut inserts `…[N bytes omitted]…`;
+      a shim note (`[hive] timeout after N s; stopping`, `[hive] stop_command exit N`) is part of the log.
+    - shell.run maps job states: lost → `killed`; a child that could not start → `bad_request` "could not start
+      the command: …" (job removed). A shell.run that times out waits for exit.json up to timeout + 3 + 8 s.
+    - Job record `pid` = child pid (shim pid until ready.json exists). A job whose shim vanished is `lost` and its
+      orphaned child (pid + ctime from ready.json) is killed.
+    - JobManager / ServiceManager always take over a pending `ctx.hold` (§13.2 step 8a) and release it when the
+      process exits; adoption re-holds the stored paths with the system identity's policy
+      (`approvals.file_fingerprint` of the current files).
+    - Service definition output (`definition`) lists `env` as its key names; `services.json` keeps the values.
+    - `ServiceManager.endpoints()` rows already have the `model.endpoints` row shape (`name`, `source:"service"`,
+      `api`, `server`, `base_url`, `healthy`, `models: null`) for WP3.
+    - `ServiceManager.endpoint_for`: an `api_key_env` that is a key of the service's own `env` wins over a store
+      secret of the same name (the value the server was started with).
+    - Health checks before WP3 merges: `_http_status` falls back to the P0 loopback `netutil.open_stream` when
+      `guarded_request` is `unsupported`, and the tcp check to a loopback connect when `tcp_check` is.
+    - Port preflight uses `procinfo.listeners()` (WP4; rows with `port`, `pid`, `name`), else a loopback connect.
+    - Docker preset: `capabilities()["docker"]` (WP4) decides; while it is the P0 stub (`{}`), a docker CLI on the
+      trusted PATH counts. A docker daemon that is not reachable is not an error for `panic_offline` (nothing to
+      stop). A `~` volume host counts as a path. `docker inspect` errors other than "no such object", "permission
+      denied" and daemon-unreachable texts fail the start with the message.
+    - The vllm/sglang `model` is passed resolved (PathGuard realpath) when local, else expanded (`~`) by form.
+    - Review file binding entries for `bind:"stat"` carry `fingerprint` ("stat:<size>:<mtime ISO>") and `mtime`
+      (note 54); `sha256` entries carry the bare hex. Header order: "changes what runs", "not bound to their
+      content", "note". Path-like words PathGuard refuses are named "(not resolvable here)".
+67. **Open items (WP2):**
+    - D40 day-1 spike (IsProcessInJob / breakaway flags of the §20.1 task on Win10 22H2 and Win11 24H2, WMI
+      `EnvironmentVariables` replace-vs-merge, winlogon ctime as boot key) needs real Windows machines; every mode
+      is implemented, the result is not recorded in DESIGN.md yet. Windows-only code paths (Job Objects,
+      suspended start, CTRL_BREAK, Toolhelp32, WMI relaunch) are written against the design but only their
+      off-Windows guards and the mocked relaunch env-file flow run in this CI; the Windows tests skip here.
+    - `service.status.resources.gpu_memory_mb` for containers (nvidia pids vs `docker top`) is not implemented
+      (null unless the service's own pids appear in `gpu.process_memory()`).
+    - The wsl.exe refusal hint does not name a `wsl-host:<node>` tagged node (the node does not know the hub's
+      node list).
+    - The §22.2 WP2 v8 item "the relay-role gateway hint" belongs to the gateway/model.forward path (§8.7, WP3/WP5);
+      no WP2 module produces that error.
