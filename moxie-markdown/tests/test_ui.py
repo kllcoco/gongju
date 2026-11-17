@@ -1,7 +1,7 @@
 import os,sys,tempfile,time
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]));work=Path(tempfile.mkdtemp(prefix='ui-'));os.environ['MOXIE_DATA']=str(work/'data')
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'));work=Path(tempfile.mkdtemp(prefix='ui-'));os.environ['MOXIE_DATA']=str(work/'data')
 import tkinter as tk
 import desktop_app
 from desktop_app import App

@@ -1,7 +1,7 @@
 import os,sys,tempfile
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='syntax-')
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='syntax-')
 import tkinter as tk
 from desktop_app import App
 root=tk.Tk()

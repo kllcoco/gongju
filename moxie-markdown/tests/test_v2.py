@@ -1,6 +1,6 @@
 import os,sys,tempfile,json,threading,time,asyncio
 from pathlib import Path
-base=Path(__file__).resolve().parents[1];sys.path.insert(0,str(base))
+base=Path(__file__).resolve().parents[1]/'src';sys.path.insert(0,str(base))
 work=Path(tempfile.mkdtemp(prefix='validation-v2-')).resolve();os.environ['MOXIE_DATA']=str(work/'data')
 from core import sha,decode,bounded
 from desktop_app import App

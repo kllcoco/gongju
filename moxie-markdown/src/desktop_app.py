@@ -4,7 +4,7 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 import tkinter as tk
 from tkinter import ttk,filedialog,messagebox
 import native_base
-from core import BASE,DATA,ASSETS,atomic,sha,backup,decode,bounded
+from core import BASE,DOCS,DATA,ASSETS,atomic,sha,backup,decode,bounded
 from rendering import Renderer,export_pdf,Tree
 import markdown
 from outline import source_headings
@@ -46,7 +46,7 @@ class App(SyntaxTools,native_base.App):
         self.source.bind('<Control-e>',lambda e:'break')
     def show_mcp_guide(self):
         from viewer import DocViewer
-        return DocViewer(self,BASE/'MCP接入说明.md','MCP 接入说明')
+        return DocViewer(self,DOCS/'MCP接入说明.md','MCP 接入说明')
     def open_link(self,url,base=None):
         from urllib.parse import urlparse,unquote
         if url.startswith(('http://','https://','mailto:')):

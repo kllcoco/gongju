@@ -3,9 +3,9 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, font
 from html.parser import HTMLParser
-from core import BASE,DATA,ASSETS
+from core import BASE,SRC,DATA,ASSETS
 import theme
-sys.path.insert(0,str(BASE/'vendor'))
+sys.path.insert(0,str(SRC/'vendor'))
 import markdown
 
 class Preview(HTMLParser):

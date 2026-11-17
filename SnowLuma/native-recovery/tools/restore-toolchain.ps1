@@ -4,8 +4,8 @@ $root=Split-Path $PSScriptRoot
 $required=@('toolchain/node.exe','toolchain/node-sdk/include/node/node_api.h','toolchain/node-sdk/Release/node.lib')
 $missing=@($required | Where-Object {-not (Test-Path -LiteralPath (Join-Path $root $_))})
 if(-not $missing.Count){return}
-if(-not $BundlePath){$BundlePath=Join-Path (Split-Path $root) 'SnowLuma-v2.4.0-native-recovery.zip'}
-if(-not (Test-Path -LiteralPath $BundlePath)){throw 'Missing bundled Node SDK. Extract the complete native-recovery ZIP, or place that ZIP and its .sha256 beside this source directory.'}
+if(-not $BundlePath){$BundlePath=Join-Path (Join-Path (Split-Path $root) 'release') 'SnowLuma-v2.4.0-native-recovery.zip'}
+if(-not (Test-Path -LiteralPath $BundlePath)){throw 'Missing bundled Node SDK. Extract the complete native-recovery ZIP, or place that ZIP and its .sha256 in the sibling release folder (SnowLuma/release).'}
 $checksumPath="$BundlePath.sha256"
 if(-not (Test-Path -LiteralPath $checksumPath)){throw 'The bundle SHA-256 file is required.'}
 $expected=((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0]

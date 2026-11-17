@@ -1,10 +1,16 @@
 """Shared document storage and bounded MCP workspace access."""
 import os,sys,json,hashlib,tempfile,threading,time
 from pathlib import Path
-BASE=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent
+FROZEN=getattr(sys,'frozen',False)
+# SRC: folder holding the Python sources (moxie-markdown/src). BASE: application root
+# (moxie-markdown/ from source, the EXE folder when frozen) holding data/ and Documents/.
+SRC=Path(__file__).resolve().parent
+BASE=Path(sys.executable).parent if FROZEN else SRC.parent
+# User manuals: moxie-markdown/docs from source; copied beside the EXE in a build.
+DOCS=BASE if FROZEN else BASE/'docs'
 DATA=Path(os.environ.get('MOXIE_DATA',str(BASE/'data')))
 DATA.mkdir(parents=True,exist_ok=True)
-ASSETS=Path(getattr(sys,'_MEIPASS',BASE))/'assets'
+ASSETS=Path(getattr(sys,'_MEIPASS',SRC))/'assets'
 MAX_BYTES=20*1024*1024
 LOCK=threading.RLock()
 def sha(raw):return hashlib.sha256(raw).hexdigest()

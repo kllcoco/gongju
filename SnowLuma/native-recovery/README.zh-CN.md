@@ -25,7 +25,7 @@
 
 输出位于 `build/Release`。已编译供检查的三个产物另外放在 `artifacts/`。重编译使用 `src/`，不会把 `reference/` 中的原版二进制链接进新产物。`hook_core.lib` 是基础静态库，不是完整 Hook DLL。
 
-GitHub 的 `SnowLuma/native-recovery/` 提供可浏览源码；完整 ZIP 位于它的上一级目录。浏览版不重复提交 Node 工具链，首次执行构建会验证相邻 ZIP 的 SHA-256，再恢复其中的 `toolchain/`。直接下载并解压完整 ZIP 则无需这一步。
+GitHub 的 `SnowLuma/native-recovery/` 提供可浏览源码；完整 ZIP 位于同级的 `SnowLuma/release/` 目录。浏览版不重复提交 Node 工具链，首次执行构建会验证 `../release/` 中 ZIP 的 SHA-256，再恢复其中的 `toolchain/`。直接下载并解压完整 ZIP 则无需这一步。
 
 本机经当前命令环境调用 build.ps1 的编译已通过；单独测试 build.cmd 时，它调用的 Windows PowerShell 因脚本执行策略拒绝启动。因此不能声称本机双击入口已验证可用。脚本不修改执行策略；SDK 恢复逻辑已另外验证。
 
@@ -53,7 +53,7 @@ GitHub 的 `SnowLuma/native-recovery/` 提供可浏览源码；完整 ZIP 位于
 - `tools/ExportRecovery.java`：导出静态证据的 Ghidra 脚本。
 - `RECONSTRUCTION.md`：函数地址对应关系、实现差异和下一步缺口。
 
-没有自动替换此前 SnowLuma 工程中的原版二进制。发布目标为 `kllcoco/gongju` 的 `SnowLuma/native-recovery/`，完整分发包为相邻的 `SnowLuma-v2.4.0-native-recovery.zip`。
+没有自动替换此前 SnowLuma 工程中的原版二进制。发布目标为 `kllcoco/gongju` 的 `SnowLuma/native-recovery/`，完整分发包为 `SnowLuma/release/SnowLuma-v2.4.0-native-recovery.zip`。
 
 ## 来源与许可
 

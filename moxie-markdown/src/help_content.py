@@ -2,7 +2,7 @@
 import json
 import sys
 from pathlib import Path
-from core import BASE
+from core import BASE,SRC
 VERSION = '2.0.5'
 TOPICS = []
 def add(category,title,steps,template='',language='markdown'):
@@ -68,7 +68,7 @@ def mcp_config():
                 return {'mcpServers':{'moxie-markdown':{'command':installed['command'],'args':installed['args']}}}
         except (OSError,ValueError,KeyError,TypeError):pass
         command=str(BASE/f'MoxieMCP-{VERSION}.exe');args=['--mcp','--root',str(root)]
-    else:command=sys.executable;args=[str(BASE/'mcp_server.py'),'--root',str(root)]
+    else:command=sys.executable;args=[str(SRC/'mcp_server.py'),'--root',str(root)]
     return {'mcpServers':{'moxie-markdown':{'command':command,'args':args}}}
 config=mcp_config()
 add('MCP 与 LLM','MCP 接入配置','文件 → 打开 MCP 配置说明，可以查看另一份接入说明。将下方 moxie-markdown 配置合并到客户端的 mcpServers；不要覆盖已有其他服务。\n配置优先读取本机已安装的 MCP 入口；未发现配置时按当前程序位置生成。--root 后面的目录是允许读写的 Markdown 工作目录，可改成自己的绝对路径。移动程序后需重新复制配置并重载客户端。\n这是 stdio MCP，不需要端口或 API 密钥；是否允许调用由 LLM 客户端控制。',json.dumps(config,ensure_ascii=False,indent=2),'json')

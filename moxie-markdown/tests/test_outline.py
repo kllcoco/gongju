@@ -1,7 +1,7 @@
 import os,sys,tempfile
 from pathlib import Path
 from unittest.mock import patch
-base=Path(__file__).resolve().parents[1];sys.path.insert(0,str(base));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='outline-')
+base=Path(__file__).resolve().parents[1]/'src';sys.path.insert(0,str(base));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='outline-')
 import tkinter as tk
 from desktop_app import App
 root=tk.Tk()

@@ -1,7 +1,7 @@
 import os,sys,tempfile,json,inspect
 from pathlib import Path
 from unittest.mock import patch
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='guide-check-')
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'src'));os.environ['MOXIE_DATA']=tempfile.mkdtemp(prefix='guide-check-')
 import tkinter as tk
 from desktop_app import App
 from help_content import TOPICS,manual_markdown
