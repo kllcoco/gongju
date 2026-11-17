@@ -18,10 +18,11 @@ moxie-markdown/
 ├── requirements.txt         运行依赖
 ├── requirements-build.txt   构建依赖
 ├── mcp-config.example.json  MCP 客户端配置示例
+├── .gitignore               不纳入仓库的文件（.venv/、data/、dist/ 等）
 └── README.md                本文件
 ```
 
-从源码运行时，程序会在本文件夹下自动创建 `data/`（草稿、历史版本等本机状态）和 `Documents/`（默认 MCP 文档目录）。它们已列入 `.gitignore`，不会进入源码仓库。
+从源码运行时，程序会在本文件夹下自动创建 `data/`（恢复草稿、历史版本、偏好设置等本机状态）；启动 MCP 服务时若未指定 `--root`，还会创建默认文档目录 `Documents/`。这两个文件夹已列入 `.gitignore`，不会进入源码仓库。
 
 ## 功能
 
@@ -79,7 +80,7 @@ python -m venv .venv
 - `mcp-config.json`：根据实际构建位置生成的接入配置。
 - `Documents/`：默认 MCP 文档目录，内含 `示例.md`。
 - `使用说明.md`、`MCP接入说明.md`、`详细使用指南.md`、`示例.md`：从 `docs/` 复制到 EXE 旁边的说明文档。
-- `licenses/`：所用第三方库的许可证文件。
+- `licenses/`：构建环境中各 Python 包的许可证文件。
 
 独立程序运行时无需系统 Python。源码仓库不包含构建产物、用户文档、恢复草稿或本机状态。
 
@@ -134,7 +135,7 @@ LLM 应先读取文档，再使用返回的 `version` 作为修改请求的 `exp
 - `详细使用指南.md`：内置使用指南的完整文字版。
 - `示例.md`：体验用示例文档。
 
-程序内“MCP 接入说明”等菜单直接读取这里的文件；打包时会复制到 EXE 旁边。
+从源码运行时，程序内打开的“MCP 接入说明”直接读取这里的 `MCP接入说明.md`；打包时这四份文档会复制到 EXE 旁边。
 
 ### `tests/` 测试
 

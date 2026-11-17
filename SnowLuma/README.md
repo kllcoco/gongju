@@ -26,7 +26,8 @@ SnowLuma/
     ├── src/  include/                          ← 恢复实现
     ├── tests/  validation/                     ← 测试与测试日志
     ├── reference/  evidence/                   ← 原版参考二进制与静态证据
-    └── tools/                                  ← 辅助脚本（含工具链恢复脚本）
+    ├── tools/                                  ← 辅助脚本（含工具链恢复脚本）
+    └── ……                                      ← 其余文件（CMakeLists.txt、RECONSTRUCTION.md、integration/、vendor/ 等）
 ```
 
 ## 文件一览
@@ -67,9 +68,14 @@ Get-FileHash .\SnowLuma-v2.4.0-win-x64.zip -Algorithm SHA256
 - **方式 A：下载完整 ZIP（最省事）。** 完整 ZIP 包含 Node 工具链、已编译产物和全部静态证据，解压后即可使用，无需额外恢复工具链。
 - **方式 B：直接使用本仓库的 `native-recovery/` 目录。** 这里是可浏览版本，省略了重复的工具链、已编译产物和逐函数伪代码。首次执行 `native-recovery/build.cmd` 时，会先校验同级 `release/` 目录中的完整 ZIP（即 `SnowLuma/release/SnowLuma-v2.4.0-native-recovery.zip` 及其 `.sha256` 文件），校验通过后再从中恢复 Node 工具链。所以请保持 `release/` 与 `native-recovery/` 在同一个 `SnowLuma/` 文件夹下，不要单独挪走。
 
-编译前需要准备：Visual Studio C++ Build Tools、Windows SDK 和 CMake。
+编译前需要准备：
 
-在 `native-recovery` 目录中打开 PowerShell，执行：
+- Windows x64 系统；
+- Visual Studio C++ Build Tools 和 Windows SDK；
+- CMake：请安装 **Visual Studio 自带的 CMake 组件**（构建脚本只会使用 Visual Studio 安装目录里的 CMake，单独安装的 CMake 不会被用到）；
+- 允许运行本地 PowerShell 脚本的环境。
+
+打开 PowerShell，进入工程目录（方式 A 是解压出来的 `SnowLuma-v2.4.0-native-recovery` 文件夹，方式 B 是 `native-recovery` 文件夹），执行：
 
 ```powershell
 .\build.cmd

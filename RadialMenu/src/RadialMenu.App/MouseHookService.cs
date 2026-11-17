@@ -414,34 +414,34 @@ internal sealed partial class MouseHookService : IDisposable
         nint module,
         uint threadId);
 
-    [LibraryImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "UnhookWindowsHookEx", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool UnhookWindowsHookEx(nint hook);
 
     [LibraryImport("user32.dll")]
     private static partial nint CallNextHookEx(nint hook, int code, nuint message, nint data);
 
-    [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "SendInput", SetLastError = true)]
     private static partial uint SendInput(uint count, [In] Input[] inputs, int size);
 
-    [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
+    [LibraryImport("user32.dll", EntryPoint = "WindowFromPoint")]
     private static partial nint WindowFromPoint(Point point);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "PostThreadMessageW", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool PostThreadMessage(uint threadId, uint message, nuint wParam, nint lParam);
 
-    [LibraryImport("user32.dll", SetLastError = true)]
+    [LibraryImport("user32.dll", EntryPoint = "GetMessageW", SetLastError = true)]
     private static partial int GetMessage(out Message message, nint window, uint minimum, uint maximum);
 
-    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
+    [LibraryImport("user32.dll", EntryPoint = "TranslateMessage")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool TranslateMessage(in Message message);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", EntryPoint = "DispatchMessageW")]
     private static partial nint DispatchMessage(in Message message);
 
-    [LibraryImport("user32.dll")]
+    [LibraryImport("user32.dll", EntryPoint = "PeekMessageW")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static partial bool PeekMessage(
         out Message message,
