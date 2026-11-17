@@ -317,12 +317,23 @@ class TestDeadline(unittest.TestCase):
 
 
 class TestHandlersGate(unittest.TestCase):
+    MODULE_OF = {"node": "node", "system": "system", "proc": "system", "shell": "shell", "job": "jobs",
+                 "service": "services", "fs": "files", "net": "net", "model": "model"}
+
     def test_every_node_spec_has_handler(self):
+        # WP1 CONTRACT-REQUEST (PHASE0_NOTES): an action module that registers no handler at all is an unmerged WP
+        # (Phase 1 merge order) and is skipped; a module that registers some of its actions must register all of them.
         load_all()
-        missing = [n for n, s in SPECS.items() if s.scope == "node" and n not in HANDLERS]
-        if missing and len(missing) == 37:
-            self.skipTest("integration gate: no WP handlers merged yet (Phase 0)")
+        node_specs = [n for n, s in SPECS.items() if s.scope == "node"]
+        by_mod = {}
+        for n in node_specs:
+            by_mod.setdefault(self.MODULE_OF[n.split(".", 1)[0]], []).append(n)
+        merged = {m for m, names in by_mod.items() if any(n in HANDLERS for n in names)}
+        missing = [n for n in node_specs if n not in HANDLERS and self.MODULE_OF[n.split(".", 1)[0]] in merged]
         self.assertEqual(missing, [])
+        unmerged = sorted(set(by_mod) - merged)
+        if unmerged:
+            self.skipTest("integration gate: action modules not merged yet: " + ", ".join(unmerged))
 
 
 if __name__ == "__main__":

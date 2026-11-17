@@ -58,13 +58,12 @@ class TestAuthReal(unittest.TestCase):
             with self.subTest(classes=sorted(classes), deny=deny, approval=approval):
                 self.assertIs(auth.exec_gated(ident, approval), expected)
 
-    def test_wp1_stubs(self):
-        for fn in (lambda: auth.parse_bearer("Bearer x"), lambda: auth.relay_identity(None),
-                   lambda: auth.identity_from_entry({}, "agent"),
-                   lambda: auth.TokenStore([], kind_default="agent").authenticate("hv_x", "")):
-            with self.assertRaises(HiveError) as cm:
-                fn()
-            self.assertEqual(cm.exception.code, "unsupported")
+    def test_wp1_real(self):
+        # WP1 merged: the former stubs are real (detailed tests in test_auth.py)
+        self.assertEqual(auth.parse_bearer("Bearer hv_x"), "hv_x")
+        with self.assertRaises(HiveError) as cm:
+            auth.TokenStore([], kind_default="agent").authenticate("hv_xxxxxxxxxx", "")
+        self.assertEqual(cm.exception.code, "unauthorized")
 
 
 class TestPolicyAndSecrets(unittest.TestCase):
@@ -86,7 +85,8 @@ class TestPolicyAndSecrets(unittest.TestCase):
         self.assertNotIn("supersecret", repr(a))
 
     def test_secretstore_stub_is_empty(self):
-        st = SecretStore(Path(tempfile.gettempdir()) / "secrets.json", passthrough=["HF_TOKEN"])
+        st = SecretStore(Path(tempfile.gettempdir()) / "hive-p0-none" / "secrets.json", passthrough=["HF_TOKEN"],
+                         env={})
         self.assertEqual(st.names(), [])
         self.assertFalse(st.has_values)
         self.assertEqual(st.mask("abc"), "abc")

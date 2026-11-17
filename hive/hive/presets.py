@@ -115,9 +115,12 @@ def _secret_key_re() -> "re.Pattern[str]":
 
 
 def _redact_value(v: str) -> str:
+    # WP1 CONTRACT-REQUEST (PHASE0_NOTES): redact_text masks values only in context (KEY=value, --token X, known
+    # prefixes); a bare value of a secret-named env key that redact_text leaves unchanged is shown as ***
     try:
         from .audit import redact_text
-        return redact_text(v)
+        out = redact_text(v)
+        return out if out != v else "***"
     except (ImportError, HiveError):
         return "***"
 

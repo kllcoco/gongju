@@ -263,3 +263,90 @@ by the lead or a line in DESIGN.md.
 
 49. `.gitignore` gained `*.pyz`. No `.pyc` files were tracked, so `git rm --cached` was not needed. Nothing was
     committed.
+
+## WP1 hand-off (contract requests and interpretations)
+
+50. **CONTRACT-REQUEST (WP1): `node.build_server(rt) -> ApiServer`** (the note-45 proposal): builds the node
+    ApiServer with every §13.3 route, not started. `helpers.start_node_server(**cfg)` now uses it (real runtime +
+    server on 127.0.0.1:0; `preset=`, `start_managers=` (default False), `agent_entry=` extra keys; owner token in
+    `rt.test_owner_token`, `rt.test_stop()` stops both). `helpers.make_node_config` now writes only
+    `{"preset": preset}` as the policy block, so the loader fills the rest from the preset (otherwise
+    `make_runtime("readonly")` was not read-only). `test_helpers.test_wp_dependent_helpers_skip` now expects only
+    `start_hub` to skip.
+51. **CONTRACT-REQUEST (WP1): additive keyword parameters** (all optional, old calls unchanged):
+    - `EffectivePolicy.auth_spec(name, *, method="GET")`: rule 5b (`secret_write`) needs the method; **WP3's
+      net.http must pass `method=`** (the design gives rule 5b no other home).
+    - `Policy(..., own_ports=())`: forwarded to `NetGuard(own_ports=…)` (the node's listen and proxy ports, §5.4
+      rule 5a last sentence); NodeRuntime passes them.
+    - `config.default_paths(env=os.environ)` and `config.hive_home(env)` (env-only mode reads the given mapping).
+52. **CONTRACT-REQUEST (WP1): additive names** other WPs may use: `SecretStore.max_value_bytes` (bytes of the
+    longest maskable value; range readers read `max_value_bytes - 1` extra bytes per side for `mask_edges`; WP2/WP3
+    need it), `SecretStore.node_name` (set by NodeRuntime for the not_found message), `audit.set_text_mask(fn)` (the
+    secret mask `redact_text` applies; NodeRuntime registers `SecretStore.mask`), `auth.system_identity()` (kind
+    `system`, all classes: autostart/supervisor), `approvals.file_fingerprint(path)` / `params_hash`,
+    `FileHolds.paths(hold_id)` (for job records / service run state), `ApprovalStore.get(id)`,
+    `NodeRuntime.effective(identity)`, `NodeRuntime.implemented()`, `NodeRuntime.request_stop(code)`,
+    `NodeRuntime.gpu_info()`, `policy.windows_string_checks()`, `httpserver.Headers`, `httpserver.tailscale_info()`.
+    `httpserver.Request` gained defaulted fields `proxied`, `local_ip`, `request_id`, `cancel` (set when a streamed
+    raw response cannot be written: the gateway uses it to close the upstream).
+53. **Hold hand-over convention (WP2 must follow):** `NodeRuntime.call` releases `ctx.hold` when the handler
+    returns **unless the handler set `ctx.hold = None`** after handing the id to JobManager/ServiceManager (which then
+    release it with `rt.holds.release(id)` when the process exits).
+54. **Review `files` entries for `stat` binding (WP2/WP5):** `ApprovalStore.require` takes the record fingerprint of
+    an entry from `fingerprint` when present, else: `bind:"sha256"` → `"sha256:"+sha256` (prefix added if missing),
+    `bind:"stat"` → `sha256` when it already starts with `stat:`, else `"stat:<size>:<mtime>"` from the entry's
+    `size` and `mtime` keys; `bind:"absent"` → null; `bind:"none"` is not stored. The pinned §5.6 entry shape has no
+    `mtime`, so WP2/WP5 should add `fingerprint` (or `mtime`) to `stat` entries. `mtime` is the ISO UTC string fs.stat
+    returns; `approvals.file_fingerprint()` builds the same form on the node.
+55. **CONTRACT-REQUEST (WP1 → P0/WP2 file `presets.py`):** the P0 `approval_review` stub showed a secret-named env
+    value through `redact_text(value)`; the real `redact_text` masks values only in context (`KEY=value`, `--token X`,
+    known prefixes), so the bare value leaked. `presets._redact_value` now shows `***` when `redact_text` leaves the
+    value unchanged. WP2's real review must keep this behaviour (golden test: `API_TOKEN=…` is hidden).
+56. **CONTRACT-REQUEST (WP1 → P0 tests):** `test_catalog.TestHandlersGate` now asserts per action module: a module
+    that registered some handlers must register all of its actions; modules that registered none (unmerged WPs) make
+    the test skip. With only node.info merged the old form failed (36 missing). `test_stubs.test_wp1_stubs` became
+    `test_wp1_real`; `test_secretstore_stub_is_empty` passes `env={}` (this CI environment has `HF_TOKEN` set, which
+    the real passthrough correctly reports).
+57. **init_node topology values** (the signature has no `--insecure`/`--no-listen` parameters): `topology` is
+    `None | "tailscale" | "lan" | "lan-insecure" | "pod"`; `"lan-insecure"` = `--lan --insecure`
+    (`allow_insecure_remote`); `listen="off"` = `--no-listen`; `listen="HOST:PORT"` / `"tailscale"`. Relay mode is
+    implied by `relay_url`/`join`. On an existing config without `force`, a `join`/`relay_url` replaces only `relay`
+    (+ `name` from the join code) and any other changeable flag edits only its block (§14.5 v7/v8); the edited config
+    carries `cfg._changed` (sorted block names) for the CLI to print. `init_hub` refuses an existing config without
+    `force` (conflict). Interactive parts (proxy/mirror probes, printing) stay in the CLI; `init_node` writes an
+    `http://` proxy found in the shell environment to `network.proxy` (§14.2) when `proxy` is not given.
+58. **Config loading details:** the raw config is merged over the defaults (policy defaults from its preset), so a
+    config may omit any block; an explicit `null` keeps the default. Typed nullable keys (`proxy_port`, `data_dir`,
+    `tls.cert`, …) are absent from validation when null and come back as the dataclass default `None`. Config
+    errors are `bad_request` ("invalid node config <path>: config.listen.hots: unknown property 'hots' (did you mean
+    'host'?)"); a world-writable config is `forbidden`. The hub config accepts `data_dir` (same rule as the node).
+    `load_client_config()` returns an empty config when client.json does not exist. `NodeConfig.data_dir` holds the
+    resolved absolute directory; `cfg._path` / `cfg._env_only` are set on loaded configs.
+59. **Policy interpretations:**
+    - Lexical step 4 also catches paths outside every root before any `realpath`/`stat`; `~`-relative and `$VAR`
+      expansion is done before it; Windows string checks (step 3) run only on Windows (unit-tested through
+      `windows_string_checks` on every OS).
+    - Root modes: the most specific (longest) matching root decides (`~` rw + `~/photos` ro → writes under photos
+      refused).
+    - Hard deny_all also covers `/proc/thread-self/**` and `/proc/*/task/*/{environ,mem}` when a root contains
+      `/proc`; the `.hive` component test is case-insensitive on every OS.
+    - Interpreter entries (sys.executable, stdlib, site dirs, scripts) are hard deny_write wherever they are (outside
+      the roots they are unreachable anyway); `sys.base_prefix`/`exec_prefix` trees only when inside an rw root.
+    - Relative deny patterns (no leading `/`, `~` or drive) are treated as `**/<pattern>`.
+    - `EffectivePolicy.needs_approval` keeps a covering grant's id in `eff.grant_id` (the pipeline audits it as
+      `extra.grant`).
+    - `check_url` rule 5c also refuses a gated write whose proxy route has no locally vetted IP or a fake-ip, and a
+      direct route to a fake-ip address; it returns the target with `pin_ip=True` otherwise.
+60. **ApiServer interpretations:** the 10 s header deadline starts at the first byte of a request; an idle
+    keep-alive connection is closed after 30 s. A proxied request's identity carries `source_ip = "proxy:<ip>"`
+    (so `ApprovalStore.may_decide` never sees it as loopback, even when the rightmost X-Forwarded-For is
+    127.0.0.1); `Request.client_ip` keeps the plain client address for throttling and audit. A route with a matching
+    path but another method answers 405 (`bad_request`, status 405); OPTIONS preflights of `cors` routes registered
+    with auth `none` are answered by the server itself (the route function is not called). Errors in openai style map
+    codes to `type` (`authentication_error`, `permission_error`, `not_found_error`, `rate_limit_error`,
+    `invalid_request_error`, `server_error`).
+61. **NodeRuntime interpretations:** `call(via=…)` cannot widen: a hub/relay identity keeps its own `via`; the
+    concurrency gate's waiting count is the NodeSummary `queued`. node.info composes the WP2/WP4 probes through
+    `actions/node.py:node_info_result` with null fallbacks (P0 stubs give `{}`/`None`). On Windows a hand-started
+    `hive node run` inside a job relaunches once through WMI and returns that node's exit code; `--supervise` runs the
+    launcher loop. `run_node` returns 2 for config errors and 1 for startup failures.

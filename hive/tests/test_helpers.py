@@ -175,9 +175,21 @@ class TestFakeRuntimeAndCtx(unittest.TestCase):
                          ("x", "cautious", 1234, "127.0.0.1"))
 
     def test_wp_dependent_helpers_skip(self):
-        for fn in (helpers.make_runtime, helpers.start_node_server, helpers.start_hub):
-            with helpers.tmp_home(), self.assertRaises(unittest.SkipTest):
-                fn()
+        # WP1 merged: make_runtime/start_node_server build real runtimes; the hub (WP5) still skips
+        with helpers.tmp_home(), self.assertRaises(unittest.SkipTest):
+            helpers.start_hub()
+        with helpers.tmp_home():
+            rt = helpers.make_runtime(start_managers=False)
+            try:
+                self.assertEqual(rt.name, "test-node")
+            finally:
+                rt.stop()
+        with helpers.tmp_home():
+            url, token, rt = helpers.start_node_server()
+            try:
+                self.assertTrue(url.startswith("http://127.0.0.1:") and token.startswith("hv_"))
+            finally:
+                rt.test_stop()
 
 
 class TestUtilities(unittest.TestCase):

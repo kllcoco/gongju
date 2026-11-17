@@ -2,8 +2,8 @@
 
 ``make_ctx()`` uses ``FakeRuntime``/``FakeEffectivePolicy`` unless ``runtime=``/``policy=`` are given; WP1 tests patch
 ``FakeNetGuard`` in for ``hive.netutil.NetGuard`` (``patch("hive.netutil.NetGuard", FakeNetGuard)``) before a Policy
-is built. ``make_runtime``/``start_node_server``/``start_hub`` need the real WP1/WP5 code and raise
-``unittest.SkipTest`` while those modules are Phase 0 stubs.
+is built. ``make_runtime``/``start_node_server`` use the real WP1 NodeRuntime/ApiServer; ``start_hub`` needs WP5 and
+raises ``unittest.SkipTest`` while the hub is a Phase 0 stub.
 """
 from __future__ import annotations
 
@@ -147,7 +147,8 @@ def make_node_config(preset: str = "standard", **overrides: Any) -> dict:
                    "max_concurrent_pulls": 2},
         "secrets": {"env_passthrough": []},
         "wsl": {"keepalive": []},
-        "policy": {"preset": preset, "read_only": False, "allow_actions": ["*"], "deny_actions": []},
+        # only the preset: the loader fills the rest from the preset (§14.2), so make_runtime("readonly") is read-only
+        "policy": {"preset": preset},
         "model_endpoints": [],
         "audit": {"enabled": True, "retention_days": 30, "required": False},
         "log": {"level": "info", "file": "logs/node.log", "max_mb": 10, "keep": 5},
@@ -178,8 +179,44 @@ def make_runtime(preset: str = "standard", *, start_managers: bool = True, **pol
 
 
 def start_node_server(**cfg: Any) -> Tuple[str, str, Any]:
-    """(url, agent token, runtime) on 127.0.0.1:0 (SkipTest until WP1 provides the server wiring)."""
-    raise unittest.SkipTest("node server not available yet (WP1); see docs/PHASE0_NOTES.md (helpers wiring)")
+    """(url, agent token, runtime) on 127.0.0.1:0 with a real NodeRuntime + ApiServer (WP1 ``node.build_server``).
+
+    ``preset=`` picks the policy preset, ``start_managers=`` is passed to NodeRuntime, ``agent_entry=`` overrides
+    fields of the agent token entry (e.g. ``require_approval``); other keyword arguments deep-merge into the
+    ``make_node_config`` dict. The owner token is ``rt.test_owner_token``; ``rt.test_stop()`` stops server and
+    runtime.
+    """
+    from hive import config, node
+    preset = cfg.pop("preset", "standard")
+    start_managers = cfg.pop("start_managers", False)
+    agent_entry = cfg.pop("agent_entry", {})
+    home = Path(os.environ.get("HIVE_HOME") or tempfile.mkdtemp(prefix="hivetest-")).resolve()
+    agent, owner = util.new_token(), util.new_token()
+    entry = {"name": "test-agent", "sha256": util.hash_token(agent), "kind": "agent", "role": "operator"}
+    entry.update(agent_entry)
+    tokens = [{"name": "owner", "sha256": util.hash_token(owner), "kind": "owner"}, entry]
+    raw = make_node_config(preset, data_dir=str(home / "node"), **cfg)
+    raw["auth"]["tokens"] = tokens + list(raw["auth"].get("tokens") or [])
+    path = home / "node" / "config.json"
+    util.write_json_atomic(path, raw, private=True)
+    try:
+        conf = config.load_node_config(str(path))
+        rt = node.NodeRuntime(conf, config_path=path, start_managers=start_managers)
+        rt.start()
+    except HiveError as e:
+        if _wp_missing(e):
+            raise unittest.SkipTest(f"node server not available yet (WP1): {e.message}")
+        raise
+    server = node.build_server(rt)
+    bound = server.start()
+    rt.server = server
+    rt.test_owner_token = owner
+
+    def stop() -> None:
+        server.stop()
+        rt.stop()
+    rt.test_stop = stop
+    return f"http://127.0.0.1:{bound[0][1]}", agent, rt
 
 
 def start_hub(nodes: Sequence[Any] = (), **cfg: Any) -> Tuple[str, Dict[str, str], Any]:
