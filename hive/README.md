@@ -1,4 +1,4 @@
-# 灵枢 LingShu · Agent 控制中枢
+# 蜂巢 Hive · Agent 控制中枢
 
 > 状态：**设计阶段**。架构设计文档完成并审定后才开始写代码；本 README 会在实现完成后更新为完整使用说明。
 
@@ -21,10 +21,10 @@
 ## 目录结构
 
 ```text
-lingshu/
+hive/
 ├─ README.md          本说明
 ├─ docs/              设计文档（DESIGN.md，设计完成后生成）
-├─ lingshu/           Python 源码（纯标准库，Python 3.9+）
+├─ hive/              Python 源码（纯标准库，Python 3.9+）
 │  ├─ errors.py       统一错误类型
 │  └─ util.py         口令、JSON、截断、编码等通用小工具
 ├─ tests/             自动测试

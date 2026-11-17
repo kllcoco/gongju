@@ -114,10 +114,10 @@ def decode_text(data: bytes) -> str:
 
 
 def default_data_dir(name: str) -> Path:
-    base = os.environ.get("LINGSHU_HOME")
+    base = os.environ.get("HIVE_HOME")
     if base:
         return Path(base).expanduser() / name
-    return Path.home() / ".lingshu" / name
+    return Path.home() / ".hive" / name
 
 
 def platform_summary() -> dict:

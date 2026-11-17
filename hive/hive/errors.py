@@ -1,6 +1,6 @@
-"""Error type shared by every LingShu component.
+"""Error type shared by every Hive component.
 
-Every failure that crosses a module or network boundary is a ``LingShuError`` with a
+Every failure that crosses a module or network boundary is a ``HiveError`` with a
 stable machine-readable ``code`` (see ``CODES``) and a human-readable message.
 On the wire it is serialised as ``{"ok": false, "error": {"code": ..., "message": ...}}``.
 """
@@ -24,7 +24,7 @@ CODES: Dict[str, int] = {
 }
 
 
-class LingShuError(Exception):
+class HiveError(Exception):
     def __init__(self, code: str, message: str, details: Optional[Dict[str, Any]] = None):
         if code not in CODES:
             code = "internal"
@@ -44,19 +44,19 @@ class LingShuError(Exception):
         return d
 
     @classmethod
-    def from_dict(cls, d: Any) -> "LingShuError":
+    def from_dict(cls, d: Any) -> "HiveError":
         if not isinstance(d, dict):
             return cls("internal", str(d))
         return cls(str(d.get("code", "internal")), str(d.get("message", "unknown error")), d.get("details") or None)
 
 
-def bad_request(msg: str) -> LingShuError:
-    return LingShuError("bad_request", msg)
+def bad_request(msg: str) -> HiveError:
+    return HiveError("bad_request", msg)
 
 
-def not_found(msg: str) -> LingShuError:
-    return LingShuError("not_found", msg)
+def not_found(msg: str) -> HiveError:
+    return HiveError("not_found", msg)
 
 
-def denied(msg: str) -> LingShuError:
-    return LingShuError("policy_denied", msg)
+def denied(msg: str) -> HiveError:
+    return HiveError("policy_denied", msg)
