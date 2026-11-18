@@ -181,11 +181,16 @@ class Progress:
             self._samples = [s for s in self._samples if now - s[0] <= 10.0]
             t0, b0 = self._samples[0]
             rate = (self.downloaded - b0) / (now - t0) if now - t0 >= 0.5 else 0.0
-            total = max(self.total, self.done)
-            left = max(0, total - self.done)
-            d: Dict[str, Any] = {"v": 1, "done": self.done, "total": total,
-                                 "percent": round(100.0 * self.done / total, 1) if total else 100.0,
-                                 "rate_bps": int(rate), "eta_s": int(left / rate) if rate > 0 else None}
+            known = self.total > 0 or self.files_total is not None     # file mode: Content-Length seen
+            total: Optional[int] = max(self.total, self.done) if known else None
+            pct: Optional[float] = None
+            eta: Optional[int] = None
+            if total is not None:
+                pct = round(100.0 * self.done / total, 1) if total else 100.0
+                if rate > 0:
+                    eta = int(max(0, total - self.done) / rate)
+            d: Dict[str, Any] = {"v": 1, "done": self.done, "total": total, "percent": pct, "rate_bps": int(rate),
+                                 "eta_s": eta}
             if self.files_total is not None:
                 d.update(files_done=self.files_done, files_total=self.files_total, current=list(self.current[:4]))
                 cur = self.current[0].rsplit("/", 1)[-1] if self.current else ""
@@ -209,8 +214,9 @@ class Progress:
             if now - self._last_log >= LOG_EVERY:
                 self._last_log = now
                 eta = f", eta {d['eta_s']}s" if d.get("eta_s") is not None else ""
-                _say(f"progress {d['percent']}% {util.human_bytes(d['done'])}/{util.human_bytes(d['total'])} "
-                     f"at {util.human_bytes(d['rate_bps'])}/s{eta}" + (f" · {d['note']}" if d.get("note") else ""))
+                of = f"/{util.human_bytes(d['total'])} ({d['percent']}%)" if d.get("total") is not None else ""
+                _say(f"progress {util.human_bytes(d['done'])}{of} at {util.human_bytes(d['rate_bps'])}/s{eta}"
+                     + (f" · {d['note']}" if d.get("note") else ""))
 
     def start(self) -> "Progress":
         self._last_log = time.monotonic()
