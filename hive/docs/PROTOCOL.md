@@ -72,6 +72,9 @@ takes `models` tokens (and, on a node, its `kind:hub` tokens).
 ```
 - `node`: on a hub a node name, `node_id` or alias (case-insensitive); omitted → the token's only node, else
   `default_node`, else 400 listing the nodes the token may see. On a node: absent, `"self"` or its own name.
+  node_ids (audit round 3): a direct node's id is the one its authenticated `node.info` reports to the hub's probe
+  and is matched before the ids relay pods report at register; an id two links of the same kind report →
+  `not_found` "ambiguous", hint "address the node by name".
 - `request_id` `^[A-Za-z0-9_.:-]{1,80}$` (generated when missing) is used for cancel, audit and correlation.
 - Deadline = `timeout` or `catalog.deadline(spec, params)`, clamped to `[1, 3700]`; the hub waits 15 s more.
 - `bound_files` only from a `kind:hub` token (any other caller → 400): the fingerprints of a hub approval; the node
@@ -95,6 +98,13 @@ configured node; a body `node` that differs → 403.
  "tags": ["ignored by the hub"]}
 ```
 → `{"session_id":"s_…","node":"pod-a100","poll_wait":25,"server_time":"…Z","max_result_bytes":33554432}`
+
+- `session_id` = `"s_"` + 24 random bytes, URL-safe base64 (audit round 3; was a millisecond clock + 32 random bits).
+- `node_id` authenticates nothing: it is dropped (warning audit record "relay node_id refused") when it equals a
+  configured name or alias, the id of another link — including the id a direct node reports in its `node.info` to
+  the hub's probe — or an id `relay_ids.json` binds to another node. Audit round 3: when a direct probe later learns
+  an id a relay node already claimed, the claim (live session and `relay_ids.json` binding) is dropped ("relay
+  node_id claim dropped").
 
 - A new register supersedes the old session: delivered, unfinished tasks fail with `unavailable`
   `session_replaced` (`maybe_executed` true for mutating actions); queued tasks are kept.
@@ -124,7 +134,9 @@ The hub holds the request up to `poll_wait` until a task, a cancel or a refresh 
   task. At most `max(1, max_parallel − 2)` `model.forward` tasks are delivered at a time (slot reserve).
 - `timeout_s` is relative: the rest of the hub's call deadline without the hub's own slack.
 - Only one poll per node is held; a newer poll makes the older one return empty. Unknown session → 409 (register
-  again). 401/403 → the node backs off 300 s.
+  again). 401/403 → the node backs off 300 s. Audit round 3: 409s count per source IP (`throttle` settings, 10 in
+  60 s → 300 s); a blocked IP's polls get 429 `rate_limited` reason `auth_throttle` with `retry_after` (the node
+  waits at least that long, at most 600 s); a successful register from the IP resets the count.
 - `refresh: "restart"` → the node shuts down gracefully and exits 75 (its service manager starts it again).
 - `status` (≤ 4 KiB) every 30 s.
 
@@ -171,6 +183,11 @@ only names its globs match —, 413, 429 inflight > 4 per token, 503 offline, 50
   tool calls with their `index`, `reasoning_content` kept; `text_completion` for completions), a final usage chunk
   with `choices: []` when `stream_options.include_usage` was set, then `data: [DONE]`. A reply larger than the relay
   limit → 502 `relay_truncated`. Non-2xx upstream replies pass through as JSON.
+- Reply headers (audit round 3): `Content-Type` only `application/json`, `text/event-stream` or `text/plain`, with
+  at most `; charset=<token>`; any other value a pod (`model.forward` `content_type`), a direct node or a model
+  server chooses → `application/json`. `Retry-After` passes only as digits; no other upstream header is passed.
+  Every server drops response headers whose name is not a token or whose value has a control character
+  (< 0x20 except tab, 0x7f).
 - On a node: `endpoint_for(service)` (managed service, else a `model_endpoints` entry), vetted with
   `check_url(purpose="model")`; non-2xx and non-SSE bodies are secret-masked; idle timeout 300 s, total 1800 s,
   replies ≤ 64 MiB.

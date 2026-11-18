@@ -17,6 +17,7 @@ execution by design.** Read this page once before you give an agent a token. The
 | Network | Outbound HTTP is limited to allowed categories (default loopback + public; LAN, link-local and cloud metadata addresses are refused). Gated identities cannot POST to local services except known OpenAI endpoints, cannot send secrets with write methods, and their write requests through a proxy are pinned to the locally vetted IP. |
 | Secrets | Stored on the node (`secrets.json`, 0600), referenced by name, bound to hosts, sent only over verified TLS (or to loopback/private targets), never written to audit, logs or results (values are replaced by `«secret:NAME»`). |
 | Transport | Loopback bind by default; any other bind needs TLS or a Tailscale address (WireGuard), and at least one token. Headers within 10 s, bodies read only after authentication, size limits before reading, ≤ 16 unauthenticated connections per IP, `Origin` refused (except the gateway's CORS routes), `Host` checked per connection (DNS rebinding) and parsed strictly as `host[:port]` (anything else → 400). |
+| Relay pods | A pod's relay token works only on the relay routes of its one configured node; a register is bound to the pod's secret `instance_key` (another instance → refused while online, unroutable until `hive hub ack-node` while offline). The `node_id` a pod reports authenticates nothing: an id a direct node reports to the hub's authenticated probe, a configured name or alias, or another node's id is refused, and a claim made before the probe is dropped once it runs. Relay sessions carry 192 random bits; polls naming unknown sessions are throttled per IP like failed logins. Gateway replies from a pod or a direct node carry only a JSON, SSE or plain-text `Content-Type`; response headers with control characters are never written. |
 | Audit | Every call, denial, approval decision, auth failure and lifecycle event goes to `<data>/audit/audit-YYYYMMDD.jsonl` (redacted: secret-looking keys, bodies hashed, env/headers by name only). `audit.required: true` refuses calls that cannot be audited. |
 | Kill switch | `hive node pause` (all non-read calls refused within 1 s, nothing spawned), `hive node panic` (pause + relay off + stop every job, service and labelled container, also with the daemon down). |
 
@@ -42,6 +43,8 @@ execution by design.** Read this page once before you give an agent a token. The
   `"HOST:PORT"` entries.
 - Through an HTTP proxy the proxy resolves names, so DNS pinning cannot hold for reads (write requests of gated tokens
   are pinned). `network.strict_dns: true` restores pinning.
+- A direct node's `node_id` is known to the hub only when the hub token may call `node.info` there (any class
+  set with `read`); otherwise a pod could claim that id. Address nodes by name in agent configs and gateway URLs.
 - A compromised hub can do on each node what that node's `kind:hub` token (or `relay.role` on pods) allows, and can
   skip its own approvals. An exec-capable agent on the hub's machine equals the hub.
 - Docker group membership is root on the host; the docker preset's checks are convenience only.

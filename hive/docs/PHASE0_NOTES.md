@@ -1797,3 +1797,43 @@ QA-S. **Stress verification after the QA fixes:** full suite 3x on python3 (3.13
     the keepalive pids are reaped; `test_walkthrough.TestForegroundNodeSurvivesConfigChange` used `pty.fork()` in the
     multi-threaded test process (DeprecationWarning on 3.12+, a possible child deadlock): `pty.openpty()` +
     `subprocess.Popen` (fork+exec in C). The WSL module ran 20x clean with `-W always::ResourceWarning`.
+
+### Audit round 3 (multi-machine)
+
+Hub + direct node + relay pod + gateway audit. Changes in `hub.py` (links, relay routes, resolution only),
+`gateway.py`, `httpserver.py`, `relay.py`; tests `tests/test_audit3_multi.py`; DESIGN §7.1, §7.2, §8.1, §8.3, §8.7,
+T6, PROTOCOL §4, §5.1, §5.2, §6, SECURITY "Relay pods" row and limits.
+
+A3-1. **Relay pod could take over a direct node's node_id (MEDIUM):** `DirectLink.node_id` was always "", so
+    `_vet_node_id` could not refuse a pod registering with a direct node's id (readable through `node.info`) and
+    `resolve` routed calls and gateway requests addressed by that id to the pod. Owner decision: `DirectLink` now
+    learns its id from the authenticated probe — with each `/v1/actions` fetch (first probe, then every 5 min) it calls
+    `node.info` over `/v1/call` with the hub token (`X-Hive-Agent: hub-probe`, only when the node implements it; a
+    failed call keeps the known id) — so `_vet_node_id` refuses it like any other link's id. `Hub.resolve` matches
+    names, then direct links' node_ids, then relay links', then aliases; an id that two links of the same kind report
+    raises `not_found` "… is ambiguous", hint "address the node by name". When a probe learns an id a relay link
+    already claimed (pod registered before the first probe), `Hub._direct_id` drops the claim from the live session
+    and from `relay_ids.json` (log warning + audit "relay node_id claim dropped"). `gateway.audit_node` already
+    tolerated resolution errors. End-to-end regression tests with a real hub, a real direct node and a `FakeRelay`
+    pod: `TestRelayCannotTakeDirectNodeId` (register refused; `/v1/call` addressed by the id, upper-cased too, has
+    `meta.node = desk` while the pod polls and gets no task; gateway by id → 403 for a `pod-a/*` app, desk's 404 for a
+    `desk/*` app; a claim made before the probe is dropped and re-registering with it is refused; direct wins if both
+    hold it; a pod keeps its own id), `TestAmbiguousNodeId`.
+A3-2. **Relay session ids had 32 random bits (LOW):** `"s_" + new_id()` → `"s_" + secrets.token_urlsafe(24)`. Polls
+    with an unknown or superseded session (409) now count per source IP in a separate `AuthThrottle` built from the
+    hub `throttle` settings (the login throttle is cleared by every successful authentication, and a guesser holds a
+    valid relay token): a blocked IP's polls get 429 `rate_limited` reason `auth_throttle` with `retry_after`
+    (audit "relay session guesses blocked"); a successful register from the IP resets the count, so a real pod's
+    409-then-register after a hub restart never accumulates. `RelayAgent` waits at least `retry_after` (≤ 600 s) on
+    a 429. Tests: `TestRelaySession` (id format/uniqueness, block after 3 mismatches even with the right session,
+    register resets, agent backoff).
+A3-3. **Pod chose the Content-Type of hub gateway replies (LOW):** the relay path wrote the pod's `content_type`
+    as is, `httpserver._write` filtered only CR/LF (so `\x0b`, NUL passed). New `gateway.safe_content_type` /
+    `safe_headers`: only `application/json`, `text/event-stream`, `text/plain`, optionally `; charset=<token>`
+    (normalized), anything else (other types, other parameters, control characters) → `application/json`;
+    `Retry-After` only as digits; no other upstream header. Applied on the relay path, in `DirectLink.open_gateway`
+    and in the gateway route for every backend (so a node's own gateway too). `httpserver._write`/`_write_stream`
+    drop any header whose name is not a token or whose value has a control character (< 0x20 except tab, 0x7f); a
+    dropped `Content-Type` falls back to the JSON default. Tests: `TestGatewayContentType`,
+    `TestRelayGatewayContentType` (pod `text/html\x0bX-Evil: 1` → `application/json`, no injected header),
+    `TestHeaderControlChars`.
