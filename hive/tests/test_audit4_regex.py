@@ -1,14 +1,22 @@
 """Audit round 4 (DoS / local users), regex half: linear-time redaction and secret masking on megabyte adversarial
-inputs, bounded proc.list / job command redaction (findings 1, 2). Bounds are generous: the old code took minutes."""
+inputs, bounded proc.list / job command redaction (findings 1, 2); fs.search / ready_pattern regexes in the
+_regexworker child with a hard kill, tightened check_regex (finding 4). Bounds are generous: the old code took
+minutes."""
 from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 
+from unittest import mock
+
 from hive import audit as audit_mod
+from hive import fsops
+from hive._regexworker import RegexWorker
+from hive.errors import HiveError
 from hive.audit import redact_env, redact_head, redact_params, redact_text
 from hive.secretstore import SecretStore
 
@@ -140,6 +148,132 @@ class TestSecretMaskLinear(unittest.TestCase):
         self.st.set("THREE", "abcdefghijk")
         self.assertEqual(self.st.mask("-abcdefghijk-"), "-«secret:THREE»-")
         self.assertEqual(self.st.mask("nothing here"), "nothing here")
+
+
+class TestCheckRegexTightened(unittest.TestCase):
+    def test_polynomial_patterns_rejected(self):
+        for bad in ("A*A*A*A*c", "A*A*c", r"\w+\d+", r".*\s*x", ".*a.*a.*c", "a.*a.*a.*b", "(?:a*)(?:a*)b",
+                    "[ab]*a?[a-c]*x", "(?i)a*A*b", ".+.+x", "(a+)+", "(a|b)*"):
+            with self.subTest(pattern=bad), self.assertRaises(HiveError) as cm:
+                fsops.check_regex(bad)
+            self.assertEqual(cm.exception.code, "bad_request")
+            self.assertIn("literal=true", cm.exception.hint)
+        with self.assertRaises(HiveError):
+            fsops.check_regex("a*A*b", flags=2)          # re.IGNORECASE from ignore_case=true
+
+    def test_common_patterns_accepted(self):
+        for good in ("foo", ".*foo.*", r"def \w+\(.*\)", r"\w+\s*=\s*\w+", r"\d+\.\d+", "class .*Error.*:",
+                     "[a-z]+[0-9]*", r"^\s*#.*$", "import (os|sys)", "foo.*bar.*baz", "TODO|FIXME", "a.*b.*c",
+                     r"https?://\S+", r"\s+$", "(?:ab)+c", "x{2,}y", r"\$\{\w+\}", "(?i)error: .*"):
+            with self.subTest(pattern=good):
+                fsops.check_regex(good)
+
+
+class TestRegexWorker(unittest.TestCase):
+    def test_matches_in_child(self):
+        with RegexWorker("b+", 0, deadline=time.monotonic() + 30) as w:
+            self.assertEqual(w.search_lines(["abc", "x", "bb", "\udcff b"]), [0, 2, 3])
+            self.assertEqual(w.search_lines([]), [])
+        with RegexWorker("B", 2, deadline=time.monotonic() + 30) as w:
+            self.assertEqual(w.search_lines(["abc"]), [0])
+        w = RegexWorker("(", 0, deadline=time.monotonic() + 30)
+        self.assertIsNotNone(w.error)
+        self.assertIsNone(w.search_lines(["("]))
+
+    def test_catastrophic_regex_is_killed_and_node_keeps_running(self):
+        # (a+)+$ on 40 a's runs for ages in-process (holding the GIL); in the child it is killed at the deadline
+        ticks = []
+        stop = threading.Event()
+
+        def ticker():
+            while not stop.is_set():
+                ticks.append(time.monotonic())
+                time.sleep(0.01)
+        th = threading.Thread(target=ticker, daemon=True)
+        th.start()
+        t0 = time.monotonic()
+        with RegexWorker("(a+)+$", 0, deadline=time.monotonic() + 1.0) as w:
+            self.assertIsNone(w.search_lines(["a" * 40 + "!"]))
+            self.assertTrue(w.timed_out)
+            proc = w.proc
+        took = time.monotonic() - t0
+        stop.set()
+        th.join(5)
+        self.assertLess(took, 8.0)
+        self.assertIsNotNone(proc.poll())                   # reaped
+        self.assertGreater(len([t for t in ticks if t0 < t < t0 + 1.0]), 10)   # this process never froze
+
+    def test_cancel_kills(self):
+        ev = threading.Event()
+        threading.Timer(0.3, ev.set).start()
+        t0 = time.monotonic()
+        with RegexWorker("(a+)+$", 0, deadline=time.monotonic() + 60, cancel=ev) as w:
+            self.assertIsNone(w.search_lines(["a" * 40 + "!"]))
+            self.assertTrue(w.cancelled)
+        self.assertLess(time.monotonic() - t0, 8.0)
+
+    def test_ready_pattern_runs_in_child(self):
+        from hive import services
+        self.assertTrue(services.ServiceManager._ready_match(r"READY\b", "boot\nserver READY now\n"))
+        self.assertFalse(services.ServiceManager._ready_match(r"READY\b", "READYX\n"))
+        t0 = time.monotonic()
+        with mock.patch.object(services, "READY_MATCH_S", 0.5):
+            self.assertFalse(services.ServiceManager._ready_match("(a+)+$", "a" * 40 + "!\n"))
+        self.assertLess(time.monotonic() - t0, 8.0)
+
+
+class TestSearchUsesWorker(unittest.TestCase):
+    def setUp(self):
+        from tests import helpers, wp1util
+        from hive.actions import load_all
+        load_all()
+        self.fh = wp1util.FakeHome()
+        self.fh.__enter__()
+        self.addCleanup(self.fh.__exit__, None, None, None)
+        self.pol = wp1util.build_policy(self.fh, "standard")
+        self.rt = helpers.FakeRuntime(workdir=self.fh.home)
+        self.addCleanup(self.rt.cleanup)
+        self.helpers, self.wp1util = helpers, wp1util
+
+    def call(self, params, timeout=30.0):
+        from hive import catalog, schema
+        from hive.actions import HANDLERS
+        eff = self.pol.effective(self.wp1util.OPERATOR, paused=False)
+        ctx = self.helpers.make_ctx("fs.search", runtime=self.rt, identity=self.wp1util.OPERATOR, policy=eff,
+                                    timeout=timeout)
+        return HANDLERS["fs.search"](ctx, schema.validate(catalog.SPECS["fs.search"].params, params))
+
+    def test_audit_example_rejected_and_killed(self):
+        self.fh.touch("d/f.txt", "A" * 250 + "\nhello\n")
+        with self.assertRaises(HiveError):
+            self.call({"pattern": "A*A*A*A*c", "path": "d"})
+        # even a pattern that slipped past check_regex cannot freeze the node: the child is killed at the deadline
+        t0 = time.monotonic()
+        with mock.patch.object(fsops, "check_regex", lambda *a, **k: None):
+            r = self.call({"pattern": "A*A*A*A*c", "path": "d"}, timeout=2.5)
+        self.assertLess(time.monotonic() - t0, 10.0)
+        self.assertTrue(r["truncated"])
+        self.assertEqual(r["reason"], "timeout")
+
+    def test_regex_never_matched_in_process(self):
+        self.fh.touch("d/f.txt", "x\nfoo 1\n" + "y" * 1500 + "foo\n" + "foo" + "z" * 1500 + "\n")
+        real = fsops.re.compile
+
+        class NoMatch:
+            def __init__(self, rx):
+                self.flags = rx.flags
+
+            def __getattr__(self, name):
+                raise AssertionError(f"agent regex used in the node process ({name})")
+
+        def guarded(pattern, flags=0):
+            rx = real(pattern, flags)
+            return NoMatch(rx) if pattern == "fo+" else rx      # check_regex may compile (validation), not match
+        with mock.patch("re.compile", guarded):
+            r = self.call({"pattern": "fo+", "path": "d"})
+        self.assertEqual([(m["line"], bool(m.get("cut"))) for m in r["matches"]], [(2, False), (4, True)])
+        r = self.call({"pattern": "FOO", "path": "d", "ignore_case": True, "literal": True})
+        self.assertEqual(len(r["matches"]), 3)
 
 
 if __name__ == "__main__":
