@@ -149,6 +149,15 @@ def http(method: str, url: str, *, token: Optional[str] = None, body: Any = None
         return e
 
 
+def http_status(method: str, url: str, **kw: Any) -> int:
+    """The status of a request whose body is not needed; the response is closed."""
+    r = http(method, url, **kw)
+    try:
+        return r.status if hasattr(r, "status") else r.code
+    finally:
+        r.close()
+
+
 def http_json(method: str, url: str, **kw: Any) -> "tuple[int, Any]":
     r = http(method, url, **kw)
     try:
@@ -286,8 +295,11 @@ def sse_lines(resp: Any) -> List[tuple]:
     """[(seconds since start, line)] for every non-empty line of a streamed response."""
     t0 = time.monotonic()
     out = []
-    for raw in resp:
-        line = raw.decode("utf-8").strip()
-        if line:
-            out.append((time.monotonic() - t0, line))
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8").strip()
+            if line:
+                out.append((time.monotonic() - t0, line))
+    finally:
+        resp.close()    # an unclosed response left its socket to the GC (ResourceWarning, QA-R)
     return out

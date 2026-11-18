@@ -145,6 +145,7 @@ class TestE2EM2(unittest.TestCase):
         r = http("GET", cls.hub_url + "/v1/dist/hive.pyz")
         assert r.status == 200, r.status
         body = r.read()
+        r.close()
         cls.pyz_sha = hashlib.sha256(body).hexdigest()
         assert r.headers.get("X-Hive-Sha256") == cls.pyz_sha, (r.headers.get("X-Hive-Sha256"), cls.pyz_sha)
         cls.local_pyz_sha = dist.pyz_sha256(dist.build_pyz())   # deterministic build: same bytes as the hub's
@@ -233,11 +234,12 @@ class TestE2EM2(unittest.TestCase):
         self.assertEqual(r.status, 200)
         sid = r.headers["Mcp-Session-Id"]
         init = json.loads(r.read())
+        r.close()
         self.assertEqual(init["result"]["serverInfo"]["name"], "hive")
         h = {"Mcp-Session-Id": sid, "MCP-Protocol-Version": "2025-06-18",
              "Accept": "application/json, text/event-stream"}
-        self.assertEqual(http("POST", url, token=token, headers=h,
-                              body={"jsonrpc": "2.0", "method": "notifications/initialized"}).status, 202)
+        self.assertEqual(m2util.http_status("POST", url, token=token, headers=h,
+                                            body={"jsonrpc": "2.0", "method": "notifications/initialized"}), 202)
         counter = [1]
 
         def call(method: str, params: Optional[dict] = None) -> dict:
@@ -371,8 +373,8 @@ class TestE2EM2(unittest.TestCase):
         res = call("tools/call", {"name": "fs_transfer", "arguments": {"src": "local:/etc/hostname",
                                                                          "dst": "desk:~/x"}})
         self.assertTrue(res["result"].get("isError"), res)              # server-hosted: no local: endpoints
-        self.assertEqual(http("DELETE", self.hub_url + "/mcp", token=self.agent_token,
-                              headers={"Mcp-Session-Id": call.sid}).status, 200)
+        self.assertEqual(m2util.http_status("DELETE", self.hub_url + "/mcp", token=self.agent_token,
+                                            headers={"Mcp-Session-Id": call.sid}), 200)
 
         self._hub_restart(c)
         self._relay_restart(c)
