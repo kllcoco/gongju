@@ -391,6 +391,48 @@ class TestDirectNodeChecking(unittest.TestCase):
             self.assertTrue(nurl.endswith(f":{port}"))
             helpers.wait_until(link.online, 12)                  # fast re-probe (2, 4, then 5 s), not 3600 s
 
+    def test_node_that_refuses_the_hub_token_gets_a_note(self):
+        # FA-C3: the node runs but does not know the hub token yet (401): say so instead of a bare "offline"
+        nurl, _tok, rt = helpers.start_node_server()
+        self.addCleanup(rt.test_stop)
+        with mock.patch.object(hubmod, "PROBE_INTERVAL", 3600.0):
+            url, toks, hub = helpers.start_hub([{"name": "desk", "mode": "direct", "url": nurl,
+                                                 "token": util.new_token()}])
+            self.addCleanup(hub.test_stop)
+            link = hub.links["desk"]
+            helpers.wait_until(lambda: link._probes_done >= 1, 10)
+            row = link.summary()
+            self.assertEqual((row["online"], row["checking"], row["hub_token_rejected"]), (False, False, True))
+            note = cli._node_notes(row, "vm")
+            self.assertIn("hub token not accepted", note)
+            self.assertIn("hive node token add hub-vm", note)
+            self.assertIn("hub-…", cli._hub_token_note(row))
+        # a machine that is switched off (nothing listening) gets no such note
+        port = helpers.free_port()
+        with mock.patch.object(hubmod, "PROBE_INTERVAL", 3600.0):
+            url2, toks2, hub2 = helpers.start_hub([{"name": "off", "mode": "direct",
+                                                    "url": f"http://127.0.0.1:{port}", "token": util.new_token()}])
+            self.addCleanup(hub2.test_stop)
+            link2 = hub2.links["off"]
+            helpers.wait_until(lambda: link2._probes_done >= 1, 10)
+            row2 = link2.summary()
+            self.assertEqual((row2["online"], row2["hub_token_rejected"]), (False, False))
+            self.assertEqual(cli._node_notes(row2, "vm"), "")
+        self.assertEqual(cli._hub_token_note({"online": True, "hub_token_rejected": True}), "")
+
+    def test_hive_nodes_prints_the_note(self):
+        rows = [{"name": "desk", "online": False, "mode": "direct", "hub_token_rejected": True},
+                {"name": "pod", "online": True, "mode": "relay"}]
+        fake = mock.Mock()
+        fake.nodes.return_value = rows
+        buf = io.StringIO()
+        with mock.patch.object(cli, "_connect", return_value=fake), \
+                mock.patch.object(cli, "_hub_local_hint", return_value=None), mock.patch("sys.stdout", buf):
+            self.assertEqual(cli.cmd_nodes(argparse.Namespace(), cli.Out()), 0)
+        text = buf.getvalue()
+        self.assertIn("note: desk: hub token not accepted", text)
+        self.assertNotIn("note: pod", text)
+
 
 # ---------------------------------------------------------------------------------------------------------------
 # B5f "applied by the watchdog"

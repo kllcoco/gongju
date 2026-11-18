@@ -255,7 +255,7 @@ hive service install hub
 
 - 要接 RunPod 这类**不在你 Tailscale 里**的云机器时，改成 `hive init hub --tailscale --with-local-node --funnel`，并按它的提示执行一次 `tailscale funnel --bg 7709`。Funnel 会给中枢一个带正规证书的公网地址 `https://<电脑名>.<你的 tailnet>.ts.net`（第一次用 Funnel 时 Tailscale 会给你一个网址，去后台点开启）。
 - `--with-local-node` 会提醒你：在中枢这台电脑上能执行命令的 Agent 等于拿到了中枢。把这台电脑上 Agent 用的口令改成谨慎口令：`hive node token set this-pc --cautious`（口令本身不变，Agent 的配置不用改；见第 8 节）。
-- `hive hub status` 查看各节点是否在线。刚加进来的节点会先显示 `checking`（中枢正在第一次联系它），几秒后变成 `online`；节点那边还没加中枢口令时显示 `offline`，加好后几秒内自动变成 `online`。
+- `hive hub status` 查看各节点是否在线。刚加进来的节点会先显示 `checking`（中枢正在第一次联系它），几秒后变成 `online`；节点那边还没加中枢口令时显示 `offline`，备注栏（NOTE）写着 `hub token not accepted`，提醒你去那台电脑上运行刚才打印的 `hive node token add hub-…`；加好后几秒内自动变成 `online`。
 - 本机节点已经在运行（比如第 3 节开着的 `hive node run`）也没关系：`--with-local-node` 会把中枢的口令加进本机节点的配置，并**自动重启本机节点**让它生效，打印 `applied (restarted the node)`；节点没在运行就打印 `will apply on next start`。
 - **为什么本机节点在中枢里叫 `hubhost`**：节点和中枢默认都用电脑名当名字（比如都叫 `vm`）。为了在中枢的节点列表里不和中枢自己重名，本机节点在中枢里登记为 `hubhost`；如果你给节点起了别的名字（`hive init node --name desk`），中枢里就用 `desk`。`hive init hub` 会打印它用的名字，以后在中枢上操作本机就用这个名字，例如 `hive sh hubhost --connection hub-local -- nvidia-smi`。
 - 用了 `--tailscale` 但这台电脑上 Tailscale 还没装好或没登录时，`hive init hub` 会立刻提醒（不会失败），装好并 `tailscale up` 后再 `hive hub run`。

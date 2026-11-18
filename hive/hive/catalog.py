@@ -264,6 +264,8 @@ _NODE_SUMMARY = _ro({
     "auto_update_off": _any("Why auto_update is off (relay nodes): not_pod | role:<role> | deny_actions | off; "
                             "null when on or unknown."),
     "checking": _b("Direct node: the hub's first check is still running (online stays false until it ends)."),
+    "hub_token_rejected": _b("Direct node: the node answered the hub's last check with 401/403 (it does not accept "
+                             "the hub token yet: run the printed 'hive node token add hub-…' on that machine)."),
     "status": _map("Live status (cpu_pct, mem_pct, gpus …)."),
 }, "NodeSummary (§9.10).")
 

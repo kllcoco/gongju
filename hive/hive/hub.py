@@ -164,6 +164,7 @@ def summary_from_info(name: str, mode: str, info: dict, status: Optional[dict], 
             "secrets": [s.get("name") for s in info.get("secrets") or [] if isinstance(s, dict)],
             "last_seen": None, "last_call_at": None, "idle_s": None, "inflight": 0, "queued": 0,
             "identity_changed": False, "outdated": bool(version) and version != __version__,
+            "hub_token_rejected": False,
             "preset": policy.get("preset") if isinstance(policy.get("preset"), str) else None,
             "auto_update": bool(modes.get("auto_update")),
             "auto_update_off": _auto_update_off(modes),
@@ -890,6 +891,11 @@ class DirectLink(NodeLink):
         with self.lock:
             # final acceptance B5e: before the first check ends the node is "checking", not offline
             row["checking"] = self._probes_done == 0 and not row["online"]
+            # FA-C3: the node answers but refuses the hub token (401/403), e.g. "hive node token add hub-…" not run
+            # there yet; shown as a NOTE so it does not look like a machine that is switched off
+            err = self._probe_error
+            row["hub_token_rejected"] = (not row["online"] and err is not None
+                                         and err.code in ("unauthorized", "forbidden"))
         row["identity_changed"] = False
         row["outdated"] = bool(row.get("version")) and row.get("version") != __version__
         gs = row.get("gpus_summary")

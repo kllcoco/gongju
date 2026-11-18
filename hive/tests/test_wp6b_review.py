@@ -404,9 +404,20 @@ class TestHubCliFixes(_HubCli):
         run(["hub", "add-node", "desk", "--direct", "http://127.0.0.1:7701", "--generate"])
         config.edit_config(config.default_paths()["hub_config"], lambda r: r.update(default_node="desk"),
                            kind="hub")
-        self.assertEqual(run(["hub", "remove-node", "desk"])[0], 0)
+        code, out, _ = run(["hub", "remove-node", "desk"])
+        self.assertEqual(code, 0)
+        # FA-C2: a direct node has no relay token; say what still has to happen on that machine
+        self.assertNotIn("relay token", out)
+        self.assertIn("the hub no longer calls it", out)
+        hub = config.load_hub_config().name
+        self.assertIn(f"hive node token revoke hub-{hub}", out)
         cfg = config.load_hub_config()
         self.assertEqual((cfg.nodes, cfg.default_node), ([], None))
+        run(["hub", "add-node", "pod-a", "--relay", "--host", "192.168.1.9"])
+        code, out, _ = run(["hub", "remove-node", "pod-a"])
+        self.assertEqual(code, 0)
+        self.assertIn("its relay token no longer works", out)
+        self.assertNotIn("token revoke", out)
         run(["hub", "add-agent", "claude"])
         self.assertEqual(run(["hub", "remove-agent", "claude"])[0], 0)
         self.assertFalse(any(t.name == "claude" for t in config.load_hub_config().tokens))

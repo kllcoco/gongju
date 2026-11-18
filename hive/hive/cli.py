@@ -1335,6 +1335,10 @@ def cmd_nodes(args: argparse.Namespace, out: Out) -> int:
     out.line(_table([[r.get("name"), _node_state(r), r.get("mode"), r.get("os_label"),
                       r.get("gpus_summary"), ",".join(r.get("tags") or [])] for r in rows],
                     ["NAME", "STATE", "MODE", "OS", "GPUS", "TAGS"]))
+    for r in rows:                         # FA-C3: say why a running direct node shows offline
+        note = _hub_token_note(r)
+        if note:
+            out.line(f"note: {r.get('name')}: {note}")
     hint = _hub_local_hint(args, len(rows))
     if hint:
         out.line(hint)
@@ -1701,8 +1705,18 @@ def cmd_hub_restart(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
-def _node_notes(r: dict) -> str:
+def _hub_token_note(r: dict, hub: Optional[str] = None) -> str:
+    """FA-C3: NOTE for a direct node that refuses the hub token ("" otherwise)."""
+    if not r.get("hub_token_rejected") or r.get("online"):
+        return ""
+    return f"hub token not accepted: run the printed 'hive node token add hub-{hub or '…'}' on that machine"
+
+
+def _node_notes(r: dict, hub: Optional[str] = None) -> str:
     notes = []
+    tok = _hub_token_note(r, hub)
+    if tok:
+        notes.append(tok)
     if r.get("identity_changed"):
         notes.append(f"IDENTITY CHANGED (check, then: hive hub ack-node {r.get('name')})")
     if r.get("outdated"):
@@ -1739,7 +1753,7 @@ def cmd_hub_status(args: argparse.Namespace, out: Out) -> int:
     out.foreign(f"hub '{srv.get('name')}' running (version {srv.get('version')}), {len(rows)} node(s)")
     if rows:
         out.line(_table([[r.get("name"), _node_state(r), r.get("mode"),
-                          r.get("os_label"), r.get("version"), _node_notes(r)] for r in rows],
+                          r.get("os_label"), r.get("version"), _node_notes(r, srv.get("name"))] for r in rows],
                         ["NAME", "STATE", "MODE", "OS", "VERSION", "NOTE"]))
     return EXIT_OK
 
@@ -2028,7 +2042,8 @@ def cmd_hub_remove_node(args: argparse.Namespace, out: Out) -> int:
     """``hive hub remove-node NAME``."""
     cfg = _hub_config(args)
     name = args.name.lower()
-    if not any(n.name == name for n in cfg.nodes):
+    found = [n for n in cfg.nodes if n.name == name]
+    if not found:
         out.error("not_found", f"no node named {name!r}", "hive hub list")
         return EXIT_ACTION
 
@@ -2037,7 +2052,12 @@ def cmd_hub_remove_node(args: argparse.Namespace, out: Out) -> int:
         if raw.get("default_node") == name:
             raw["default_node"] = None
     _hub_edit(args, fn)
-    out.line(f"node '{name}' removed (its relay token no longer works)")
+    if found[0].mode == "relay":
+        out.line(f"node '{name}' removed (its relay token no longer works)")
+    else:
+        # a direct node has no relay token: the hub only stops calling it; the hub token stays valid on that machine
+        out.line(f"node '{name}' removed (the hub no longer calls it)")
+        out.line(f"to also remove the hub's token on {name}, run there: hive node token revoke hub-{cfg.name}")
     _restart_hub(args, out)
     return EXIT_OK
 
