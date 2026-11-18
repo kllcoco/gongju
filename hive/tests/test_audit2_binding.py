@@ -158,6 +158,27 @@ class TestScriptOperand(unittest.TestCase):
             with self.subTest(w=w):
                 self.assertFalse(L(w, quiet))
 
+    def test_entry_files_redirects_and_start(self):
+        """One step further: what else the interpreter runs for an operand, stdin scripts, Start-Process/start."""
+        w = plan("python3 run3")[0]
+        self.assertIn("./run3/__main__.py", w)                 # a folder operand runs its __main__.py
+        w, _m, _u, quiet = plan("node run3")
+        for p in ("./run3.js", "./run3.node", "./run3/index.js", "./run3/package.json"):
+            self.assertIn(p, w)
+            self.assertIn(p, quiet)
+        self.assertNotIn("./app.js.js", plan("node app.js")[0])
+        self.assertIn("./run3", plan("bash < run3")[0])         # stdin script
+        self.assertIn("./in.txt", plan("python3 a.py < in.txt > out")[0])
+        self.assertNotIn("./EOF", plan("bash <<EOF\necho hi\nEOF")[0])   # heredoc delimiter
+        self.assertNotIn("./3", plan("sort <&3")[0])
+        self.assertIn("./r1", plan("diff <(bash r1) f")[0])
+        self.assertIn("./run3", plan("timeout -- 5 bash run3")[0])
+        self.assertIn("./run3", plan("env -- A=1 bash run3")[0])
+        self.assertIn("./run3", plan("Start-Process python -ArgumentList run3", shell="powershell")[0])
+        self.assertIn("./run3.bat", plan("saps run3", shell="powershell")[0])
+        self.assertIn("./run3.bat", plan('start "" /b run3', shell="cmd")[0])
+        self.assertEqual([x for x in plan("call :lbl", shell="cmd")[0] if x.startswith("./")], [])
+
     def test_unbound_variable_operand_is_listed(self):
         self.assertIn("$S (variables; not bound)", plan("bash $S")[2])
 

@@ -1574,7 +1574,7 @@ class Hub:
             except HiveError as e:
                 i += 1
                 if e.code in ("policy_denied", "forbidden", "not_found", "bad_request"):
-                    if _pathlike(w):
+                    if _pathlike(w) and w not in quiet:
                         not_bound.append(f"{w} (not resolvable here)")
                     continue
                 raise

@@ -766,29 +766,34 @@ def _posix_tokens(text: str) -> List[List[Tuple[str, int]]]:
 def _posix_scan(text: str) -> List[Tuple[str, Any]]:
     """``_posix_tokens`` with the command structure kept (v8.1, audit round 2): ``("w", (chars, redirect))`` per
     word and ``("sep", None)`` where a simple command ends (``; & | ( )`` and newlines). ``redirect`` marks a word
-    after ``<``/``>`` (its target) and a digit word right before one (``2>&1``)."""
+    after ``<``/``>`` (its target: ``"in"`` for ``<``/``<>``, ``"here"`` for ``<<``/``<<<``, ``"fd"`` for ``<&``,
+    ``"out"`` for ``>`` forms) and a digit word right before one (``2>&1``: ``"fd"``); ``""`` otherwise."""
     items: List[Tuple[str, Any]] = []
     cur: Optional[List[Tuple[str, int]]] = None
-    redir = False
+    redir = ""
     i, n = 0, len(text)
     while i < n:
         c = text[i]
         if c in " \t\r\n" or c in _SHELL_OPS:
             if cur is not None:
                 fd = c in "<>" and all(q == _Q_NONE and ch.isdigit() for ch, q in cur)
-                items.append(("w", (cur, redir or fd)))
-                redir = False
+                items.append(("w", (cur, redir or ("fd" if fd else ""))))
+                redir = ""
                 cur = None
             prev = text[i - 1] if i else ""
             nxt = text[i + 1] if i + 1 < n else ""
-            if c in "<>":
-                redir = True
+            if c == "<":
+                if prev != "<":
+                    redir = "here" if nxt == "<" else "fd" if nxt == "&" else "" if nxt == "(" else "in"
+            elif c == ">":
+                if prev != "<":
+                    redir = "out"
             elif (c == "&" and (prev in "<>" or nxt == ">")) or (c == "|" and prev == ">"):
                 pass        # >&, <&, &>, >|: part of a redirection
             elif c == "\n" or c in _SHELL_OPS:
                 if not items or items[-1][0] != "sep":
                     items.append(("sep", None))
-                redir = False
+                redir = ""
             i += 1
             continue
         if c == "#" and cur is None:
@@ -1020,10 +1025,11 @@ def text_may_change_cwd(text: str) -> bool:
 # is not a flag or a path is listed as "no file here, not bound" (approval_review/hub).
 
 class _W:
-    """One word of a simple command: its text (quotes removed), bind spellings and whether it is a redirect target."""
+    """One word of a simple command: its text (quotes removed), bind spellings and its redirect kind (``_posix_scan``:
+    "in", "here", "fd", "out"; "" for an argument)."""
     __slots__ = ("text", "spellings", "redir")
 
-    def __init__(self, text: str, spellings: List[Optional[str]], redir: bool = False) -> None:
+    def __init__(self, text: str, spellings: List[Optional[str]], redir: str = "") -> None:
         self.text = text
         self.spellings = spellings
         self.redir = redir
@@ -1281,16 +1287,19 @@ def _skip_wrapper(spec: _Wrap, base: str, words: List[_W], i: int, roles: _Roles
     """Index of the command word a wrapper at ``words[i - 1]`` runs (``len(words)`` when none)."""
     short, longs, npos, cwd, stops, splits, files = spec
     n = len(words)
+    opts = True
     while i < n:
         w = words[i]
         t = w.text
-        if t == "--":
-            return i + 1
+        if t == "--" and opts:
+            opts = False
+            i += 1
+            continue
         if base == "env" and _NAME_ASSIGN_RE.match(t):
             _assignment(w, roles)
             i += 1
             continue
-        if t.startswith("--") and len(t) > 2:
+        if opts and t.startswith("--") and len(t) > 2:
             name, eq, val = t.partition("=")
             if name in stops:
                 return n
@@ -1312,7 +1321,7 @@ def _skip_wrapper(spec: _Wrap, base: str, words: List[_W], i: int, roles: _Roles
                 continue
             i += 1
             continue
-        if t.startswith("-") and len(t) > 1:
+        if opts and t.startswith("-") and len(t) > 1:
             j = 1
             nxt = i + 1
             while j < len(t):
@@ -1508,6 +1517,24 @@ def _scan_interp(kind: str, words: List[_W], i: int, roles: _Roles) -> None:
             roles.hush(w)
     else:
         roles.op(w)
+        _entry_files(kind, w.text, roles)
+
+
+_NODE_EXT = (".js", ".mjs", ".cjs", ".node", ".json", ".ts", ".mts", ".cts")
+
+
+def _entry_files(kind: str, name: str, roles: _Roles) -> None:
+    """Files an interpreter runs for a script operand besides the name itself (bound quietly): a folder operand runs
+    ``name/__main__.py`` (python) or ``name/index.js``/``package.json`` "main" (node), and node also tries
+    ``name.js``/``name.node``."""
+    if not name or name == "-" or "$" in name:
+        return
+    if kind == "python":
+        roles.extra(name.rstrip("/\\") + "/__main__.py")
+    elif kind == "node" and not name.lower().endswith(_NODE_EXT):
+        base = name.rstrip("/\\")
+        for x in (base + ".js", base + ".node", base + "/index.js", base + "/package.json"):
+            roles.extra(x)
 
 
 _PWSH_VALUES = ("executionpolicy", "windowstyle", "configurationname", "configurationfile", "custompipename",
@@ -1579,6 +1606,49 @@ def _scan_cmd(words: List[_W], i: int, roles: _Roles) -> None:
         i += 1
 
 
+def _scan_start_process(words: List[_W], i: int, roles: _Roles) -> None:
+    """PowerShell ``Start-Process [-FilePath] prog [[-ArgumentList] args]``: an interpreter with its arguments is
+    read again as a command line; another program (Windows looks in the cwd too) binds name.com/.exe/.bat/.cmd."""
+    n = len(words)
+    prog: Optional[_W] = None
+    args: List[str] = []
+    while i < n:
+        t = words[i].text
+        if t.startswith("-") and len(t) > 1:
+            p = t[1:].lower()
+            v = words[i + 1] if i + 1 < n else None
+            if p in ("wait", "nonewwindow", "passthru", "usenewenvironment", "loaduserprofile", "noprofile",
+                     "useshellexecute"):
+                i += 1
+                continue
+            if v is not None and "filepath".startswith(p):
+                prog = v
+            elif v is not None and ("argumentlist".startswith(p) or p == "args"):
+                args.append(v.text.replace(",", " "))
+            elif v is not None and len(p) >= 2 and "workingdirectory".startswith(p):
+                roles.cwd = True
+                roles.hush(v)
+            elif v is not None and "redirectstandardinput".startswith(p) and len(p) >= 12:
+                roles.op(v)
+            elif v is not None:
+                roles.hush(v)
+            i += 2
+            continue
+        if prog is None:
+            prog = words[i]
+        else:
+            args.append(t)
+        i += 1
+    if prog is None:
+        return
+    roles.hush(prog)
+    if _interp_kind(_cmd_base(prog.text)) is None:
+        if not os.path.isabs(prog.text) and ":" not in prog.text:
+            roles.op(prog, pathext=True)
+        return
+    roles.nested.append((" ".join([prog.text] + args), "powershell"))
+
+
 def _scan_command(words: List[_W], roles: _Roles, dialect: str) -> None:
     """One simple command (redirect targets removed): assignments, keywords, wrappers, then the program."""
     n = len(words)
@@ -1600,16 +1670,26 @@ def _scan_command(words: List[_W], roles: _Roles, dialect: str) -> None:
         w = words[i]
         base = _cmd_base(w.text)
         if dialect == "cmd":
-            if base == "call":
+            if base in ("call", "start"):
                 roles.hush(w)
-                if i + 1 < n:
-                    roles.op(words[i + 1], pathext=True)
+                k = i + 1
+                while k < n and (not words[k].text or words[k].text.startswith("/")):
+                    k += 1       # start "title" /b /wait …: the empty title and the switches
+                if k < n and not words[k].text.startswith(":"):
+                    roles.op(words[k], pathext=True)
+                    if base == "start":
+                        i = k
+                        continue
                 return
             if base not in _CMD_BUILTINS and not os.path.isabs(w.text) and ":" not in w.text:
                 if "." in base and not _interp_kind(base):
                     roles.op(w)       # run3.bat: the script itself
                     return
                 roles.op(w, pathext=True)   # npm, python, run3: cmd tries name.com/.exe/.bat/.cmd in the cwd first
+        if dialect == "pwsh" and base in ("start-process", "saps", "start"):
+            roles.hush(w)
+            _scan_start_process(words, i + 1, roles)
+            return
         roles.hush(w)
         if dialect == "posix" and base in ("source", ".") and w.text in ("source", "."):
             k = i + 1
@@ -1649,14 +1729,14 @@ def _win_segments(text: str, dialect: str) -> List[List[_W]]:
     segs: List[List[_W]] = [[]]
     cur: Optional[List[str]] = None
     q = ""
-    redir = False
+    redir = ""
 
     def end() -> None:
         nonlocal cur, redir
         if cur is not None:
             t = "".join(cur)
             segs[-1].append(_W(t, _plain_spellings(t), redir))
-            redir = False
+            redir = ""
             cur = None
 
     for c in text:
@@ -1681,7 +1761,7 @@ def _win_segments(text: str, dialect: str) -> List[List[_W]]:
             continue
         if c in "<>":
             end()
-            redir = True
+            redir = "in" if c == "<" else "out"
             continue
         if cur is None:
             cur = []
@@ -1721,6 +1801,11 @@ def _scan_commands(argv_or_command: Union[List[str], str], *, shell: Optional[st
         except ValueError:
             segs = _win_segments(str(argv_or_command), "pwsh")
     for seg in segs:
+        for w in seg:
+            if w.redir == "in":       # bash < run3: an input file is what the program reads (and runs)
+                roles.op(w)
+            elif w.redir in ("here", "fd"):
+                roles.hush(w)
         _scan_command([w for w in seg if not w.redir], roles, dialect)
     return roles
 
@@ -1931,7 +2016,7 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
             # exec paths, held inputs) is still shown and bound; the line says agents cannot change it
             real = str(policy.resolve_path(cand))
         except HiveError:
-            if _pathlike(w):
+            if _pathlike(w) and w not in quiet:
                 not_bound.append(f"{w} (not resolvable here)")
             continue
         except Exception:  # noqa: BLE001
@@ -1950,7 +2035,7 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
         except FileNotFoundError:
             exists = False
         except OSError:
-            if _pathlike(w):
+            if _pathlike(w) and w not in quiet:
                 not_bound.append(f"{w} (not resolvable here)")
             continue
         if exists and not os.path.isfile(real):

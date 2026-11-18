@@ -1831,7 +1831,12 @@ A2-1. **Script operands with plain names were not bound (HIGH):** `bind_files` s
     (and `env BASH_ENV=x …`) binds `x` like the `env` param; in cmd a non-builtin command word binds
     `name.com/.exe/.bat/.cmd` in the cwd (cmd searches it before PATH) and `call x` binds `x`; wrapper options that
     change the directory (`sudo -D`, `env -C`, `ruby -C`, `bun --cwd`, `wsl --cd`, `chroot`, `pwsh -wd`, `conda run
-    --cwd`, `uv run --directory`) move every relative word; `pwsh -EncodedCommand` is a header item. Quiet extras are
+    --cwd`, `uv run --directory`) move every relative word; `pwsh -EncodedCommand` is a header item. Also: a `<`
+    input redirect target is bound like an operand (`bash < run3`; heredoc delimiters and `<&3` are quiet); a
+    python operand also binds `name/__main__.py` and a node operand `name.js`, `name.node`, `name/index.js`,
+    `name/package.json` (quietly; a folder or extension-less name runs those); `env --`/`timeout --` keep reading
+    assignments/positionals; PowerShell `Start-Process`/`saps` and cmd `start` are read like the command they start;
+    `call :label` binds nothing. Quiet extras are
     planned last so they never push a named file over the 8-entry cap. Tests: `TestScriptOperand` (114 command
     forms and 10 argv forms bound, 28 not-overbroad cases, module files, cmd/PowerShell, cwd-changing options,
     quiet/listing, nesting bound), `TestNodeOperandBinding` (the repro end to end on a real node for `bash run3`, `python -X dev foo2`, an
