@@ -65,6 +65,25 @@ def _wall() -> float:
     return time.time()
 
 
+FUTURE_SLACK_S = 60.0
+
+
+def _recent_restarts(stamps: Any, window: float) -> List[str]:
+    """Restart timestamps inside the window. Phase 2 review: stamps later than now (+ 60 s slack), recorded while
+    the clock ran ahead (RTC in local time, a Pi before its first NTP sync), are dropped instead of counting
+    toward max_restarts for hours."""
+    now = _wall()
+    out: List[str] = []
+    for t in stamps or []:
+        try:
+            ts = util.parse_iso(t)
+        except (HiveError, TypeError, ValueError):
+            continue
+        if now - window <= ts <= now + FUTURE_SLACK_S:
+            out.append(t)
+    return out
+
+
 def _identity_system() -> Any:
     from .auth import system_identity
     return system_identity("node:autostart")
@@ -335,6 +354,7 @@ class ServiceManager:
         self._ops: Dict[str, threading.Lock] = {}
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._autostart_thread: Optional[threading.Thread] = None
         self._pool: Optional[ThreadPoolExecutor] = None
         self._busy: set = set()
         self._deleting: set = set()
@@ -431,7 +451,23 @@ class ServiceManager:
         """Load definitions and runtime state, adopt live shims, apply the boot rule, autostart (staggered 2 s in
         name order), start the supervisor and the health pool."""
         util.secure_mkdir(self.dir)
-        raw = util.read_json(self.defs_path, {}) if self.defs_path.exists() else {}
+        try:
+            raw = util.read_json(self.defs_path, {}) if self.defs_path.exists() else {}
+        except (HiveError, OSError, ValueError) as e:
+            # Phase 2 review: an unreadable services.json (power loss, AV, a hand edit) never disables service
+            # management: keep it as services.json.corrupt-<ts>, start with no definitions and warn
+            bad = self.defs_path.with_name(f"services.json.corrupt-{time.strftime('%Y%m%d%H%M%S')}")
+            msg = e.message if isinstance(e, HiveError) else str(e)
+            try:
+                util.replace_with_retry(self.defs_path, bad)
+            except OSError:
+                bad = self.defs_path
+            text = f"services.json was unreadable ({msg[:200]}); kept as {bad.name}, starting with no services"
+            log.warning("%s", text)
+            ws = getattr(self.rt, "warnings", None)
+            if isinstance(ws, list):
+                ws.append(text)
+            raw = {}
         defs = (raw.get("services") or {}) if isinstance(raw, dict) else {}
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="svc-health")
         to_start: List[str] = []
@@ -450,6 +486,8 @@ class ServiceManager:
             rs = self._new_rs()
             if isinstance(rs0, dict):
                 rs.update(rs0)
+                if isinstance(rs.get("restarts"), list):    # drop future stamps (Phase 2 review)
+                    rs["restarts"] = _recent_restarts(rs["restarts"], float("inf"))
             rs.update(_gen=0, _health={"last_check": None, "latency_ms": None, "consecutive_failures": 0,
                                        "last_error": None})
             with self._lock:
@@ -507,7 +545,9 @@ class ServiceManager:
         self._thread.start()
         self._started = True
         if to_start:
-            threading.Thread(target=self._autostart, args=(to_start,), name="svc-autostart", daemon=True).start()
+            self._autostart_thread = threading.Thread(target=self._autostart, args=(to_start,), name="svc-autostart",
+                                                      daemon=True)
+            self._autostart_thread.start()
 
     def _autostart(self, names: List[str]) -> None:
         for i, name in enumerate(names):
@@ -540,6 +580,10 @@ class ServiceManager:
         if t is not None:
             t.join(3)
         self._thread = None
+        at = getattr(self, "_autostart_thread", None)
+        if at is not None:       # Phase 2 review: a staggered autostart never spawns after the shutdown
+            at.join(5)
+            self._autostart_thread = None
         with self._lock:
             proctree.adopt_popens([rs.get("_popen") for rs in self._rs.values() if rs.get("_popen") is not None])
         if self._pool is not None:
@@ -848,6 +892,9 @@ class ServiceManager:
             if hold:
                 rs["_hold"] = hold
             self._cond.notify_all()
+            late = self._stop.is_set()
+        if late:     # the manager shut down during this spawn: its Popen is reaped by proctree (Phase 2 review)
+            proctree.adopt_popens([h.popen])
         self._save_rs(name)
         end = time.monotonic() + 2.0
         while time.monotonic() < end and not (run / "ready.json").exists() and not (run / "exit.json").exists():
@@ -1050,14 +1097,7 @@ class ServiceManager:
                 k = int(rs.get("_short_runs", 0)) if short else 0
                 rs["_short_runs"] = k + 1 if short else 0
                 window = float(d.get("restart_window", 600))
-                cutoff = _wall() - window
-                recent = []
-                for t in rs.get("restarts") or []:
-                    try:
-                        if util.parse_iso(t) >= cutoff:
-                            recent.append(t)
-                    except HiveError:
-                        continue
+                recent = _recent_restarts(rs.get("restarts"), window)
                 rs["restarts"] = recent
             if len(recent) >= int(d.get("max_restarts", 5)):
                 base["last_error"] = (f"restarted {len(recent)} times within {window:g} s; giving up (last exit "
@@ -1189,15 +1229,7 @@ class ServiceManager:
         return d, rs
 
     def _restarts_in_window(self, d: dict, rs: dict) -> int:
-        cutoff = _wall() - float(d.get("restart_window", 600))
-        n = 0
-        for t in rs.get("restarts") or []:
-            try:
-                if util.parse_iso(t) >= cutoff:
-                    n += 1
-            except HiveError:
-                continue
-        return n
+        return len(_recent_restarts(rs.get("restarts"), float(d.get("restart_window", 600))))
 
     def _summary(self, name: str) -> dict:
         d, rs = self._get(name)

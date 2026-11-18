@@ -31,7 +31,12 @@ def _stream_text(path: Path, max_output: int) -> Tuple[str, int, bool]:
     head_n = int(max_output * 0.25)
     tail_n = max_output - head_n
     head = head_raw[:head_n] if earliest == 0 else b""
-    tail = textlog.read_at(path, max(earliest, size - tail_n), tail_n)
+    tail_at = max(earliest, size - tail_n)
+    tail = textlog.read_at(path, tail_at, tail_n)
+    if tail and tail_at > earliest:
+        # Phase 2 review: an ANSI code page tail cut inside a double-byte character starts on its trail byte
+        ctx_n = min(256, tail_at - earliest)
+        tail = tail[textlog.dbcs_skip(textlog.read_at(path, tail_at - ctx_n, ctx_n), tail):]
     omitted = size - len(head) - len(tail)
     head_text = textlog.decode_chunk(head)[0] if head else ""
     text = (textlog.clean_terminal_text(head_text) + f"\n…[{omitted} bytes omitted]…\n"

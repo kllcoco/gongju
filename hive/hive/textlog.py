@@ -11,6 +11,7 @@ import json
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -32,18 +33,30 @@ class RotatingWriter:
         total = max(4096, int(max_bytes))
         self.limit = max(1024, total // (self.keep + 1))
         self._lock = threading.Lock()
-        self.rotated = _read_state(self.path)
+        st = _read_state_full(self.path)
+        self.rotated = st[0]
+        self._seq = st[1]
+        if st[1] & 1:   # a writer died inside a rotation: settle the state from the files (§10.3 seqlock)
+            self.rotated = _settle(self.path, st)
         self._f = open(self.path, "ab")
         try:
             self._size = os.fstat(self._f.fileno()).st_size
         except OSError:
             self._size = 0
-        if not self.path.with_name(self.path.name + STATE_SUFFIX).exists():
+        if st[1] & 1 or not self.path.with_name(self.path.name + STATE_SUFFIX).exists():
             self._write_state()
 
-    def _write_state(self) -> None:
-        util.write_json_atomic(self.path.with_name(self.path.name + STATE_SUFFIX),
-                               {"v": 1, "rotated_bytes": self.rotated})
+    def _write_state(self, rotating: Optional[int] = None) -> None:
+        """Even ``seq``: settled; odd ``seq`` (with ``rotating`` = the size of the file being rotated): a rotation is
+        in progress and readers wait (Phase 2 review: renames and the new state are not one atomic step)."""
+        nxt = self._seq + 1
+        if (nxt & 1) != (0 if rotating is None else 1):
+            nxt += 1
+        self._seq = nxt
+        obj: dict = {"v": 1, "rotated_bytes": self.rotated, "seq": self._seq}
+        if rotating is not None:
+            obj["rotating"] = int(rotating)
+        util.write_json_atomic(self.path.with_name(self.path.name + STATE_SUFFIX), obj)
 
     def write(self, data: bytes) -> None:
         """Append ``data`` (flushed), rotating first when the current file is full."""
@@ -63,6 +76,11 @@ class RotatingWriter:
         self._f.close()
         size = self._size
         try:
+            self._write_state(rotating=size)          # odd seq: readers wait until the even state below
+        except OSError:
+            self._f = open(self.path, "ab")
+            return
+        try:
             if self.keep > 0:
                 oldest = self.path.with_name(f"{self.path.name}.{self.keep}")
                 if oldest.exists():
@@ -77,6 +95,7 @@ class RotatingWriter:
                 self._f = open(self.path, "wb")
         except OSError:
             self._f = open(self.path, "ab")
+            self._write_state()                       # nothing moved: settle with the old rotated_bytes
             return
         self.rotated += size
         self._size = 0
@@ -95,20 +114,61 @@ class RotatingWriter:
 # ---------------------------------------------------------------------------------------------------------------
 # reading
 
-def _read_state(log: Path) -> int:
+def _read_state_full(log: Path) -> Tuple[int, int, Optional[int]]:
+    """(rotated_bytes, seq, rotating size or None); seq is odd while a rotation is in progress."""
     try:
         d = json.loads(Path(str(log) + STATE_SUFFIX).read_text(encoding="utf-8") or "{}")
-        n = int(d.get("rotated_bytes", 0)) if isinstance(d, dict) else 0
-        return max(0, n)
+        if not isinstance(d, dict):
+            return 0, 0, None
+        n = max(0, int(d.get("rotated_bytes", 0)))
+        seq = d.get("seq", 0)
+        seq = seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
+        rot = d.get("rotating")
+        rot = rot if isinstance(rot, int) and not isinstance(rot, bool) and rot >= 0 else None
+        return n, seq, rot
     except (OSError, ValueError, TypeError):
-        return 0
+        return 0, 0, None
+
+
+def _read_state(log: Path) -> int:
+    return _read_state_full(log)[0]
+
+
+def _settle(log: Path, st: Tuple[int, int, Optional[int]]) -> int:
+    """rotated_bytes for a state left odd (the writer died mid-rotation): the rotation counts as done when ``.1``
+    holds the rotated size and the current file is smaller than it."""
+    rotated, _seq, size = st
+    if not size:
+        return rotated
+    try:
+        one = log.with_name(f"{log.name}.1").stat().st_size
+    except OSError:
+        return rotated
+    try:
+        cur = log.stat().st_size
+    except OSError:
+        cur = 0
+    return rotated + size if one == size and cur < size else rotated
+
+
+ROTATION_WAIT_S = 2.0
 
 
 def _segments(log: Path) -> Tuple[List[Tuple[Path, int, int]], int, int]:
-    """([(path, logical start, length)] oldest first, earliest offset, logical size)."""
+    """([(path, logical start, length)] oldest first, earliest offset, logical size). A seqlock on ``.state``:
+    while its ``seq`` is odd (a rotation in progress) or changed while the files were listed, read again."""
     log = Path(log)
-    for _attempt in range(3):
-        rotated = _read_state(log)
+    deadline = time.monotonic() + ROTATION_WAIT_S
+    attempt = 0
+    while True:
+        attempt += 1
+        st = _read_state_full(log)
+        rotated = st[0]
+        if st[1] & 1:
+            if time.monotonic() < deadline:
+                time.sleep(min(0.02, 0.001 * attempt))
+                continue
+            rotated = _settle(log, st)        # the writer is gone (or stuck): judge from the files
         try:
             cur = log.stat().st_size
         except OSError:
@@ -122,8 +182,10 @@ def _segments(log: Path) -> Tuple[List[Tuple[Path, int, int]], int, int]:
             except OSError:
                 break
             i += 1
-        if _read_state(log) != rotated:
-            continue   # a rotation happened while we looked; retry
+        if _read_state_full(log)[:2] != st[:2]:
+            if time.monotonic() < deadline:
+                continue   # a rotation happened while we looked; retry
+            return [(log, 0, 0)], 0, 0
         segs: List[Tuple[Path, int, int]] = []
         start = rotated
         for p, n in rotated_files:
@@ -134,7 +196,6 @@ def _segments(log: Path) -> Tuple[List[Tuple[Path, int, int]], int, int]:
         segs.append((log, rotated, cur))
         earliest = segs[0][1] if segs else rotated
         return segs, earliest, rotated + cur
-    return [(log, 0, 0)], 0, 0
 
 
 def _read_logical(segs: List[Tuple[Path, int, int]], start: int, length: int) -> bytes:
@@ -185,7 +246,9 @@ def read_range(log: Path, offset: Optional[int], max_bytes: int, tail_lines: Opt
         skipped = earliest - start
         start = earliest
     if start > size:
-        start = size
+        # Phase 2 review: never move a follower backwards (a reader that saw a bigger size keeps its offset)
+        return {"data": b"", "offset": offset, "next_offset": offset, "size": size, "skipped_bytes": skipped,
+                "truncated": False}
     n = min(max_bytes, size - start)
     data = _read_logical(segs, start, n)
     nxt = start + len(data)
@@ -271,14 +334,60 @@ def _utf8_incomplete_tail(b: bytes) -> int:
 
 def decode_chunk(b: bytes) -> Tuple[str, int]:
     """(text, bytes_consumed): drops an incomplete trailing UTF-8 sequence, decodes the rest (UTF-8, then mbcs/gbk)."""
+    b = bytes(b)
     cut = _utf8_incomplete_tail(b)
     if cut:
         try:
-            bytes(b[:len(b) - cut]).decode("utf-8")
+            b[:len(b) - cut].decode("utf-8")
         except UnicodeDecodeError:
             cut = 0    # not UTF-8 text at all (e.g. GBK): nothing to hold back
+    if not cut and util.IS_WINDOWS:
+        try:
+            b.decode("utf-8")
+        except UnicodeDecodeError:
+            # Phase 2 review: ANSI code page output (GBK, …) cut inside a double-byte character: hold back the
+            # trailing lead byte, so neither this chunk nor the next one is decoded misaligned
+            for enc in ("mbcs", "gbk"):
+                try:
+                    b.decode(enc)
+                    break
+                except LookupError:
+                    continue
+                except UnicodeDecodeError:
+                    try:
+                        b[:-1].decode(enc)
+                    except UnicodeDecodeError:
+                        break
+                    cut = 1
+                    break
     consumed = len(b) - cut
-    return util.decode_text(bytes(b[:consumed])), consumed
+    return util.decode_text(b[:consumed]), consumed
+
+
+def dbcs_skip(before: bytes, data: bytes) -> int:
+    """1 when ``data`` starts on the trail byte of a double-byte (GBK/ANSI code page) character whose lead byte is the
+    last byte of ``before`` (the bytes preceding ``data`` in the log), else 0. Windows only, and only for text that is
+    not UTF-8 (Phase 2 review: a tail cut at an arbitrary byte). Walks forward from the last byte below 0x40 in
+    ``before`` (never a trail byte, so a character boundary)."""
+    if not util.IS_WINDOWS or not data or not before:
+        return 0
+    try:
+        (before[-4:] + data[:64]).decode("utf-8")
+        return 0
+    except UnicodeDecodeError:
+        pass
+    start = -1
+    for i in range(len(before) - 1, -1, -1):
+        if before[i] < 0x40:
+            start = i
+            break
+    if start < 0:
+        return 0
+    pos = start + 1
+    n = len(before)
+    while pos < n:
+        pos += 2 if 0x81 <= before[pos] <= 0xFE else 1
+    return 1 if pos > n else 0
 
 
 _CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -331,5 +440,5 @@ def clean_terminal_text(s: str) -> str:
     return "\n".join(out)
 
 
-__all__ = ["RotatingWriter", "read_range", "tail_lines", "decode_chunk", "clean_terminal_text", "log_size",
+__all__ = ["RotatingWriter", "read_range", "tail_lines", "decode_chunk", "dbcs_skip", "clean_terminal_text", "log_size",
            "rotated_bytes", "head_bytes", "last_line"]

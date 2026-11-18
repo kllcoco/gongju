@@ -50,9 +50,9 @@ class TestRotation(unittest.TestCase):
         self.assertEqual(r["offset"], earliest)
         self.assertEqual(r["skipped_bytes"], earliest - 10)
         self.assertEqual(r["data"], everything[earliest:earliest + 100])
-        # beyond the end: empty, not an error
+        # beyond the end: empty, not an error, and never moved backwards (Phase 2 review)
         r = textlog.read_range(self.log, size + 50, 100, None)
-        self.assertEqual((r["data"], r["offset"], r["next_offset"]), (b"", size, size))
+        self.assertEqual((r["data"], r["offset"], r["next_offset"]), (b"", size + 50, size + 50))
 
     def test_reopen_continues_offsets(self):
         w = textlog.RotatingWriter(self.log, max_bytes=2048, keep=1)

@@ -11,6 +11,7 @@
 #    HIVE_RELAY_PROXY, else HIVE_PROXY; CONNECT for https), verifying TLS with the system CAs or, with a pin in the
 #    join code / HIVE_RELAY_PIN, the certificate's DER sha256 before any byte is sent; the body's sha256 must equal
 #    the hub's X-Hive-Sha256 header and, when set, HIVE_PYZ_SHA256. It is written as hive.pyz.new, then renamed.
+#    A plain http:// hub URL is accepted only for a loopback/LAN/tailnet host, unless HIVE_PYZ_SHA256 is set.
 # 2a. cd "$HIVE_HOME" and write the $HIVE_HOME/hive wrapper when missing.
 # 3. Loop like the watchdog (HIVE_WATCHDOG=1): `hive.pyz _update` (always; it updates only when relay.auto_update),
 #    `hive.pyz node run` (env-only mode reads HIVE_JOIN, HIVE_SECRET_*, HIVE_PROXY, … itself), exit 0 -> stop,
@@ -60,6 +61,48 @@ u = urllib.parse.urlsplit(url)
 if u.scheme not in ("http", "https") or not u.hostname:
     fail("the hub URL must be http(s)://host[:port]")
 host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
+
+
+def plain_ok(h):
+    # §5.9 rule C1 (as relay.check_hub_url): plaintext only to a loopback/private/tailnet address
+    import ipaddress
+    cgnat = ipaddress.ip_network("100.64.0.0/10")
+
+    def ip_ok(a):
+        try:
+            ip = ipaddress.ip_address(a.split("%", 1)[0])
+        except ValueError:
+            return False
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if ip.is_loopback or (ip.version == 4 and ip in cgnat):
+            return True
+        if ip.version == 6 and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+            return True
+        return ip.is_private and not ip.is_link_local and not ip.is_unspecified and not ip.is_reserved
+    h = h.strip("[]")
+    if h.lower() in ("localhost",) or ip_ok(h):
+        return True
+    try:
+        ipaddress.ip_address(h.split("%", 1)[0])
+        return False        # an IP literal that is not private
+    except ValueError:
+        pass
+    try:
+        addrs = [ai[4][0] for ai in socket.getaddrinfo(h, port, 0, socket.SOCK_STREAM)]
+    except (OSError, UnicodeError):
+        addrs = []
+    if addrs:
+        return all(ip_ok(a) for a in addrs)
+    low = h.lower().rstrip(".")
+    return "." not in low or low.endswith((".ts.net", ".local", ".lan", ".home.arpa", ".internal"))
+
+
+# Phase 2 review: code fetched over plain http from a public address can be swapped on the path; without a
+# pinned HIVE_PYZ_SHA256 only a loopback/LAN/tailnet hub may serve it
+if u.scheme == "http" and not (os.environ.get("HIVE_PYZ_SHA256") or "").strip() and not plain_ok(host):
+    fail("refusing to fetch hive.pyz over plain http from %s (not a LAN/tailnet address); use an https hub URL "
+         "or set HIVE_PYZ_SHA256" % host)
 path = (u.path or "").rstrip("/") + "/v1/dist/hive.pyz"
 hostport = ("[%s]" % host if ":" in host else host) + ":" + str(port)
 proxy = None

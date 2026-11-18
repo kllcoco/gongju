@@ -274,12 +274,15 @@ def _drop_meta(path: Optional[Path]) -> None:
 def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec], headers: Dict[str, str],
            resume: bool, max_size: Optional[int], hasher_factory: Callable[[], Any], progress: Progress,
            stop: threading.Event, on_headers: Optional[Callable[[int, int, Dict[str, str]], None]] = None,
-           meta: Optional[Path] = None) -> Tuple[Any, int, Dict[str, str], str]:
+           meta: Optional[Path] = None, checkpoint: Optional[Dict[str, Any]] = None
+           ) -> Tuple[Any, int, Dict[str, str], str]:
     """Download ``url`` into ``part`` (Range resume from the part size when ``resume``); returns
     (hasher over the whole part, size, response headers, final URL). ``max_size``: abort at max_size + 1 bytes.
     ``on_headers(start, remaining_or_-1, headers)`` runs before the first byte is written (disk checks).
     ``meta`` (file mode): the resume validator sidecar; a part is resumed only when the sidecar names the same URL,
-    with ``If-Range`` (strong ETag or Last-Modified) so a changed resource answers 200 and restarts from zero."""
+    with ``If-Range`` (strong ETag or Last-Modified) so a changed resource answers 200 and restarts from zero.
+    ``checkpoint`` (Phase 2 review): a dict kept by the caller across attempts; it holds the hasher state of the part
+    as this function last left it, so a resume re-hashes the part from disk only when its size or mtime changed."""
     start = 0
     if resume and part.exists() and not part.is_symlink():
         start = part.stat().st_size
@@ -305,8 +308,10 @@ def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec]
             start = 0
             raise _Restart()
         if status == 206 and start > 0 and _range_start(rh) == start:
-            h = hasher_factory()
-            _hash_file(part, h, stop, limit=start)
+            h = _checkpoint_hasher(checkpoint, part, start)
+            if h is None:
+                h = hasher_factory()
+                _hash_file(part, h, stop, limit=start)
             progress.add(start, downloaded=False)
             fd = _open_part(part, truncate=False)
             size = start
@@ -333,6 +338,8 @@ def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec]
             except BaseException:
                 os.close(fd)
                 raise
+        if checkpoint is not None:
+            checkpoint.clear()
         try:
             for b in chunks:
                 if stop.is_set():
@@ -344,12 +351,44 @@ def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec]
                 size += len(b)
                 progress.add(len(b))
         finally:
-            _fsync_close(fd)
+            try:
+                _fsync_close(fd)
+            finally:
+                if checkpoint is not None:
+                    _save_checkpoint(checkpoint, part, h, size)
         return h, size, rh, final
     finally:
         close = getattr(chunks, "close", None)
         if callable(close):
             close()
+
+
+def _part_sig(part: Path) -> Optional[Tuple[int, int]]:
+    try:
+        st = os.stat(str(part))
+    except OSError:
+        return None
+    return st.st_size, st.st_mtime_ns
+
+
+def _save_checkpoint(cp: Dict[str, Any], part: Path, h: Any, size: int) -> None:
+    sig = _part_sig(part)
+    cp.clear()
+    if sig is not None and sig[0] == size:
+        try:
+            cp.update(h=h.copy(), size=size, sig=sig)
+        except Exception:  # noqa: BLE001 - a hasher without copy(): re-hash from disk next time
+            cp.clear()
+
+
+def _checkpoint_hasher(cp: Optional[Dict[str, Any]], part: Path, start: int) -> Any:
+    """A copy of the checkpointed hasher when the part is still exactly what the last attempt left, else None."""
+    if not cp or cp.get("size") != start or cp.get("sig") != _part_sig(part):
+        return None
+    try:
+        return cp["h"].copy()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class _Restart(Exception):
@@ -364,6 +403,8 @@ class _HttpStatus(Exception):
 
 
 def _transient(e: BaseException) -> bool:
+    if util.is_disk_full(e):          # Phase 2 review: a full disk is not a network error
+        return False
     if isinstance(e, _HttpStatus):
         return e.status >= 500 or e.status in (408, 429)
     if isinstance(e, HiveError):
@@ -537,7 +578,7 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
                     _say(f"{_err_text(e)}; retrying in {BACKOFF[attempt - 1]} s")
                     _sleep(BACKOFF[attempt - 1], stop)
                     continue
-                raise Failure(f"download failed: {_err_text(e)}")
+                raise Failure(f"download failed: {_err_text(e)}", EXIT_DISK if util.is_disk_full(e) else EXIT_FAIL)
         digest = h.hexdigest()
         if want_sha and digest != want_sha:
             raise Failure(f"sha256 mismatch: expected {want_sha}, got {digest} (partial file kept: {part})", EXIT_HASH)
@@ -780,6 +821,7 @@ class Puller:
         hash_retries = 0
         net_retries = 0
         resume = True
+        checkpoint: Dict[str, Any] = {}
         with self.lock:
             self.progress.current.append(f["path"])
         try:
@@ -790,7 +832,8 @@ class Puller:
                 try:
                     h, got, _rh, _final = _fetch(url, part, guard=self.guard, auth=self.auth, headers={},
                                                  resume=resume, max_size=size, hasher_factory=factory,
-                                                 progress=before, stop=self.stop)  # type: ignore[arg-type]
+                                                 progress=before, stop=self.stop,  # type: ignore[arg-type]
+                                                 checkpoint=checkpoint)
                 except (Stopped, Failure) as e:
                     if isinstance(e, Failure) and e.code == EXIT_HASH:     # oversize body: delete, one retry
                         self._rewind(before)
@@ -819,6 +862,8 @@ class Puller:
                     self._rewind(before)
                     if self.stop.is_set():
                         raise Stopped()
+                    if util.is_disk_full(e):
+                        raise Failure(f"{f['path']}: disk full ({_err_text(e)})", EXIT_DISK)
                     if _transient(e) and net_retries < len(BACKOFF):
                         _say(f"{f['path']}: {_err_text(e)}; retrying in {BACKOFF[net_retries]} s")
                         _sleep(BACKOFF[net_retries], self.stop)
@@ -891,7 +936,8 @@ class Puller:
             _say(f"failed: {e}")
         except (OSError, HiveError) as e:
             with self.lock:
-                self.failures.append((f["path"], f"{f['path']}: {_err_text(e)}", EXIT_FAIL))
+                self.failures.append((f["path"], f"{f['path']}: {_err_text(e)}",
+                                      EXIT_DISK if util.is_disk_full(e) else EXIT_FAIL))
             _say(f"failed: {f['path']}: {_err_text(e)}")
 
     def _fatal(self) -> bool:

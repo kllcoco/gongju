@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from . import proctree, textlog, util
-from .errors import HiveError, bad_request, cancelled, not_found, rate_limited
+from .errors import HiveError, bad_request, cancelled, not_found, rate_limited, too_large
 
 if TYPE_CHECKING:  # pragma: no cover
     from .actions import ActionContext
@@ -152,9 +152,14 @@ def read_log(run_dir: Path, logs: Dict[str, str], finished: Any, secrets: Any = 
             time.sleep(min(0.1, max(0.0, end - time.monotonic())))
     rr = textlog.read_range(log_path, offset, max_bytes, tail_lines if offset is None else None)
     data: bytes = rr["data"]
+    start = rr["offset"]
+    if data and start > 0 and util.IS_WINDOWS:
+        # Phase 2 review: a range that starts inside an ANSI code page double-byte character skips its trail byte
+        ctx_n = min(256, start)
+        k = textlog.dbcs_skip(textlog.read_at(log_path, start - ctx_n, ctx_n), data)
+        data, start = data[k:], start + k
     _text, consumed = textlog.decode_chunk(data)
     data = data[:consumed]
-    start = rr["offset"]
     nxt = start + consumed
     masked = False
     sec = secrets
@@ -205,7 +210,17 @@ class JobManager:
         for d in sorted(self.dir.iterdir()) if self.dir.exists() else []:
             if not d.is_dir():
                 continue
-            rec = util.read_json(d / "job.json", None) if (d / "job.json").exists() else None
+            try:
+                rec = util.read_json(d / "job.json", None) if (d / "job.json").exists() else None
+            except (HiveError, OSError, ValueError) as e:
+                # Phase 2 review: one unreadable record (power loss, AV, a hand edit) never disables the manager
+                msg = e.message if isinstance(e, HiveError) else str(e)
+                log.warning("job record %s is unreadable (%s); renamed to job.json.corrupt", d.name, msg)
+                try:
+                    util.replace_with_retry(d / "job.json", d / "job.json.corrupt")
+                except OSError:
+                    pass
+                continue
             if not isinstance(rec, dict) or rec.get("job_id") != d.name:
                 continue
             with self._lock:
@@ -250,13 +265,20 @@ class JobManager:
             snap = dict(rec)
             if self._jobs.get(snap.get("job_id")) is not rec:
                 return      # removed meanwhile (a finished shell.run job): its run dir is gone, nothing to save
+        rd = self._run_dir(snap["job_id"])
         try:
-            util.write_json_atomic(self._run_dir(snap["job_id"]) / "job.json", snap, private=True)
+            # Phase 2 review: never re-create a run dir a concurrent remove() deleted (mkdir=False)
+            util.write_json_atomic(rd / "job.json", snap, private=True, mkdir=False)
         except OSError as e:
             with self._lock:
                 gone = self._jobs.get(snap.get("job_id")) is not rec
             if not gone:
                 log.warning("cannot write job record %s: %s", snap.get("job_id"), e)
+            return
+        with self._lock:
+            gone = self._jobs.get(snap.get("job_id")) is not rec
+        if gone:     # removed while we wrote: remove() may have deleted the dir before our file landed
+            shutil.rmtree(rd, ignore_errors=True)
 
     def _rehold(self, jid: str, rec: Dict[str, Any]) -> None:
         paths = rec.get("held_paths") or []
@@ -320,6 +342,11 @@ class JobManager:
                                         merge_stderr=merge_stderr, log_max_bytes=log_max_bytes, log_keep=log_keep,
                                         keep_awake=keep_awake, tags=tags, command_display=command_display,
                                         extra_files=extra_files)
+        except OSError as e:
+            if util.is_disk_full(e):     # Phase 2 review: the fsops mapping, not "internal: OSError [Errno 28]"
+                raise too_large("disk full: cannot write the job's files", hint="disk full",
+                                path=str(self._run_dir(jid)))
+            raise
         finally:
             with self._lock:
                 self._reserved.pop(jid, None)

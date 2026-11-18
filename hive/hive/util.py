@@ -182,10 +182,13 @@ def replace_with_retry(src: "os.PathLike[str] | str", dst: "os.PathLike[str] | s
             delay = min(delay * 2, 1.6)
 
 
-def atomic_write_bytes(path: "os.PathLike[str] | str", data: bytes, private: bool = False) -> None:
-    """Write bytes atomically (tmp file in the same dir + fsync + replace); ``private`` -> secure_file."""
+def atomic_write_bytes(path: "os.PathLike[str] | str", data: bytes, private: bool = False, *,
+                       mkdir: bool = True) -> None:
+    """Write bytes atomically (tmp file in the same dir + fsync + replace); ``private`` -> secure_file;
+    ``mkdir=False`` (Phase 2 review): a missing parent raises FileNotFoundError instead of being created."""
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
+    if mkdir:
+        p.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(p.parent))
     try:
         with os.fdopen(fd, "wb") as f:
@@ -203,9 +206,9 @@ def atomic_write_bytes(path: "os.PathLike[str] | str", data: bytes, private: boo
         raise
 
 
-def write_json_atomic(path: "os.PathLike[str] | str", obj: Any, private: bool = False) -> None:
+def write_json_atomic(path: "os.PathLike[str] | str", obj: Any, private: bool = False, *, mkdir: bool = True) -> None:
     """Write JSON atomically (tmp file + fsync + replace). ``private`` -> 0600 on POSIX, owner-only ACL on Windows."""
-    atomic_write_bytes(path, (json_dumps(obj, pretty=True) + "\n").encode("utf-8"), private=private)
+    atomic_write_bytes(path, (json_dumps(obj, pretty=True) + "\n").encode("utf-8"), private=private, mkdir=mkdir)
 
 
 def b64e(data: bytes) -> str:
@@ -560,6 +563,99 @@ def _linux_btime() -> Optional[float]:
     return None
 
 
+_BTIME_CACHE: Optional[Tuple[str, float]] = None
+
+
+def _linux_boot_id() -> Optional[str]:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as f:
+            bid = f.read().strip()
+    except OSError:
+        return None
+    return bid if re.match(r"^[0-9A-Fa-f-]{8,64}\Z", bid) else None
+
+
+def _btime_dirs() -> List[str]:
+    out: List[str] = []
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if xdg and os.path.isabs(xdg):
+        out.append(xdg)
+    for d in ("/dev/shm", tempfile.gettempdir()):
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def _read_btime_file(path: str) -> Optional[float]:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size > 64:
+            return None
+        v = float(os.read(fd, 64).decode("ascii").strip())
+        return v if v > 0 else None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def _stable_btime() -> Optional[float]:
+    """Linux boot time that does not move with wall-clock steps (Phase 2 review): /proc/stat ``btime`` is derived
+    from the realtime clock, so an NTP/RTC/WSL clock step moves it and every recorded ctime would stop matching.
+    The first value read in a boot is kept for that boot (per boot_id) in a 0600 file owned by this user under
+    $XDG_RUNTIME_DIR, /dev/shm or the temp dir (cleared at reboot), so every Hive process (node, shims, CLI) of this
+    boot computes the same create times; the live value is the fallback."""
+    global _BTIME_CACHE
+    bid = _linux_boot_id()
+    if bid is None:
+        return _linux_btime()
+    cached = _BTIME_CACHE
+    if cached is not None and cached[0] == bid:
+        return cached[1]
+    name = f"hive-btime-{os.getuid()}-{bid}"
+    for d in _btime_dirs():
+        v = _read_btime_file(os.path.join(d, name))
+        if v is not None:
+            _BTIME_CACHE = (bid, v)
+            return v
+    live = _linux_btime()
+    if live is None:
+        return None
+    for d in _btime_dirs():
+        if not os.path.isdir(d):
+            continue
+        path = os.path.join(d, name)
+        tmp = os.path.join(d, f".{name}.{os.getpid()}.{secrets.token_hex(4)}")
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except OSError:
+            continue
+        try:
+            os.write(fd, repr(live).encode("ascii"))
+            os.close(fd)
+            try:
+                os.link(tmp, path)          # first writer wins (atomic, never replaces another process's value)
+            except FileExistsError:
+                pass
+            except OSError:
+                continue
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        v = _read_btime_file(path)
+        if v is not None:
+            _BTIME_CACHE = (bid, v)
+            return v
+    _BTIME_CACHE = (bid, live)
+    return live
+
+
 def _linux_stat_fields(pid: int) -> Optional[List[str]]:
     try:
         with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8", errors="replace") as f:
@@ -580,14 +676,16 @@ def process_create_time(pid: int) -> Optional[float]:
         return None
     if pid < 0:
         return None
-    try:
-        import psutil  # type: ignore  # optional extra (hive-agent[full])
+    linux = sys.platform.startswith("linux") and os.path.isdir("/proc/self")
+    if not linux:   # Phase 2 review: on Linux psutil's create_time follows the moving btime too, so /proc is used
         try:
-            return float(psutil.Process(pid).create_time())
-        except Exception:
-            return None
-    except ImportError:
-        pass
+            import psutil  # type: ignore  # optional extra (hive-agent[full])
+            try:
+                return float(psutil.Process(pid).create_time())
+            except Exception:
+                return None
+        except ImportError:
+            pass
     if IS_WINDOWS:  # pragma: no cover - Windows only
         try:
             import ctypes
@@ -606,9 +704,9 @@ def process_create_time(pid: int) -> Optional[float]:
                 k32.CloseHandle(h)
         except Exception:
             return None
-    if sys.platform.startswith("linux"):
+    if linux:
         fields = _linux_stat_fields(pid)
-        btime = _linux_btime()
+        btime = _stable_btime() if fields else None
         if not fields or btime is None or len(fields) < 20:
             return None
         try:
@@ -951,6 +1049,16 @@ def parse_kv(items: Iterable[str], sep: str = "=") -> Dict[str, str]:
 # ---------------------------------------------------------------------------------------------------------------
 # misc (existing)
 
+def is_disk_full(e: BaseException) -> bool:
+    """An OSError that means "no space left" (ENOSPC, EDQUOT, Windows ERROR_DISK_FULL/ERROR_HANDLE_DISK_FULL)."""
+    if not isinstance(e, OSError):
+        return False
+    import errno as _errno
+    if e.errno in (_errno.ENOSPC, getattr(_errno, "EDQUOT", -1)):
+        return True
+    return getattr(e, "winerror", None) in (112, 39)
+
+
 def decode_text(data: bytes) -> str:
     """Decode process output / file bytes leniently (UTF-8, then local codepage)."""
     try:
@@ -963,6 +1071,25 @@ def decode_text(data: bytes) -> str:
                 return data.decode(enc)
             except (UnicodeDecodeError, LookupError):
                 continue
+        # Phase 2 review: a chunk cut inside a double-byte character (a log range, a truncated tail) starts on an
+        # orphaned trail byte and/or ends on a lone lead byte; decode the rest with the code page and mark the cut
+        # bytes, instead of turning every character of the chunk into U+FFFD through UTF-8
+        for enc in ("mbcs", "gbk"):
+            for a, b in ((0, 1), (1, 0), (1, 1)):
+                try:
+                    text = data[a:len(data) - b].decode(enc)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+                return "\ufffd" * a + text + "\ufffd" * b
+        best = data.decode("utf-8", errors="replace")
+        for enc in ("mbcs", "gbk"):
+            try:
+                alt = data.decode(enc, errors="replace")
+            except LookupError:
+                continue
+            if alt.count("\ufffd") < best.count("\ufffd"):
+                best = alt
+        return best
     return data.decode("utf-8", errors="replace")
 
 
