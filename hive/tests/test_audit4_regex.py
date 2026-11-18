@@ -1,9 +1,10 @@
 """Audit round 4 (DoS / local users), regex half: linear-time redaction and secret masking on megabyte adversarial
 inputs, bounded proc.list / job command redaction (findings 1, 2); fs.search / ready_pattern regexes in the
 _regexworker child with a hard kill, tightened check_regex (finding 4). Bounds are generous: the old code took
-minutes."""
+minutes. Also the btime FIFO (finding 5) and model listing caps (finding 8)."""
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import threading
@@ -274,6 +275,86 @@ class TestSearchUsesWorker(unittest.TestCase):
         self.assertEqual([(m["line"], bool(m.get("cut"))) for m in r["matches"]], [(2, False), (4, True)])
         r = self.call({"pattern": "FOO", "path": "d", "ignore_case": True, "literal": True})
         self.assertEqual(len(r["matches"]), 3)
+
+
+@unittest.skipUnless(hasattr(os, "mkfifo") and os.path.exists("/proc/sys/kernel/random/boot_id"), "Linux only")
+class TestBtimeFifo(unittest.TestCase):
+    def setUp(self):
+        from hive import util
+        self.util = util
+        self.tmp = Path(tempfile.mkdtemp(prefix="hive-a4bt-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.shared = self.tmp / "shm"
+        self.shared.mkdir()
+        os.chmod(self.shared, 0o1777)
+        self.private = self.tmp / "run"
+        self.private.mkdir(mode=0o700)
+        self.name = f"hive-btime-{os.getuid()}-{util._linux_boot_id()}"
+        self.fifos = []
+
+    def fifo(self, path: Path) -> None:
+        os.mkfifo(str(path), 0o600)
+        self.fifos.append(path)
+
+    def tearDown(self):
+        for f in self.fifos:             # release a reader that might still be blocked
+            try:
+                fd = os.open(str(f), os.O_WRONLY | os.O_NONBLOCK)
+                os.close(fd)
+            except OSError:
+                pass
+
+    def run_btime(self, private_dirs, legacy_dirs):
+        res = {}
+        u = self.util
+
+        def go():
+            with mock.patch.object(u, "_BTIME_CACHE", None), \
+                    mock.patch.object(u, "_btime_dirs", lambda create=False: [str(d) for d in private_dirs]), \
+                    mock.patch.object(u, "_legacy_btime_dirs", lambda: [str(d) for d in legacy_dirs]):
+                res["v"] = u._stable_btime()
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        th.join(5)
+        self.assertFalse(th.is_alive(), "btime read blocked")
+        return res["v"]
+
+    def test_fifo_in_shared_or_private_dir_never_blocks(self):
+        self.fifo(self.shared / self.name)
+        v = self.run_btime([self.private], [self.shared])
+        self.assertAlmostEqual(v, self.util._linux_btime(), delta=5)
+        self.assertTrue((self.private / self.name).is_file())
+        (self.private / self.name).unlink()
+        self.fifo(self.private / self.name)
+        v = self.run_btime([self.private], [])
+        self.assertAlmostEqual(v, self.util._linux_btime(), delta=5)
+
+    def test_only_private_regular_files_count(self):
+        bad = self.private / self.name
+        bad.write_text("12345")
+        os.chmod(bad, 0o644)
+        v = self.run_btime([self.private], [])
+        self.assertNotEqual(v, 12345.0)
+        bad.unlink()
+        legacy = self.shared / self.name
+        legacy.write_text("1700000000.0")
+        os.chmod(legacy, 0o600)
+        (self.private / f"hive-btime-{os.getuid()}-old-boot").write_text("1")
+        self.assertEqual(self.run_btime([self.private], [self.shared]), 1700000000.0)   # carried over mid-boot
+        self.assertEqual((self.private / self.name).read_text(), "1700000000.0")
+        self.assertFalse((self.private / f"hive-btime-{os.getuid()}-old-boot").exists())  # earlier boots pruned
+
+    def test_shared_dirs_are_never_btime_dirs(self):
+        u = self.util
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.shared), "HIVE_HOME": str(self.tmp / "hh")}):
+            dirs = u._btime_dirs(create=True)
+        self.assertNotIn(str(self.shared), dirs)
+        self.assertNotIn("/dev/shm", dirs)
+        self.assertNotIn(tempfile.gettempdir(), dirs)
+        self.assertIn(str(self.tmp / "hh" / "run"), dirs)
+        self.assertEqual(os.stat(self.tmp / "hh" / "run").st_mode & 0o777, 0o700)
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.private)}):
+            self.assertEqual(u._btime_dirs()[0], str(self.private))
 
 
 if __name__ == "__main__":

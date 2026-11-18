@@ -18,6 +18,7 @@ import os
 import platform
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -579,25 +580,59 @@ def _linux_boot_id() -> Optional[str]:
     return bid if re.match(r"^[0-9A-Fa-f-]{8,64}\Z", bid) else None
 
 
-def _btime_dirs() -> List[str]:
+def _private_dir(d: str, *, create: bool = False) -> bool:
+    """``d`` is a real directory owned by this user that no other user can write (optionally created 0700)."""
+    try:
+        if create and not os.path.lexists(d):
+            os.makedirs(d, 0o700, exist_ok=True)
+        st = os.stat(d)                 # a symlinked ~/.hive is fine when its target is ours and private
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022
+
+
+def _btime_dirs(*, create: bool = False) -> List[str]:
+    """Audit round 4 (local users): private per-user directories only, never a shared world-writable one (another
+    user could plant a FIFO or the name there): $XDG_RUNTIME_DIR when it is ours and not writable by others, then
+    ``<passwd home>/.hive/run`` (the account's home, not $HOME, so a job's env cannot split it), then
+    ``$HIVE_HOME/run``. The per-boot file name makes a stale file from an earlier boot harmless."""
     out: List[str] = []
     xdg = os.environ.get("XDG_RUNTIME_DIR")
-    if xdg and os.path.isabs(xdg):
+    if xdg and os.path.isabs(xdg) and _private_dir(xdg):
         out.append(xdg)
-    for d in ("/dev/shm", tempfile.gettempdir()):
-        if d not in out:
+    homes: List[str] = []
+    try:
+        import pwd
+        homes.append(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".hive"))
+    except (ImportError, KeyError, OSError):
+        pass
+    hh = os.environ.get("HIVE_HOME")
+    if hh and os.path.isabs(hh):
+        homes.append(hh)
+    for h in homes:
+        d = os.path.join(h, "run")
+        if d not in out and _private_dir(h, create=create) and _private_dir(d, create=create):
             out.append(d)
     return out
 
 
+def _legacy_btime_dirs() -> List[str]:
+    """Pre-round-4 locations (/dev/shm, the temp dir): read only, so a process upgraded mid-boot keeps the value
+    the older version recorded; never written to."""
+    return [d for d in ("/dev/shm", tempfile.gettempdir())]
+
+
 def _read_btime_file(path: str) -> Optional[float]:
+    """The value of a btime file, or None unless it is a regular file owned by this user with no group/other
+    permission bits. Opened O_NONBLOCK | O_NOFOLLOW: a FIFO or device planted under the name cannot block."""
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOCTTY", 0))
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_size > 64:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 or st.st_size > 64:
             return None
         v = float(os.read(fd, 64).decode("ascii").strip())
         return v if v > 0 else None
@@ -607,12 +642,48 @@ def _read_btime_file(path: str) -> Optional[float]:
         os.close(fd)
 
 
+def _write_btime_file(d: str, name: str, value: float) -> Optional[float]:
+    """Publish ``value`` as ``d/name`` unless a value is there already (first writer wins); returns the stored one."""
+    path = os.path.join(d, name)
+    tmp = os.path.join(d, f".{name}.{os.getpid()}.{secrets.token_hex(4)}")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return None
+    try:
+        os.write(fd, repr(value).encode("ascii"))
+        os.close(fd)
+        try:
+            os.link(tmp, path)          # atomic, never replaces another process's value
+        except FileExistsError:
+            pass
+        except OSError:
+            return None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    prefix = f"hive-btime-{os.getuid()}-"
+    try:
+        for old in os.listdir(d):    # files of earlier boots
+            if old.startswith(prefix) and old != name and not old.startswith("."):
+                try:
+                    os.unlink(os.path.join(d, old))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return _read_btime_file(path)
+
+
 def _stable_btime() -> Optional[float]:
     """Linux boot time that does not move with wall-clock steps (Phase 2 review): /proc/stat ``btime`` is derived
     from the realtime clock, so an NTP/RTC/WSL clock step moves it and every recorded ctime would stop matching.
-    The first value read in a boot is kept for that boot (per boot_id) in a 0600 file owned by this user under
-    $XDG_RUNTIME_DIR, /dev/shm or the temp dir (cleared at reboot), so every Hive process (node, shims, CLI) of this
-    boot computes the same create times; the live value is the fallback."""
+    The first value read in a boot is kept for that boot (per boot_id) in a 0600 file owned by this user in a
+    private per-user directory (``_btime_dirs``; audit round 4: never /dev/shm or /tmp, which another local user
+    could poison with a FIFO), so every Hive process (node, shims, CLI) of this boot computes the same create
+    times; the live value is the fallback."""
     global _BTIME_CACHE
     bid = _linux_boot_id()
     if bid is None:
@@ -626,38 +697,22 @@ def _stable_btime() -> Optional[float]:
         if v is not None:
             _BTIME_CACHE = (bid, v)
             return v
-    live = _linux_btime()
-    if live is None:
+    first = None
+    for d in _legacy_btime_dirs():
+        first = _read_btime_file(os.path.join(d, name))
+        if first is not None:
+            break
+    if first is None:
+        first = _linux_btime()
+    if first is None:
         return None
-    for d in _btime_dirs():
-        if not os.path.isdir(d):
-            continue
-        path = os.path.join(d, name)
-        tmp = os.path.join(d, f".{name}.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except OSError:
-            continue
-        try:
-            os.write(fd, repr(live).encode("ascii"))
-            os.close(fd)
-            try:
-                os.link(tmp, path)          # first writer wins (atomic, never replaces another process's value)
-            except FileExistsError:
-                pass
-            except OSError:
-                continue
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        v = _read_btime_file(path)
+    for d in _btime_dirs(create=True):
+        v = _write_btime_file(d, name, first)
         if v is not None:
             _BTIME_CACHE = (bid, v)
             return v
-    _BTIME_CACHE = (bid, live)
-    return live
+    _BTIME_CACHE = (bid, first)
+    return first
 
 
 def _linux_stat_fields(pid: int) -> Optional[List[str]]:
