@@ -1049,8 +1049,10 @@ _CWD_TEXT_RE = re.compile(
     r"|setlocation|setcurrentdirectory|currentdirectory\s*=")
 _DYNAMIC_TEXT_RE = re.compile(
     r"(?i)`|\$\(|(?<![\w.-])(eval|source|iex|invoke-expression|invoke-command|icm)(?![\w-])"
-    r"|(^|[;&|(){}\n]|\b(do|then|else|exec|command|env|xargs|sudo|nohup|time)\s)\s*[\"']?\$[{\w]"
-    r"|(^|[;&|(){}\n])\s*\.\s")
+    r"|(^|[;&|(){}\n]|\b(do|then|else|exec|command|env|xargs|sudo|nohup|time)\s)[^\S\n]*[\"']?\$[{\w]"
+    r"|(^|[;&|(){}\n])[^\S\n]*\.\s")
+# audit round 4 (DoS): blanks after a separator exclude newlines (a newline is itself a separator): ``\s*`` there
+# rescanned every following newline from each one, quadratic (40k newlines took 11 s)
 
 
 def text_may_change_cwd(text: str) -> bool:

@@ -78,6 +78,19 @@ class TestLinearRedaction(unittest.TestCase):
             self.assertLessEqual(len(flt), system.FILTER_MAX)
             self.assertLessEqual(len(disp), 200)
 
+    def test_other_hot_regexes_linear(self):
+        # found by scanning every module-level regex of the package with adversarial inputs
+        from hive import hfhub, presets
+        for s in ("\n" * MB, "; " + " " * MB, "(" * MB, "do" + "\n" * MB):
+            with self.subTest(text=s[:4]), Timed(self, "presets._DYNAMIC_TEXT_RE", 0.5):
+                presets.text_may_change_cwd(s)
+        for s in ("<" * 65536, "<" + "a" * 65536 + ">; rel=next"):
+            with Timed(self, "hfhub.LINK_NEXT_RE", 0.5):
+                hfhub.LINK_NEXT_RE.search(s)
+        self.assertTrue(presets.text_may_change_cwd("a;\n  $X"))
+        self.assertTrue(presets.text_may_change_cwd("x\n. ./env"))
+        self.assertEqual(hfhub.LINK_NEXT_RE.search('<https://h/x?p=2>; rel="next"').group(1), "https://h/x?p=2")
+
 
 class TestRedactHead(unittest.TestCase):
     def test_short_text_unchanged_semantics(self):

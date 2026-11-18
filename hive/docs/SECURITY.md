@@ -54,6 +54,9 @@ execution by design.** Read this page once before you give an agent a token. The
 - WSL interop and automount let Linux processes reach the Windows profile; disable them if the WSL node must be a
   boundary.
 - Audit files can be rewritten by a same-user shell (no hash chain yet).
+- Authenticated agents can still keep idle keep-alive connections and fill the agents' share of the HTTP connection
+  pool (owner tokens from this machine keep a reserve); a JSON body made of empty containers expands several times
+  in memory when parsed (the body budget counts bytes on the wire).
 
 ## Hardening guide
 

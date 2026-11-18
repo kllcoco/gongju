@@ -1993,3 +1993,65 @@ A3-4. **Gateway resolved the node twice (MINOR):** `HubGatewayBackend.authorize`
     `model.forward`. Tests: `TestGatewayResolvesOnce` (the probe moves the id from pod-a to desk inside authorize:
     the request still goes to pod-a, nothing reaches desk's audit; `forward` refuses a link the globs do not cover).
     DESIGN §8.7 step 1.
+
+### Audit round 4 (DoS / local users)
+
+Independent DoS / hub `/mcp` / local multi-user audit, with owner decisions. Findings 3, 6, 7 (this part): changes in
+`httpserver.py`, `limits.py`, `node.py` (call slots), `hub.py` (relay result route, transport inflight cap),
+`relay.py`, `config.py`; tests `tests/test_audit4_dos.py` (+ two updated cases in `tests/test_httpserver.py`); DESIGN
+§6.1, §5.7 limits, §5.9, §7.3, §14 defaults; PROTOCOL §1, §5.3; SECURITY transport row and limits. Measured with
+real `ApiServer`s on loopback (server in a child process, node defaults unless noted; scratch harness, not shipped).
+
+A4-3. **Unauthenticated connection exhaustion / slowloris (HIGH):** 16 idle sockets from 127.0.0.1 (any local user,
+    no token) got the owner's CLI/MCP a 503; 127.0.0.2+ aliases filled `max_connections`; through `proxy_port`
+    (Funnel) all peers are 127.0.0.1, so 16 idle internet sockets locked out everyone; idle pre-auth sockets lived
+    30 s. Now (`httpserver._ConnTable`, per the owner decisions): `max_connections` = pre-auth pool (`n // 2`) +
+    authenticated pool (rest) with 4 slots (≤ half) only owner tokens accepted by the owner check may take (a
+    connection moves pools with its first authenticated request; no room → 503 `busy`, `Retry-After: 1`); pre-auth
+    buckets ≤ 16: one per remote IP, ONE for 127.0.0.0/8 + ::1, one for `proxy_port` and `trusted_proxies`; a
+    newcomer to a full bucket (or full pool: largest bucket) evicts the oldest connection there that is still waiting
+    for its head (socket-level shutdown, also for TLS sockets), else a static 503 with `Retry-After`; the pre-auth
+    phase (TLS handshake + idle + head) has 5 s in total (`PREAUTH_DEADLINE`; from the accept, then from the end of
+    each response on an unauthenticated keep-alive connection); authenticated keep-alive keeps 30 s. The accept
+    thread no longer uses a semaphore; connection threads are started by `_BoundedServer.process_request` with their
+    slot. A local owner Unix socket is future work (not needed with the reserve). Measured (owner GET /v1/echo while
+    flooded; before → after): 16 idle from 127.0.0.1: connection reset (503) → 200 in 3 ms; 64 idle from
+    127.0.0.2–5: 503 → 200; 16 and 64 idle on `proxy_port`: owner on the main port reset → 200, an agent through the
+    proxy reset → 200; 200 idle mixed (4 loopback addresses + proxy): 503 → 200 (owner and agent); idle pre-auth
+    socket closed after 30.0 s → 5.0 s. Residual: authenticated non-owner keep-alive connections can still fill
+    the non-owner share of the authenticated pool (owners keep their reserve; idle authenticated sockets are not
+    evicted, since a client may be sending on them).
+A4-6. **Bodies buffered before per-identity limits (MEDIUM):** a hub buffered and parsed 48 MiB bodies with no global
+    bound (40 concurrent ones: peak RSS 1580 MiB, 90 s wall, the pure-Python depth scan ~2 s per body holding the
+    GIL). Now, after authentication and before the body is read: (a) a route `pre_body(headers, identity, length)`
+    hook may refuse or answer unread; `/v1/relay/result` uses it: `RelayAgent` sends `X-Hive-Task` /
+    `X-Hive-Session`, `RelayLink.expects_result` checks them and an unexpected result gets `{"accepted":false}` with
+    the 30 MiB body never read; with the headers the body fields must match (400), without them (older pods) the
+    body decides; (b) per non-owner identity (kind, name, token hash, agent) ≤ 32 requests with a body in flight
+    (`ApiServer.inflight`, `KeyedLimit`; node: ≥ its per-identity call slots; hub: `max_inflight_per_agent` + 8) →
+    429 `inflight`; (c) a global byte budget `listen.max_buffered_bytes` (node 128 MiB, hub 256 MiB, ≥ 2 ×
+    `max_body_bytes`, a quarter reserved for owners; `limits.BodyBudget`) charged until the response is written, wait
+    ≤ 2 s then 503 `busy` `Retry-After: 2`; both close the connection. (d) `json_depth_ok` runs at C speed: escape
+    pairs dropped (`\\\\` then `\\"`, left to right as JSON pairs them), `translate` keeps only brackets/quotes,
+    strings cut (find loop or one regex; an unterminated string runs to the end), `()`-removal passes, then
+    `itertools.accumulate` over bracket runs; never True when the parse would nest deeper (fuzzed against the old
+    loop). Measured, hub, 40 concurrent 48 MiB POSTs from two agent tokens + an owner 1 MiB POST: peak RSS 1580 MiB,
+    90.7 s, all 40 buffered → 265 MiB, 9 s, 2–4 accepted at a time and the rest 503 `busy` before their bodies were
+    read, the owner's POST 200 both times; depth scan per 48 MiB: string + structure 1.88 s → 0.07 s, numbers
+    2.46 s → 0.05 s, adversarial depth-8 bracket soup 2.46 s → 1.27 s (its `json.loads` takes ~5.6 s). Residual:
+    `json.loads` of a body that is mostly empty containers allocates many times the body size (the budget counts
+    body bytes).
+A4-7. **One token could take every node call slot (MEDIUM):** `ConcurrencyGate` now takes `owner_reserve` and
+    `per_identity`; the node builds it with `policy.limits.owner_reserved_calls` (default 4, ≤ n − 1) and
+    `policy.limits.max_calls_per_identity` (default and maximum: every non-reserved slot, i.e. 28 of 32); owner
+    tokens may take any free slot; the key is (kind, name, token hash, agent), so agents behind one hub token are
+    capped separately. A refusal where the identity cap (smaller than the shared slots) is what binds →
+    `rate_limited` reason `inflight` `retry_after` 2; otherwise `unavailable` `busy` as before. Tests:
+    `TestNodeCallSlots` (6 slots, 2 reserved, 2 per identity: a third call of one agent → inflight, a third agent →
+    busy, the owner still runs 2), `TestLimits`.
+    Tests (all in `tests/test_audit4_dos.py`): JSON depth equivalence/safety fuzz and speed (< 1.5 s for 48 MiB bodies
+    that took ~2 s each), `_ConnTable` pools/eviction/owner reserve, a real server flooded from 127.0.0.1–3 and through
+    `proxy_port` (owner and agent still 200, loopback bucket untouched by proxy sockets), the total pre-auth deadline
+    against a dribbling head, owner reserve with the authenticated pool full, 429 / 503 answered before a 30 MiB body
+    is sent and the owner exempt, `pre_body` short-circuit, a real hub refusing unexpected relay results unread and
+    checking header/body agreement, `RelayAgent` sending the headers.

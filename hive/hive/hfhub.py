@@ -35,7 +35,7 @@ SOURCES = ("huggingface", "modelscope")
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}(/[A-Za-z0-9][A-Za-z0-9._-]{0,95})?\Z")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}\Z")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}\Z")
-LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?', re.IGNORECASE)
+LINK_NEXT_RE = re.compile(r'<([^<>]{1,8192})>\s*;\s*rel="?next"?', re.IGNORECASE)
 CACHE_TTL = 600.0
 MAX_PAGES = 20
 MAX_PAGE_BYTES = 16 << 20
