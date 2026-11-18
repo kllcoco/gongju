@@ -235,7 +235,8 @@ class TestApprovalBinding(unittest.TestCase):
             run = n.home / "run.sh"
             run.write_text("echo approved > out.txt\n")
             aid, rv = self.review(n, "shell.run", {"command": "bash run.sh"})
-            self.assertEqual(set(rv), {"action", "lines", "changes_what_runs", "files"})
+            self.assertEqual(set(rv), {"action", "lines", "changes_what_runs", "files", "cwd"})   # v8.1: + cwd
+            self.assertEqual(rv["cwd"], os.path.realpath(str(n.home)))
             f = [x for x in rv["files"] if x["path"] == str(run)][0]
             self.assertEqual((f["bind"], f["shown"]), ("sha256", True))
             self.assertIn("echo approved > out.txt", rv["lines"])
@@ -306,7 +307,9 @@ class TestApprovalBinding(unittest.TestCase):
             (n.home / "sub").mkdir()
             (n.home / "sub" / "run.sh").write_text("echo hi\n")
             _aid, rv = self.review(n, "shell.run", {"command": "cd sub && bash run.sh"})
-            self.assertIn("run.sh (missing here)", rv["lines"][0])
+            # v8.1 (external review): relative words after cd are never bound, and named as such
+            self.assertIn("run.sh (cwd may change)", rv["lines"][0])
+            self.assertNotIn("bash (cwd may change)", rv["lines"][0])
 
     def test_outside_roots_and_exec_paths_not_bound(self):
         with Node() as n:

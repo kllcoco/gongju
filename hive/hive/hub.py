@@ -1356,10 +1356,13 @@ class Hub:
         review = presets.approval_review(action, params, ctx=None)
         if action not in FILE_BIND_ACTIONS:
             return review
-        words, cwd = self._bind_words(identity, link, action, params, rid, end, gated)
-        if not words:
+        words, cwd, moved = self._bind_words(identity, link, action, params, rid, end, gated)
+        if not words and not moved:
             return review
         files, lines, not_bound = self._bind_files(identity, link, words, cwd, rid, end, gated)
+        if moved:   # v8.1: relative words after cd / -C are not bound; named in the header (presets.moved_items)
+            not_bound += presets.moved_items(moved, lambda w: self._is_file(identity, link, self._join(cwd, w), rid,
+                                                                             end, gated))
         from .util import escape_terminal
         review = dict(review)
         rl = list(review.get("lines") or [])
@@ -1381,41 +1384,51 @@ class Hub:
                         exec_gated=gated)
         return _envelope_result(env)
 
-    def _split(self, text: str, shell: Optional[str], os_name: Optional[str]) -> List[str]:
+    def _split(self, text: str, shell: Optional[str], os_name: Optional[str]) -> Tuple[List[str], List[str]]:
+        """(words to bind, relative words after a cwd change) via ``presets.bindable_words`` (v8.1)."""
         from . import presets
         if shell not in (None, "", "auto"):
-            return presets.candidate_words(text, shell=shell, os_name=None)
+            return presets.bindable_words(text, shell=shell, os_name=None)
         if os_name == "Windows":
-            return presets.candidate_words(text, shell="powershell")
+            return presets.bindable_words(text, shell="powershell")
         if os_name:
-            return presets.candidate_words(text, shell="bash")
-        out = presets.candidate_words(text, shell="bash")
-        for w in presets.candidate_words(text, shell="powershell"):
-            if w not in out:
-                out.append(w)
-        return out
+            return presets.bindable_words(text, shell="bash")
+        out, moved = presets.bindable_words(text, shell="bash")
+        w2, m2 = presets.bindable_words(text, shell="powershell")
+        out += [w for w in w2 if w not in out]
+        moved += [w for w in m2 if w not in moved]
+        return out, moved
+
+    def _is_file(self, identity: Identity, link: NodeLink, path: str, rid: str, end: float, gated: bool) -> bool:
+        try:
+            st = self._sub(identity, link, "fs.stat", {"path": path}, rid, 900, end, gated)
+        except HiveError:
+            return False
+        return bool(st.get("exists")) and st.get("type") == "file"
 
     def _bind_words(self, identity: Identity, link: NodeLink, action: str, params: dict, rid: str, end: float,
-                    gated: bool) -> Tuple[List[str], Optional[str]]:
+                    gated: bool) -> Tuple[List[str], Optional[str], List[str]]:
         from . import presets
         os_name = link.os_name()
         words: List[str] = []
+        moved: List[str] = []
         cwd = params.get("cwd") if isinstance(params.get("cwd"), str) else None
         if action in ("shell.run", "job.start"):
             if params.get("argv"):
-                words = presets.candidate_words([str(x) for x in params["argv"]])
+                words, moved = presets.bindable_words([str(x) for x in params["argv"]])
             else:
-                words = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
+                words, moved = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
         elif action == "service.define":
             if params.get("argv"):
-                words = presets.candidate_words([str(x) for x in params["argv"]])
+                words, moved = presets.bindable_words([str(x) for x in params["argv"]])
             elif params.get("command"):
-                words = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
+                words, moved = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
             sc = params.get("stop_command")
             if sc:
-                more = presets.candidate_words([str(x) for x in sc]) if isinstance(sc, list) else \
+                more, mm = presets.bindable_words([str(x) for x in sc]) if isinstance(sc, list) else \
                     self._split(str(sc), params.get("shell"), os_name)
                 words += [w for w in more if w not in words]
+                moved += [w for w in mm if w not in moved]
             for item in params.get("preset_args") or []:
                 s = str(item)
                 if "=" in s:
@@ -1427,15 +1440,15 @@ class Hub:
                 st = self._sub(identity, link, "service.status", {"name": params.get("name")}, rid, 0, end, gated)
             except HiveError as e:
                 if e.code in ("policy_denied", "forbidden", "not_found"):
-                    return [], None
+                    return [], None, []
                 raise
             d = st.get("definition") if isinstance(st.get("definition"), dict) else {}
             if d.get("argv"):
-                words = presets.candidate_words([str(x) for x in d["argv"]])
+                words, moved = presets.bindable_words([str(x) for x in d["argv"]])
             elif d.get("command"):
-                words = self._split(str(d.get("command")), d.get("shell"), os_name)
+                words, moved = self._split(str(d.get("command")), d.get("shell"), os_name)
             cwd = d.get("cwd") if isinstance(d.get("cwd"), str) else None
-        return words, cwd
+        return words, cwd, moved
 
     @staticmethod
     def _join(cwd: Optional[str], w: str) -> str:

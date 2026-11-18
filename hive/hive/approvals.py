@@ -195,6 +195,12 @@ class ApprovalStore:
                 rec["status"] = "used"
                 rec["used_at"] = iso_utc(now)
                 self._save()
+                want = rec.get("cwd")
+                if isinstance(want, str) and want:
+                    got = review.get("cwd") if isinstance(review, dict) else None
+                    if got != want:     # v8.1: the cwd the words were bound against must be the cwd it runs in
+                        raise conflict("the working folder of the approved command changed; request approval again",
+                                       changed=[want], hint="request approval again; the owner sees the new folder")
                 return dict(rec.get("files") or {})
             for rec in self._records.values():
                 if (rec.get("status") == "pending" and rec.get("requester") == identity.name
@@ -223,6 +229,8 @@ class ApprovalStore:
                    "requester_key": identity.token_sha256, "agent": identity.agent or None, "node": node,
                    "action": action, "params_hash": h, "summary": summary, "review": review, "files": files,
                    "status": "pending", "decided_by": None, "decided_at": None, "note": ""}
+            if isinstance(review.get("cwd"), str) and review.get("cwd"):
+                rec["cwd"] = review["cwd"]     # v8.1: the real cwd of the review, checked again on consume
             self._records[aid] = rec
             self._save()
             raise self._required(rec)

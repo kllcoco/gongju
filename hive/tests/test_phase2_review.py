@@ -55,8 +55,8 @@ class TestBindNextToShellOperators(unittest.TestCase):
     def test_hub_split_mirrors_it(self):
         from hive.hub import Hub
         for os_name in ("Linux", None):
-            self.assertIn("run.sh", Hub._split(None, "bash run.sh;true", None, os_name))  # type: ignore[arg-type]
-        self.assertIn(".\\run.ps1", Hub._split(None, "& .\\run.ps1;calc", None, "Windows"))  # type: ignore[arg-type]
+            self.assertIn("run.sh", Hub._split(None, "bash run.sh;true", None, os_name)[0])  # type: ignore[arg-type]
+        self.assertIn(".\\run.ps1", Hub._split(None, "& .\\run.ps1;calc", None, "Windows")[0])  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------------------------- 2 fs.search oracle

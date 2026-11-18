@@ -788,6 +788,27 @@ class TestHubFileBinding(_HubCase):
         self.assertNotIn("line1", rec["review"]["lines"])
         self.assertIn("content not shown; inspect it on the node", rec["review"]["lines"])
 
+    def test_v81_cd_unbinds_later_relative_words(self):
+        # audit finding 3 (hub side): "cd sub && bash setup.sh" must not bind /w/setup.sh (a decoy in the cwd)
+        stats = []
+
+        def answer(t):
+            p = t["params"]["path"]
+            stats.append(p)
+            if p == "/w/setup.sh":
+                return ok_env({"path": p, "exists": True, "type": "file", "size": 12, "sha256": "ab" * 32,
+                               "mtime": "2026-11-01T00:00:00.000Z"})
+            if p == "/w/sub":
+                return ok_env({"path": p, "exists": True, "type": "dir"})
+            return ok_env({"path": p, "exists": False})
+        box, _seen = self.run_call({"command": "cd sub && bash setup.sh", "cwd": "/w"}, answer)
+        self.assertEqual(box["error"].code, "approval_required")
+        rec = self.hub.approvals.get(box["error"].details["approval_id"])
+        self.assertEqual(rec["files"], {})
+        self.assertIn("setup.sh (cwd may change)", rec["review"]["lines"][0])
+        self.assertNotIn("bash (cwd may change)", rec["review"]["lines"][0])
+        self.assertNotIn("sub (cwd may change)", rec["review"]["lines"][0])
+
     def test_windows_word_split(self):
         self.fake.info = dict(self.fake.info, os="Windows")
         paths = []

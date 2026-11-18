@@ -748,41 +748,106 @@ _SHELL_OPS = frozenset("();<>|&")
 _META_SPLIT = re.compile(r"[;|&<>()]+")
 
 
+def _raw_words(argv_or_command: Union[List[str], str], *, shell: Optional[str], os_name: Optional[str]) -> List[str]:
+    if isinstance(argv_or_command, (list, tuple)):
+        return [str(w) for w in argv_or_command]
+    text = str(argv_or_command)
+    if _windows_shell(shell, os_name):
+        return [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
+    try:
+        # Phase 2 review: shell operators split words even without spaces ("bash run.sh;true",
+        # "run.sh|bash", "<in.sh"), so a script next to a metacharacter is still bound (§5.6)
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        return [w for w in lex if not (w and all(c in _SHELL_OPS for c in w))]
+    except ValueError:
+        return [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
+
+
+def _word_candidates(w: str) -> List[str]:
+    out: List[str] = []
+    if not w:
+        return out
+    if not w.startswith("-"):
+        out.append(w)
+    if "=" in w:
+        v = w.split("=", 1)[1]
+        if v and not v.startswith("-"):
+            out.append(v)
+    return out
+
+
+# v8.1 (external review): words that change the directory later words are resolved in. After one of them a relative
+# word is not bound (the review cannot know which file it names) and is listed as "not bound (cwd may change)".
+CWD_CHANGERS = frozenset({"cd", "pushd", "popd", "chdir", "set-location", "sl", "push-location", "pop-location"})
+_CWD_OPTION_RE = re.compile(r"^(-C.*|--directory(=.*)?|--chdir(=.*)?|-chdir=.*|--work-tree(=.*)?|--git-dir(=.*)?)$")
+
+
+def changes_cwd(word: str) -> bool:
+    """``word`` changes the directory later words are resolved in (cd/pushd/Set-Location/sl/chdir, ``-C <dir>``,
+    ``--directory``, ``--chdir``, terraform ``-chdir=``)."""
+    base = os.path.basename(word.replace("\\", "/")).lower()
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base in CWD_CHANGERS or bool(_CWD_OPTION_RE.match(word))
+
+
+def relative_word(w: str) -> bool:
+    """Not absolute, not ``~``-based and not a drive path (resolved against the cwd)."""
+    return not (w.startswith(("~", "/", "\\")) or re.match(r"^[A-Za-z]:[\\/]", w))
+
+
 def candidate_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
                     os_name: Optional[str] = None) -> List[str]:
     """Words a command names (§5.6 file binding): argv elements, or the command split (shlex for POSIX shells,
     whitespace with quotes stripped for PowerShell/cmd), plus the part after the first ``=`` of KEY=VALUE /
     --opt=VALUE words; words starting with ``-`` are skipped."""
-    if isinstance(argv_or_command, (list, tuple)):
-        words = [str(w) for w in argv_or_command]
-    else:
-        text = str(argv_or_command)
-        if _windows_shell(shell, os_name):
-            words = [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
-        else:
-            try:
-                # Phase 2 review: shell operators split words even without spaces ("bash run.sh;true",
-                # "run.sh|bash", "<in.sh"), so a script next to a metacharacter is still bound (§5.6)
-                lex = shlex.shlex(text, posix=True, punctuation_chars=True)
-                lex.whitespace_split = True
-                words = [w for w in lex if not (w and all(c in _SHELL_OPS for c in w))]
-            except ValueError:
-                words = [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
     out: List[str] = []
-    for w in words:
-        if not w:
-            continue
-        if not w.startswith("-") and w not in out:
-            out.append(w)
-        if "=" in w:
-            v = w.split("=", 1)[1]
-            if v and v not in out and not v.startswith("-"):
-                out.append(v)
+    for w in _raw_words(argv_or_command, shell=shell, os_name=os_name):
+        for c in _word_candidates(w):
+            if c not in out:
+                out.append(c)
     return out
+
+
+def bindable_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
+                   os_name: Optional[str] = None) -> Tuple[List[str], List[str]]:
+    """(words to bind, relative words after a cwd change) (v8.1): like ``candidate_words``, but once a word changes
+    the directory (``changes_cwd``: ``cd sub && bash run.sh``, ``git -C sub``, ``make -C sub``), that word's
+    relative successors go to the second list ("not bound (cwd may change)"); absolute and ``~`` words stay bound.
+    The node review and the hub review share it."""
+    words: List[str] = []
+    moved: List[str] = []
+    after = False
+    for w in _raw_words(argv_or_command, shell=shell, os_name=os_name):
+        for c in _word_candidates(w):
+            if after and relative_word(c):
+                if c not in moved:
+                    moved.append(c)
+            elif c not in words:
+                words.append(c)
+        if not after and changes_cwd(w):
+            after = True
+    return words, moved
 
 
 def _pathlike(word: str) -> bool:
     return "/" in word or "\\" in word or word.lower().endswith(PATHLIKE_EXT)
+
+
+def moved_items(moved: List[str], is_file: Callable[[str], bool]) -> List[str]:
+    """Header items "<word> (cwd may change)" for the relative words after a cwd change (``bindable_words``): the
+    path-like ones and those naming a file in the review cwd (the same words binding would have bound); command names
+    such as ``bash`` and the ``cd`` target folder are left out (v8.1)."""
+    out: List[str] = []
+    for w in moved:
+        try:
+            hit = _pathlike(w) or bool(is_file(w))
+        except Exception:  # noqa: BLE001
+            hit = False
+        if hit:
+            out.append(f"{w} (cwd may change)")
+    return out
 
 
 def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str], str]
@@ -893,14 +958,50 @@ def _param_lines(params: dict, *, skip: Tuple[str, ...], secret_re: "re.Pattern[
     return lines
 
 
-def _resolve_cwd(policy: Any, cwd: Optional[str]) -> str:
-    try:
-        return str(policy.check_cwd(cwd))
-    except Exception:  # noqa: BLE001
+def _review_cwd(policy: Any, cwd: Optional[str]) -> Tuple[str, str]:
+    """(text for the ``cwd:`` line, real cwd the command words are bound against) (v8.1, external review).
+
+    Never falls back to the workdir for a given cwd: the cwd is resolved like ``check_cwd`` resolves it at run time
+    (``~``/variables expanded, relative -> workdir, realpath) through PathGuard without requiring it to exist; a
+    missing or refused cwd is shown verbatim with the reason, and the words are still bound against it (a script in a
+    missing folder is ``absent``). The real cwd goes into the record (``review["cwd"]``); ``require`` refuses a
+    consume whose cwd now resolves elsewhere."""
+    if cwd is None or cwd == "":
         try:
-            return str(policy.workdir)
+            real = str(policy.check_cwd(None))
         except Exception:  # noqa: BLE001
-            return os.getcwd()
+            try:
+                real = str(policy.workdir)
+            except Exception:  # noqa: BLE001
+                real = os.getcwd()
+        return f"{real} (node workdir)", real
+    cwd = str(cwd)
+    reason: Optional[str] = None
+    try:
+        real = str(policy.resolve_path(cwd))
+    except HiveError as e:
+        reason = e.message
+        real = ""
+    except Exception as e:  # noqa: BLE001
+        reason = type(e).__name__
+        real = ""
+    if not real:
+        try:
+            expand = getattr(policy, "_expand", None)
+            s = expand(cwd) if callable(expand) else os.path.expanduser(cwd)
+            if not os.path.isabs(s):
+                s = os.path.join(str(policy.workdir), s)
+            real = os.path.realpath(s)
+        except Exception:  # noqa: BLE001
+            real = cwd
+    text = cwd if cwd == real else f"{cwd} (= {real})"
+    if reason:
+        text += f" (not usable here: {reason})"
+    elif not os.path.exists(real):
+        text += " (does not exist here yet)"
+    elif not os.path.isdir(real):
+        text += " (not a folder)"
+    return text, real
 
 
 def _resolved_shell(shell: Optional[str], ctx: PresetCtx) -> str:
@@ -942,6 +1043,8 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
     files: List[dict] = []
     file_lines: List[str] = []
     not_bound: List[str] = []
+    moved: List[str] = []
+    real_cwd: Optional[str] = None
     if action in ("shell.run", "job.start"):
         env_keys = [k for k, _v in _env_pairs(params.get("env"))]
         shell = params.get("shell")
@@ -954,15 +1057,20 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             body.append(f"shell: {shell or 'auto'}")
             body.append("command:")
             body.extend(str(params.get("command") or "").split("\n"))
-        cwd = _resolve_cwd(ctx.policy, params.get("cwd")) if ctx is not None else params.get("cwd")
-        body.append(f"cwd: {cwd if cwd else '(node workdir)'}")
+        if ctx is not None:
+            cwd_text, cwd = _review_cwd(ctx.policy, params.get("cwd"))
+            real_cwd = cwd
+        else:
+            cwd = params.get("cwd")
+            cwd_text = cwd if cwd else "(node workdir)"
+        body.append(f"cwd: {cwd_text}")
         if params.get("secret_env"):
             body.append("secret_env: " + ", ".join(params["secret_env"]))
         body.extend(_param_lines(params, skip=("argv", "command", "shell", "cwd", "secret_env"), secret_re=secret_re,
                                  shows_env=True))
         if ctx is not None:
-            words = candidate_words(params.get("argv") or str(params.get("command") or ""), shell=shell,
-                                    os_name=ctx.os)
+            words, moved = bindable_words(params.get("argv") or str(params.get("command") or ""), shell=shell,
+                                          os_name=ctx.os)
             files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=str(cwd), mask=ctx.mask)
     elif action == "service.define":
         if ctx is None:
@@ -977,20 +1085,23 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             body.append(f"name: {d.get('name')}")
             if d.get("preset"):
                 body.append(f"preset: {d['preset']} (expanded on this node)")
-            cwd = _resolve_cwd(ctx.policy, d.get("cwd"))
+            cwd_text, cwd = _review_cwd(ctx.policy, d.get("cwd"))
+            real_cwd = cwd
             if d.get("argv"):
                 body.append("argv: " + json.dumps(d["argv"], ensure_ascii=False))
-                words = candidate_words(d["argv"])
+                words, moved = bindable_words(d["argv"])
             else:
                 shell = _resolved_shell(d.get("shell"), ctx)
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(d.get("command") or "").split("\n"))
-                words = candidate_words(str(d.get("command") or ""), shell=shell, os_name=ctx.os)
+                words, moved = bindable_words(str(d.get("command") or ""), shell=shell, os_name=ctx.os)
             if d.get("stop_command"):
                 body.append("stop_command: " + json.dumps(d["stop_command"], ensure_ascii=False))
-                words += [w for w in candidate_words(d["stop_command"]) if w not in words]
-            body.append(f"cwd: {cwd}")
+                sw, sm = bindable_words(d["stop_command"])
+                words += [w for w in sw if w not in words]
+                moved += [w for w in sm if w not in moved]
+            body.append(f"cwd: {cwd_text}")
             auto = [s for s in (d.get("secret_env") or []) if s not in (params.get("secret_env") or [])]
             if d.get("secret_env"):
                 body.append("secret_env: " + ", ".join(d["secret_env"])
@@ -1007,10 +1118,11 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                 body.append(f"wait: {json.dumps(params.get('wait'))}")
         else:
             argv = service.get("argv")
-            cwd = _resolve_cwd(ctx.policy, service.get("cwd"))
+            cwd_text, cwd = _review_cwd(ctx.policy, service.get("cwd"))
+            real_cwd = cwd
             if argv:
                 body.append("argv: " + json.dumps(argv, ensure_ascii=False))
-                words = candidate_words(argv)
+                words, moved = bindable_words(argv)
                 mt = _argv0_mtime(str(argv[0]), ctx.policy)
                 body.append(f"argv[0] modified: {mt or 'unknown'}")
             else:
@@ -1018,8 +1130,8 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(service.get("command") or "").split("\n"))
-                words = candidate_words(str(service.get("command") or ""), shell=shell, os_name=ctx.os)
-            body.append(f"cwd: {cwd}")
+                words, moved = bindable_words(str(service.get("command") or ""), shell=shell, os_name=ctx.os)
+            body.append(f"cwd: {cwd_text}")
             body.append(f"defined_by: {service.get('defined_by') or 'unknown'}")
             files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask)
     else:
@@ -1030,6 +1142,8 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             red = {k: "***" if secret_re.search(k) else v for k, v in params.items()}
         body.append(f"action: {action}")
         body.extend(_param_lines(red, skip=(), secret_re=secret_re, shows_env=False))
+    if moved and real_cwd is not None:
+        not_bound += moved_items(moved, lambda w: os.path.isfile(os.path.join(str(real_cwd), os.path.expanduser(w))))
     changes = _risky(env_keys)
     header: List[str] = []
     if changes:
@@ -1045,9 +1159,11 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                               "changes_what_runs": changes, "files": files}
     if note:
         review["note"] = note
+    if real_cwd is not None:
+        review["cwd"] = real_cwd     # v8.1: require() keeps it in the record and checks it again on consume
     return review
 
 
 __all__ = ["Preset", "PRESETS", "PresetCtx", "build", "expand_define", "approval_review", "describe",
-           "candidate_words", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
+           "candidate_words", "bindable_words", "changes_cwd", "moved_items", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
            "HUB_START_NOTE", "DEF_KEYS", "INTERNAL_KEYS", "BIND_HINT"]
