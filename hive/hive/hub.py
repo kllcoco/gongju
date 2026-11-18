@@ -437,6 +437,7 @@ class RelayLink(NodeLink):
         with self.lock:
             rec = ids.get(self.name)
             changed = False
+            key_ok = True
             note: Optional[dict] = None
             if rec.get("key_sha256") is None and kh is not None:
                 rec.update(key_sha256=kh, bound_at=iso_utc(), bound_seen_at=iso_utc(), pending_sha256=None,
@@ -458,7 +459,15 @@ class RelayLink(NodeLink):
                                                        "pod_id": pod_id})
                 self.identity_changed = True
                 changed = True
+                key_ok = False
                 note = {"event": "identity changed", "ip": ip, "hostname": hostname}
+            # Phase 2 review: the node_id is bound like the key (relay_ids.json "node_id"): only a register with the
+            # bound key may set or change it, and an id stored for another node is refused even while that node is
+            # offline (node_id resolution would otherwise route another node's calls to this pod)
+            new_nid, bad_nid = self._vet_node_id(body.get("node_id"), rec=rec, key_ok=key_ok)
+            if new_nid and key_ok and rec.get("node_id") != new_nid:
+                rec["node_id"] = new_nid
+                changed = True
             if changed:
                 ids.save()
             # supersede the old session (§7.1): delivered tasks fail, queued tasks are kept
@@ -471,8 +480,7 @@ class RelayLink(NodeLink):
             self.info = info
             acts = body.get("actions") if isinstance(body.get("actions"), list) else []
             self.actions_list = [a for a in acts if isinstance(a, str) and len(a) <= 64][:500]
-            nid = body.get("node_id")
-            self._node_id, bad_nid = self._vet_node_id(nid)
+            self._node_id = new_nid
             try:
                 self.max_parallel = max(1, min(256, int(body.get("max_parallel") or 8)))
             except (TypeError, ValueError):
@@ -493,10 +501,13 @@ class RelayLink(NodeLink):
         return {"session_id": sid, "node": self.name, "poll_wait": float(self.cfg.poll_wait),
                 "server_time": iso_utc(), "max_result_bytes": int(self.cfg.max_result_bytes)}
 
-    def _vet_node_id(self, nid: Any) -> Tuple[str, Optional[str]]:
+    def _vet_node_id(self, nid: Any, *, rec: Optional[dict] = None, key_ok: bool = True
+                     ) -> Tuple[str, Optional[str]]:
         """(node_id to store, refused value or None). The pod's node_id authenticates nothing (§7.1), so it is kept
-        only when well-formed and not equal (case-insensitively) to any configured node name, alias or another
-        link's node_id; otherwise a pod could take over routing for another node (WP5b review)."""
+        only when well-formed and not equal (case-insensitively) to any configured node name, alias, another
+        link's node_id or a node_id relay_ids.json binds to another node; otherwise a pod could take over routing
+        for another node (WP5b review). Phase 2 review: with ``rec`` (this node's relay_ids record) a register
+        without the bound key keeps only the bound node_id."""
         if nid is None or nid == "":
             return "", None
         if not isinstance(nid, str) or not NODE_ID_RE.match(nid):
@@ -505,6 +516,16 @@ class RelayLink(NodeLink):
         for l in list(self.hub.links.values()):
             if n == l.name.lower() or n in l.aliases or (l is not self and l.node_id and l.node_id.lower() == n):
                 return "", nid
+        ids = getattr(self.hub, "relay_ids", None)
+        if ids is not None:
+            for other, orec in ids.items():
+                bound = orec.get("node_id") if isinstance(orec, dict) else None
+                if other != self.name and isinstance(bound, str) and bound.lower() == n:
+                    return "", nid
+        if rec is not None and not key_ok:
+            bound = rec.get("node_id")
+            if not isinstance(bound, str) or bound.lower() != n:
+                return "", (nid if bound else None)
         return nid, None
 
     def poll(self, body: dict) -> dict:
@@ -866,10 +887,15 @@ class RelayIds:
                 if rec is None or rec.get("token_sha256") != e.token_sha256:
                     rec = {"key_sha256": None, "pending_sha256": None, "pending": None,
                            "token_sha256": e.token_sha256, "bound_at": None, "bound_seen_at": None}
-                for k in ("key_sha256", "pending_sha256", "pending", "bound_at", "bound_seen_at"):
+                for k in ("key_sha256", "pending_sha256", "pending", "bound_at", "bound_seen_at", "node_id"):
                     rec.setdefault(k, None)
                 self.nodes[e.name] = rec
             self.save()
+
+    def items(self) -> List[Tuple[str, dict]]:
+        """(name, record) pairs (a snapshot)."""
+        with self.lock:
+            return list(self.nodes.items())
 
     def get(self, name: str) -> dict:
         """The (mutable) record of a relay node."""

@@ -341,7 +341,7 @@ class TestApprovalReview(unittest.TestCase):
     def test_candidate_words(self):
         self.assertEqual(presets.candidate_words("python3 run.py --cfg=conf.yaml -v X=1"),
                          ["python3", "run.py", "conf.yaml", "X=1", "1"])
-        self.assertEqual(presets.candidate_words('& "C:\\a b.ps1" -x', shell="powershell"), ["&", "C:\\a", "b.ps1"])
+        self.assertEqual(presets.candidate_words('& "C:\\a b.ps1" -x', shell="powershell"), ["C:\\a", "b.ps1"])
         self.assertEqual(presets.candidate_words(["bash", "s.sh"]), ["bash", "s.sh"])
 
 

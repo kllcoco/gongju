@@ -54,12 +54,21 @@ CORS_HEADERS_RE = re.compile(r"^[A-Za-z0-9_, -]{0,1024}\Z")
 FORWARD_HEADERS = ("x-forwarded-for", "forwarded", "x-real-ip", "cf-connecting-ip")
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 ID_PARAM_PATTERNS = {
-    "id": r"^(ap|gr)_[A-Za-z0-9_-]{6,40}$",
-    "job_id": r"^j_[A-Za-z0-9_-]{6,40}$",
-    "service": r"^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,63}$",
-    "name": r"^[a-z0-9][a-z0-9_.-]{0,63}$",
-    "node": r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+    "id": r"^(ap|gr)_[A-Za-z0-9_-]{6,40}\Z",
+    "job_id": r"^j_[A-Za-z0-9_-]{6,40}\Z",
+    "service": r"^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,63}\Z",
+    "name": r"^[a-z0-9][a-z0-9_.-]{0,63}\Z",
+    "node": r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z",
 }
+
+
+def _wire_status(status: Any) -> int:
+    """A status the server may put on the wire: an int in 100..599, else 502."""
+    try:
+        st = int(status)
+    except (TypeError, ValueError):
+        return 502
+    return st if 100 <= st <= 599 else 502
 
 
 class Headers(dict):
@@ -622,7 +631,7 @@ class ApiServer:
                 raise _Reject(403, forbidden("browser origins not allowed"))
             for k, v in params.items():
                 pat = ID_PARAM_PATTERNS.get(k)
-                if pat and not re.match(pat, v):
+                if pat and not re.fullmatch(pat, v):
                     raise _Reject(400, bad_request(f"invalid {k} {v[:80]!r}"))
             # CORS preflight
             if method == "OPTIONS" and route.cors and route.auth == "none":
@@ -925,6 +934,12 @@ class ApiServer:
 
     def _write(self, conn: "_Conn", status: int, headers: Dict[str, str], body: bytes, *, close: bool,
                default_ct: bool = True) -> None:
+        status = _wire_status(status)
+        bodyless = status < 200 or status in (204, 304)
+        if bodyless and body:
+            # Phase 2 review: these statuses carry no body; a body written after them would be parsed by the
+            # client as the next reply on a keep-alive connection
+            body, close = b"", True
         reason = http.server.BaseHTTPRequestHandler.responses.get(status, ("OK",))[0]
         lines = [f"HTTP/1.1 {status} {reason}"]
         hdrs = self._base_headers()
@@ -934,13 +949,19 @@ class ApiServer:
             if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
                 continue
             hdrs.append((k, v))
-        hdrs.append(("Content-Length", str(len(body))))
+        if bodyless:
+            hdrs = [(k, v) for k, v in hdrs if k.lower() not in ("content-length", "transfer-encoding")]
+        else:
+            hdrs.append(("Content-Length", str(len(body))))
         hdrs.append(("Connection", "close" if close else "keep-alive"))
         lines += [f"{k}: {v}" for k, v in hdrs]
         conn.send(("\r\n".join(lines) + "\r\n\r\n").encode("latin-1", "replace") + body)
 
     def _write_stream(self, conn: "_Conn", status: int, headers: Dict[str, str], chunks: Iterable[bytes],
                       cancel: threading.Event) -> None:
+        status = _wire_status(status)
+        if status < 200 or status in (204, 304):
+            status = 502
         reason = http.server.BaseHTTPRequestHandler.responses.get(status, ("OK",))[0]
         hdrs = self._base_headers() + [(k, v) for k, v in headers.items() if "\n" not in k + v and "\r" not in k + v]
         hdrs.append(("Connection", "close"))

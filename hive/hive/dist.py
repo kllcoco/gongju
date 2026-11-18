@@ -300,6 +300,15 @@ def _reachable_host(host: Optional[str]) -> Optional[str]:
     return h
 
 
+def _plaintext_host_ok(host: str) -> bool:
+    """§5.9 rule C1 (``transport.plaintext_ok``) for a printed http:// hub address."""
+    try:
+        from .transport import plaintext_ok, resolve_host
+        return bool(plaintext_ok(host, resolve_host(host, 80, timeout=3.0)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def add_node_instructions(hub_cfg: Any, name: str, token: str, *, via: Optional[str] = None,
                           tailnet_ip: Optional[str] = None, pyz_sha256_hex: Optional[str] = None,
                           tls_pin: Optional[str] = None, host: Optional[str] = None) -> Dict[str, Any]:
@@ -349,6 +358,13 @@ def add_node_instructions(hub_cfg: Any, name: str, token: str, *, via: Optional[
                                        + (" (public_url is set)" if public else " with public_url set"))
             raise bad_request(f"the hub listens on {listen.host}, which another machine cannot reach",
                               hint="give the hub's LAN/tailnet address, or set public_url")
+        if not _plaintext_host_ok(plain_host):
+            # Phase 2 review: a node refuses a plaintext relay to a public address (§5.9, relay.check_hub_url), and
+            # a pod bootstrap would fetch code over it: never print an http:// join code for such a host
+            raise bad_request(f"refusing a plaintext (http://) join code for {plain_host}, which is not a "
+                              "loopback/LAN/tailnet address",
+                              hint="serve the hub over TLS (listen.tls or public_url with Funnel/Caddy) and use "
+                                   "--via public, or give the hub's LAN/tailnet address")
     tls_host: Optional[str] = None
     if "B" in variants and not public:
         tls_host = _reachable_host(host) or _reachable_host(str(listen.host))

@@ -674,6 +674,9 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
     scanned = matched_files = 0
     truncated, reason = False, None
     mask = _edge_masker(ctx)
+    sec = getattr(ctx.rt, "secrets", None)
+    whole_mask = sec.mask if sec is not None and getattr(sec, "has_values", False) and callable(
+        getattr(sec, "mask", None)) else None
     if os.path.isfile(_lp(root)):
         files: Iterable[Any] = [root]
     else:
@@ -706,6 +709,10 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
         if binary:
             continue
         text = fsops.decode_bytes(data, enc)[0]
+        if whole_mask is not None:
+            # Phase 2 review: match against the masked text, so the match predicate is no oracle over secret
+            # bytes (§5.1: a secret value never shows in a result, not even one bit of it at a time)
+            text = whole_mask(text)
         lines = [fsops._strip_eol(x) for x in fsops.split_lines(text)]
         hit_here = False
         for i, line in enumerate(lines):

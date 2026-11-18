@@ -744,6 +744,10 @@ def _windows_shell(shell: Optional[str], os_name: Optional[str]) -> bool:
     return shell in (None, "", "auto") and os_name == "windows"
 
 
+_SHELL_OPS = frozenset("();<>|&")
+_META_SPLIT = re.compile(r"[;|&<>()]+")
+
+
 def candidate_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
                     os_name: Optional[str] = None) -> List[str]:
     """Words a command names (§5.6 file binding): argv elements, or the command split (shlex for POSIX shells,
@@ -754,12 +758,16 @@ def candidate_words(argv_or_command: Union[List[str], str], *, shell: Optional[s
     else:
         text = str(argv_or_command)
         if _windows_shell(shell, os_name):
-            words = [w.strip("\"'") for w in text.split()]
+            words = [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
         else:
             try:
-                words = shlex.split(text, posix=True)
+                # Phase 2 review: shell operators split words even without spaces ("bash run.sh;true",
+                # "run.sh|bash", "<in.sh"), so a script next to a metacharacter is still bound (§5.6)
+                lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+                lex.whitespace_split = True
+                words = [w for w in lex if not (w and all(c in _SHELL_OPS for c in w))]
             except ValueError:
-                words = [w.strip("\"'") for w in text.split()]
+                words = [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
     out: List[str] = []
     for w in words:
         if not w:

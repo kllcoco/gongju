@@ -67,6 +67,20 @@ class GatewayBackend(Protocol):
 # ---------------------------------------------------------------------------------------------------------------
 # helpers
 
+def upstream_status(value: Any) -> Optional[int]:
+    """An upstream (node or pod) status the gateway may pass on: an int in 200..599 other than 204 and 304 (those
+    and 1xx carry no body, so a body written after them would be read as the next reply); else None."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        st = value
+    elif isinstance(value, str) and value.strip().isdigit() and len(value.strip()) <= 3:
+        st = int(value)
+    else:
+        return None
+    if 200 <= st <= 599 and st not in (204, 304):
+        return st
+    return None
+
+
 def _openai_error(status: int, message: str, typ: str, code: str) -> GatewayResponse:
     body = json.dumps({"error": {"message": message, "type": typ, "code": code}}).encode("utf-8")
     return GatewayResponse(status=status, headers={"Content-Type": "application/json"}, body=body, chunks=None)
@@ -385,6 +399,10 @@ class NodeGatewayBackend(GatewayBackend):
         status, rh, chunks = netutil.open_stream(method, url, guard=eff, purpose="model", headers=headers,
                                                  body=body if method == "POST" else None, connect_timeout=10,
                                                  idle_timeout=float(cfg.idle_timeout), auth=auth)
+        if upstream_status(status) is None:
+            _close(chunks)
+            return _openai_error(502, f"the upstream model server answered HTTP {status}", "upstream_error",
+                                 "upstream_error")
         ctype = ""
         for k, v in rh.items():
             if k.lower() == "content-type":
@@ -580,10 +598,12 @@ class HubGatewayBackend(GatewayBackend):
         if r.get("truncated"):
             return _openai_error(502, "reply larger than the relay limit; lower max_tokens or use a direct link",
                                  "upstream_error", "relay_truncated")
-        try:
-            status = int(r.get("status") or 502)
-        except (TypeError, ValueError):
-            status = 502
+        status = upstream_status(r.get("status"))
+        if status is None:
+            # Phase 2 review: the pod chooses this value; a 1xx/204/304 or out-of-range status would make the hub
+            # write a body clients do not read (response splitting on keep-alive connections)
+            return _openai_error(502, "the upstream model server sent an invalid HTTP status", "upstream_error",
+                                 "upstream_error")
         text = r.get("body") if isinstance(r.get("body"), str) else ""
         data = text.encode("utf-8")
         ctype = r.get("content_type") if isinstance(r.get("content_type"), str) else "application/json"
