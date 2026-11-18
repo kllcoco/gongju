@@ -357,5 +357,77 @@ class TestBtimeFifo(unittest.TestCase):
             self.assertEqual(u._btime_dirs()[0], str(self.private))
 
 
+class TestListingCaps(unittest.TestCase):
+    """Finding 8: a hostile mirror cannot make the node hold an unbounded listing."""
+
+    def setUp(self):
+        from hive import hfhub
+        self.hf = hfhub
+        hfhub.clear_cache()
+        self.addCleanup(hfhub.clear_cache)
+        self.calls = []
+
+    def fake(self, pages):
+        import json as _json
+        from types import SimpleNamespace
+        sha = "a" * 40
+
+        def req(url, guard, auth, end):
+            self.calls.append(url)
+            if "/revision/" in url:
+                body = {"sha": sha}
+                headers = {}
+            else:
+                i = int(url.rsplit("page=", 1)[1]) if "page=" in url else 0
+                body = pages[i]
+                headers = {"Link": f'<https://hf.test/next?page={i + 1}>; rel="next"'} if i + 1 < len(pages) else {}
+            return SimpleNamespace(status=200, body=_json.dumps(body).encode(), headers=headers, truncated=False)
+        return req
+
+    def entries(self, n, start=0):
+        return [{"type": "file", "path": f"f{i}.bin", "size": 1, "oid": "b" * 40} for i in range(start, start + n)]
+
+    def list(self, source="huggingface"):
+        return self.hf.list_repo(source, "https://hf.test", "org/repo", "model", "main", guard=None, auth=None,
+                                 deadline=time.monotonic() + 30)
+
+    def test_entry_cap_across_pages(self):
+        pages = [self.entries(600), self.entries(600, 600)]
+        with mock.patch.object(self.hf, "MAX_ENTRIES", 1000), mock.patch.object(self.hf, "_request", self.fake(pages)):
+            with self.assertRaises(HiveError) as cm:
+                self.list()
+        self.assertEqual(cm.exception.code, "too_large")
+        self.assertIn("net.download", cm.exception.hint)
+        self.assertEqual(cm.exception.details.get("max_entries"), 1000)
+
+    def test_modelscope_entry_cap(self):
+        import json as _json
+        from types import SimpleNamespace
+        body = {"Code": 200, "Data": {"Files": [{"Type": "blob", "Path": f"f{i}", "Size": 1} for i in range(50)]}}
+
+        def req(url, guard, auth, end):
+            return SimpleNamespace(status=200, body=_json.dumps(body).encode(), headers={}, truncated=False)
+        with mock.patch.object(self.hf, "MAX_ENTRIES", 40), mock.patch.object(self.hf, "_request", req):
+            with self.assertRaises(HiveError) as cm:
+                self.list("modelscope")
+        self.assertEqual(cm.exception.code, "too_large")
+
+    def test_only_small_listings_are_cached(self):
+        with mock.patch.object(self.hf, "CACHE_MAX_ENTRIES", 20), \
+                mock.patch.object(self.hf, "_request", self.fake([self.entries(30)])):
+            self.assertEqual(len(self.list()[1]), 30)
+            n = len(self.calls)
+            self.list()
+            self.assertEqual(len(self.calls), 2 * n)          # listed again: too big to cache
+        self.hf.clear_cache()
+        self.calls.clear()
+        with mock.patch.object(self.hf, "CACHE_MAX_ENTRIES", 20), \
+                mock.patch.object(self.hf, "_request", self.fake([self.entries(10)])):
+            self.list()
+            n = len(self.calls)
+            self.list()
+            self.assertEqual(len(self.calls), n)              # cached
+
+
 if __name__ == "__main__":
     unittest.main()

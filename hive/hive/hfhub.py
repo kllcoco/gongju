@@ -39,6 +39,10 @@ LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="?next"?', re.IGNORECASE)
 CACHE_TTL = 600.0
 MAX_PAGES = 20
 MAX_PAGE_BYTES = 16 << 20
+MAX_ENTRIES = 200_000                  # audit round 4: listing entries in all (a hostile mirror cannot exhaust memory)
+CACHE_MAX_ENTRIES = 20_000             # only listings up to this many files are cached (64 of them at most)
+TOO_MANY_HINT = ("the repository lists too many files to pull with model.pull (include/exclude only filter the "
+                 "listing); download the files you need with net.download, or ask the owner")
 REQUEST_TIMEOUT = 60.0
 LIST_BUDGET = 600.0
 NOT_FOUND_HINT = "check the repo id/revision; private repos need a token"
@@ -210,6 +214,11 @@ def _request(url: str, guard: Any, auth: Optional["AuthSpec"], end: float) -> "n
                                    max_bytes=MAX_PAGE_BYTES, follow_redirects=True, auth=auth)
 
 
+def _too_many(repo: str) -> HiveError:
+    return too_large(f"the file listing of {repo} has more than {MAX_ENTRIES} entries", hint=TOO_MANY_HINT,
+                     max_entries=MAX_ENTRIES)
+
+
 def _hf_list(endpoint: str, repo: str, repo_type: str, revision: str, guard: Any, auth: Optional["AuthSpec"],
              end: float) -> Tuple[str, List[RepoFile]]:
     kind = "datasets" if repo_type == "dataset" else "models"
@@ -224,7 +233,7 @@ def _hf_list(endpoint: str, repo: str, repo_type: str, revision: str, guard: Any
                           body=_snippet(r))
     url: Optional[str] = f"{base}/tree/{sha}?recursive=true"
     files: List[RepoFile] = []
-    pages = 0
+    pages = seen = 0
     while url:
         pages += 1
         if pages > MAX_PAGES:
@@ -236,6 +245,9 @@ def _hf_list(endpoint: str, repo: str, repo_type: str, revision: str, guard: Any
         page = _json(r, "file listing")
         if not isinstance(page, list):
             raise unavailable("the file listing is not a list", reason="upstream", maybe_executed=False)
+        seen += len(page)
+        if seen > MAX_ENTRIES:
+            raise _too_many(repo)
         for e in page:
             if not isinstance(e, dict) or e.get("type") != "file":
                 continue
@@ -292,6 +304,8 @@ def _ms_list(endpoint: str, repo: str, revision: str, guard: Any, auth: Optional
     entries = d.get("Files")
     if not isinstance(entries, list):
         raise unavailable("the ModelScope file listing has no Files", reason="upstream", maybe_executed=False)
+    if len(entries) > MAX_ENTRIES:
+        raise _too_many(repo)
     files: List[RepoFile] = []
     newest: Tuple[float, str] = (-1.0, "")
     for e in entries:
@@ -323,10 +337,11 @@ def _worker(key: Tuple[Any, ...], listing: _Listing, source: str, endpoint: str,
         else:
             res = _hf_list(endpoint, repo, repo_type, revision, guard, auth, end)
         listing.result = res
-        with _lock:
-            if len(_cache) > 64:
-                _cache.clear()
-            _cache[key] = (time.monotonic(), res[0], res[1])
+        if len(res[1]) <= CACHE_MAX_ENTRIES:
+            with _lock:
+                if len(_cache) > 64:
+                    _cache.clear()
+                _cache[key] = (time.monotonic(), res[0], res[1])
     except BaseException as e:  # noqa: BLE001 - handed to every waiter
         listing.error = e
     finally:
@@ -337,7 +352,8 @@ def _worker(key: Tuple[Any, ...], listing: _Listing, source: str, endpoint: str,
 
 def list_repo(source: str, endpoint: str, repo: str, repo_type: str, revision: str, *, guard: "NetGuard",
               auth: Optional["AuthSpec"], deadline: float) -> Tuple[str, List[RepoFile]]:
-    """(commit, files) of a repo snapshot; results cached 10 min per (endpoint, repo, repo_type, revision). A listing
+    """(commit, files) of a repo snapshot; results cached 10 min per (endpoint, repo, repo_type, revision) when they
+    hold at most CACHE_MAX_ENTRIES files; more than MAX_ENTRIES listing entries raise ``too_large``. A listing
     still running at ``deadline`` (monotonic) raises ``timeout`` but goes on in the background, so the next call
     with the same arguments returns quickly from the cache."""
     if source not in SOURCES:
