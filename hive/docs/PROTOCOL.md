@@ -20,7 +20,8 @@ DESIGN.md §6–§7 and §8.7 (v8), kept in sync with it; DESIGN.md is authorita
   `Retry-After: 2`. Both close the connection.
 - POST needs `Content-Length` (chunked → 411) and `Content-Type: application/json` (→ 415). Body limit 48 MiB
   (`listen.max_body_bytes`), gateway routes `gateway.max_body_bytes` (8 MiB) → 413. JSON nested deeper than 64 →
-  400.
+  400. More than 262 144 arrays/objects outside strings (relay results: 1 048 576) → 413 `too_large`, refused
+  before parsing (`/mcp`: HTTP 413 with a JSON-RPC invalid-request error).
 - `Origin` not in `allowed_origins` → 403 (except `/openai/*` with `gateway.cors`). Unexpected `Host` → 421.
 - Optional request header `X-Hive-Api: 1`; another value → 400 "api mismatch". Every response carries
   `X-Hive-Api: 1`, `X-Request-Id`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`.
@@ -154,10 +155,11 @@ The hub holds the request up to `poll_wait` until a task, a cancel or a refresh 
 
 ### 5.3 Result — `POST /v1/relay/result`
 `{"session_id","task_id","envelope":{…}}` → `{"accepted":true|false}` (false for unknown, superseded, finished or
-expired tasks). Body ≤ `max_result_bytes` + 64 KiB; larger envelopes are replaced by the node with `too_large`. The
-node retries at 1, 3, 9 s on network errors. Headers `X-Hive-Task` / `X-Hive-Session` (sent by current nodes) name the
-task: the hub answers `{"accepted":false}` without reading the body when it does not expect that result, and with
-the headers present the body's `task_id` / `session_id` must equal them (400 otherwise).
+expired tasks). Body ≤ `max_result_bytes` + 64 KiB and ≤ 1 048 576 arrays/objects (else 413); larger envelopes are
+replaced by the node with `too_large`. The node retries at 1, 3, 9 s on network errors. Headers `X-Hive-Task` /
+`X-Hive-Session` (sent by current nodes) name the task: the hub answers `{"accepted":false}` without reading the body
+when it does not expect that result, and with the headers present the body's `task_id` / `session_id` must equal them
+(400 otherwise).
 
 ### 5.4 Hub-side outcomes (§7.4)
 

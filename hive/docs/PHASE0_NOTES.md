@@ -2131,3 +2131,66 @@ A4-sweep. **Other regexes on attacker-controlled text** (every module-level patt
     matching / kill at deadline with a responsive parent / cancel, fs.search never matching in-process (patched
     `re.compile`) and killing a bypassed `A*A*A*A*c`, `ready_pattern` via the worker, btime FIFOs and private dirs,
     listing caps and cache limit, the swept regexes on 1 MB.
+
+Verification of round 4 (live re-run of every attack on loopback: hub, node as another user, relay pod, a Python 3.9
+node, attacker `nobody`; all earlier items held). New findings fixed here: changes in `fsops.py`, `actions/files.py`,
+`audit.py`, `httpserver.py`, `mcp.py`, `gateway.py`, `hub.py` (relay result parse cap only), `hfhub.py`, `policy.py`
+(dead regex removed); tests `tests/test_verify4_dos.py`, `TestEditDoSVerification4` in `tests/test_fsops.py`,
+`TestBoundedRecordsVerification4` in `tests/test_audit.py` (+ a racy budget assertion in `tests/test_audit4_dos.py`
+now waits for the server thread); DESIGN §6.1 (backlog, JSON), §9.7 (fs.edit, fs.search, check_regex); PROTOCOL §1,
+§5.3; SECURITY Audit / Agent regexes rows and the body limit. Timings: this container, CPython 3.13 / 3.9.
+
+V4-1. **fs.edit `closest` was cubic (BLOCKER):** `closest_window` ran difflib `ratio()` (autojunk off) per window, no
+    deadline: 400 / 800 `old_text` lines 4.6 / 14.9 s per call, a 1 MB `old_text` burned a node thread for 26+ min.
+    Now bounded: the first 200 lines / 8 KiB of `old_text`; windows ranked by how many of their whitespace-stripped
+    lines occur in `old_text` (prefix sums over the file, linear), ties broken by a character-count similarity
+    (`quick_ratio` from two `Counter`s) within a 4 Mi-char budget; the call deadline is checked between the steps and
+    every 64 windows → `details.closest: null`. A long `old_text` whose first/last 16 chars do not occur is not
+    searched at all. After: 16 KB file / 1.6 KB `old_text` 0.08 s (3.9: 0.15 s), 1 MB `old_text` 0.12 s, a 4 MB file
+    with 1 MB `old_text` 0.35 s, 16 MB of code with a typo'd function 0.6 s. Lines are now split at C speed
+    (`re.split`), also for the success snippet, which splits only the edited region (`snippet(offset=)`).
+V4-2. **Python 3.9 `str.find` is O(n·m) (BLOCKER on 3.9):** `'A'*k+'B'+'A'*k` needles held the GIL for 6–30 s
+    (fs.edit) and 1.6 s per file (fs.search literal, 500-char needle). `fsops.LiteralSearch`: on Python < 3.10 a
+    needle of ≥ 32 chars is searched with a pure-literal pattern compiled by `sre_compile` directly (not through the
+    `re` cache, which would keep 512 large needles); sre turns it into a literal prefix with a KMP overlap table, so
+    find / count / finditer / sub are linear (verified: 1 MB needle in 16 MB, 0.03 s search; compiling costs ~1 µs
+    per needle char in pure Python, which releases the GIL). 3.10+ keep the str methods (two-way search). After
+    (3.9): 2 MB file / 100 KB `old_text` 0.14 s found, 0.13 s not found; fs.search literal 500-char needle on a
+    16 MiB line 0.02 s.
+V4-3. **Match line numbers were matches × file size (MAJOR):** `_line_of` counted from offset 0 for every match (300 k
+    matches: 30 s). `apply_edit_at` counts newlines incrementally for the first 100 matches only (conflict
+    `details.lines` and the replace_all result list hold ≤ 100 lines) and the total with `count`. 16 MB file of
+    `a\n`, `old_text` `a`: conflict 0.03 s, replace_all 0.04 s (+ snippet 0.003 s).
+V4-4. **Audit records copied params containers whole (MAJOR):** a 48 MiB body of empty lists wrote a 50 MB line.
+    `AuditLog.record` now redacts with a budget (`redact_params(..., bounded=True)`): ≤ 32 items/keys per container
+    (argv 128), ≤ 2000 values, depth ≤ 24, the rest summarized (`"…[+N items]"`, `{"…": "[N keys]"}`); body keys
+    holding containers of more than 10 000 values get `{"items": N, "sha256": null}` instead of a canonical-JSON
+    hash; a record over 64 KiB has its `params` (then `extra`) replaced by `{"…": "[record cut: N bytes]", "keys"}`,
+    else only ts/id/kind/action/ok/code remain. A 16M-element params list: 0.2 ms, a 368-byte record. Unbounded
+    `redact_params` (approval review display, node fallback) is unchanged.
+V4-5 / V4-6. **JSON parse amplification and GIL-holding pre-scan (MAJOR):** `json.loads` of 48 MiB `[],` allocates
+    ~1.1 GB (hub peak 13.2 GB from 40 bodies), and the depth scan's whole-body `re.sub` / `translate` held the GIL
+    1.3–1.8 s on `"[`-style bodies. `httpserver._json_bracket_seq` now builds the outside-string bracket sequence in
+    1 MiB slices (string state and a trailing lone backslash carried across; fuzzed against the reference loop with
+    3-byte slices) and stops once more than the container cap opened; `json_body_problem` / `check_json_body`:
+    `Request.json(max_containers=262144)` (`MAX_JSON_CONTAINERS`; relay results via `_relay_body` 1 048 576, the
+    legacy path without `X-Hive-Task` included), `/mcp`, and gateway bodies → 413 `too_large` before `json.loads`.
+    Brackets inside strings never count (a file's text in `content` passes). After, 48 MiB bodies: `[],` refused in
+    0.05 s, `"[` / `"[]` / `[]"` in 0.1–0.15 s with a longest GIL gap ≤ 0.06 s (was 1.3–1.8 s), plain string body
+    0.05 s. Residual: within the cap, numbers and short strings still expand a few times when parsed.
+V4-7. **Bounded quantifiers bypassed the regex rules (minor):** `{m,n}` with n − m > 16 (`LARGE_REPEAT_RANGE`) now
+    counts as unbounded in `_scan_regex` (unbounded count) and `_overlap_problem` (adjacent / chained overlap), and a
+    group quantified with an upper bound > 1 may not contain an unbounded quantifier (this also closes `(?:a+){10}c`,
+    which passed before: the group-repeat rule only looked at counts > 10). All six reported patterns are refused;
+    `\d{1,3}`, `(\d{1,3}\.){3}`, `[0-9a-f]{40}`, `x{0,1000}y`, `(?:ab){0,30}c` still pass. Regex-mode fs.search
+    stops after 120 s (`REGEX_SEARCH_MAX_S`, partial results, reason `timeout`).
+V4-8. **Listen backlog (minor):** `request_queue_size` = 4 × `max_connections`, between 64 and 1024
+    (`httpserver.listen_backlog`; node 256, hub 1024; the kernel still caps it at `net.core.somaxconn`).
+V4-9. **presets.bind_plan on 100 KB commands (minor):** not changed here (approval-binding area, owned by the
+    binding work in progress).
+V4-10. **Dead quadratic `policy._HIVE_CMD_RE` (minor):** removed; the test keeps it as the oracle for `_is_hive_cmd`
+    (4000 random lines, 0 differences).
+V4-11. **hfhub listing transient memory (minor):** each HF page (and the ModelScope reply) is pre-counted with
+    `json_body_problem` before `json.loads`: more than 4 arrays/objects per remaining entry (`CONTAINERS_PER_ENTRY`)
+    → `too_large` like the entry cap (16 MiB of `{}`: refused unparsed instead of +360 MiB); entries whose path is
+    longer than 4096 chars are skipped.
