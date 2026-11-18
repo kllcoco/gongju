@@ -1529,7 +1529,7 @@ def _entry_files(kind: str, name: str, roles: _Roles) -> None:
     ``name.js``/``name.node``."""
     if not name or name == "-" or "$" in name:
         return
-    if kind == "python":
+    if kind == "python" and not name.lower().endswith((".py", ".pyw", ".pyc", ".pyz", ".zip")):
         roles.extra(name.rstrip("/\\") + "/__main__.py")
     elif kind == "node" and not name.lower().endswith(_NODE_EXT):
         base = name.rstrip("/\\")

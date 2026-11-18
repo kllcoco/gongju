@@ -1833,7 +1833,7 @@ A2-1. **Script operands with plain names were not bound (HIGH):** `bind_files` s
     change the directory (`sudo -D`, `env -C`, `ruby -C`, `bun --cwd`, `wsl --cd`, `chroot`, `pwsh -wd`, `conda run
     --cwd`, `uv run --directory`) move every relative word; `pwsh -EncodedCommand` is a header item. Also: a `<`
     input redirect target is bound like an operand (`bash < run3`; heredoc delimiters and `<&3` are quiet); a
-    python operand also binds `name/__main__.py` and a node operand `name.js`, `name.node`, `name/index.js`,
+    python operand without a `.py`/`.pyz`/`.zip` suffix also binds `name/__main__.py` and a node operand `name.js`, `name.node`, `name/index.js`,
     `name/package.json` (quietly; a folder or extension-less name runs those); `env --`/`timeout --` keep reading
     assignments/positionals; PowerShell `Start-Process`/`saps` and cmd `start` are read like the command they start;
     `call :label` binds nothing. Quiet extras are
