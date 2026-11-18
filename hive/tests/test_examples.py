@@ -73,5 +73,68 @@ class TestExamples(unittest.TestCase):
             self.assertEqual(len(seen[0]["tools"]), 28)
 
 
+class TestStubOpenAI(unittest.TestCase):
+    """Final acceptance B1: examples/stub_openai.py (README 6.1) is a working OpenAI-compatible stub."""
+
+    def setUp(self):
+        self.port = helpers.free_port()
+        env = dict(os.environ)
+        for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+            env.pop(k, None)
+        self.proc = subprocess.Popen([sys.executable, str(EX / "stub_openai.py"), str(self.port), "--model", "m1"],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        self.addCleanup(self._stop)
+        line = self.proc.stdout.readline().decode()
+        self.assertIn(f"http://127.0.0.1:{self.port}/v1", line)
+
+    def _stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(10)
+        self.proc.stdout.close()
+
+    def _req(self, method, path, body=None):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            c.request(method, path, body=json.dumps(body) if body is not None else None,
+                      headers={"Content-Type": "application/json"})
+            r = c.getresponse()
+            return r.status, r.getheader("Content-Type"), r.read()
+        finally:
+            c.close()
+
+    def test_routes(self):
+        st, _ct, b = self._req("GET", "/health")
+        self.assertEqual((st, json.loads(b)), (200, {"status": "ok"}))
+        st, _ct, b = self._req("GET", "/v1/models")
+        self.assertEqual([m["id"] for m in json.loads(b)["data"]], ["m1"])
+        st, _ct, b = self._req("POST", "/v1/chat/completions",
+                               {"model": "m1", "messages": [{"role": "user", "content": "hi there"}]})
+        d = json.loads(b)
+        self.assertEqual((st, d["object"], d["choices"][0]["message"]["content"]),
+                         (200, "chat.completion", "stub reply: hi there"))
+        st, _ct, b = self._req("POST", "/v1/completions", {"prompt": "abc"})
+        self.assertEqual(json.loads(b)["choices"][0]["text"], "stub reply: abc")
+        self.assertEqual(self._req("GET", "/nope")[0], 404)
+        self.assertEqual(self._req("POST", "/v1/chat/completions", None)[0], 200)   # empty body = {}
+
+    def test_stream(self):
+        st, ct, b = self._req("POST", "/v1/chat/completions",
+                              {"messages": [{"role": "user", "content": "one two"}], "stream": True,
+                               "stream_options": {"include_usage": True}})
+        self.assertEqual((st, ct), (200, "text/event-stream"))
+        events = [ln[6:] for ln in b.decode().splitlines() if ln.startswith("data: ")]
+        self.assertEqual(events[-1], "[DONE]")
+        chunks = [json.loads(e) for e in events[:-1]]
+        text = "".join(c["choices"][0]["delta"].get("content", "") for c in chunks if c["choices"])
+        self.assertEqual(text, "stub reply: one two")
+        self.assertEqual(chunks[-1]["usage"]["completion_tokens"], 4)
+        self.assertEqual(chunks[-2]["choices"][0]["finish_reason"], "stop")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,8 @@ log = logging.getLogger("hive.hub")
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}\Z")
 PROBE_INTERVAL = 30.0           # DirectLink GET /v1/nodes
+FAST_PROBE_MAX = 5.0            # B5e: a direct node not reached yet is probed again after 2, 4, then every 5 s
+FAST_PROBE_WINDOW = 600.0       # ... during the hub's first 10 minutes
 ACTIONS_INTERVAL = 300.0        # DirectLink GET /v1/actions
 FRESH_S = 75.0                  # a direct row older than this is probed synchronously (§8.3 v5)
 PROBE_TIMEOUT = 5.0
@@ -133,6 +135,14 @@ def _os_label(info: dict) -> Optional[str]:
     return None
 
 
+def _auto_update_off(modes: dict) -> Optional[str]:
+    """``modes.auto_update_off`` of a node's info when well-formed (final acceptance B5g), else None."""
+    v = modes.get("auto_update_off")
+    if isinstance(v, str) and re.match(r"^(not_pod|deny_actions|off|role:[a-z]{1,16})\Z", v):
+        return v
+    return None
+
+
 def summary_from_info(name: str, mode: str, info: dict, status: Optional[dict], *, entry: Any) -> dict:
     """NodeSummary row (§9.10) from a relay node's register ``info`` (+ poll status); hub config is authoritative for
     name/mode/tags/description."""
@@ -156,8 +166,28 @@ def summary_from_info(name: str, mode: str, info: dict, status: Optional[dict], 
             "identity_changed": False, "outdated": bool(version) and version != __version__,
             "preset": policy.get("preset") if isinstance(policy.get("preset"), str) else None,
             "auto_update": bool(modes.get("auto_update")),
+            "auto_update_off": _auto_update_off(modes),
             "max_timeout": ex.get("max_timeout") if isinstance(ex.get("max_timeout"), (int, float)) else None,
             "status": status or {}}
+
+
+def _unknown_action(action: str, link: "NodeLink") -> HiveError:
+    """not_found for an action the hub's catalog lacks (final acceptance B5a): "upgrade the hub" only when the node
+    implements it (a newer node); otherwise a typo is likelier: the closest action names and ``hive actions``."""
+    name = action[:64]
+    known = sorted(set(catalog.SPECS) | set(link.actions()))
+    if action in link.actions():
+        ver = link.summary().get("version") or "?"
+        return not_found(f"unknown action {name!r}",
+                         hint=f"node '{link.name}' (hive {ver}) has {name!r} but the hub runs hive {__version__}, "
+                              "which does not know it; upgrade the hub")
+    sugg = difflib.get_close_matches(action, known, n=3, cutoff=0.6)
+    hint = ("did you mean " + " or ".join(f"'{x}'" for x in sugg) + "? " if sugg else "") + \
+        "list the actions: hive actions"
+    ver = link.summary().get("version")
+    if ver and ver != __version__:
+        hint += f" (the hub runs hive {__version__}, node '{link.name}' hive {ver})"
+    return HiveError("not_found", f"unknown action {name!r}", {"suggestions": sugg}, hint=hint)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -303,6 +333,7 @@ class RelayLink(NodeLink):
         self.poll_gen = 0
         self.refresh: Optional[str] = None
         self.identity_changed = False
+        self.gone: Optional[str] = None               # why the node unregistered (B5c); None after a register
 
     @property
     def node_id(self) -> str:
@@ -357,6 +388,13 @@ class RelayLink(NodeLink):
 
     def _offline_error(self) -> HiveError:
         last = iso_utc(self.last_seen_wall) if self.last_seen_wall else None
+        gone = getattr(self, "gone", None)
+        if gone:
+            hint = {"panic": "the node was stopped with hive node panic; on that machine: hive node resume",
+                    "paused": "the node turned its relay off (relay.disabled); on that machine: hive node resume"
+                    }.get(gone, "the node stopped; start it again on that machine (hive node run, or its service)")
+            return unavailable(f"node {self.name} is offline ({gone})", reason="offline", maybe_executed=False,
+                               last_seen=last, hint=hint)
         return unavailable(f"node {self.name} is offline", reason="offline", maybe_executed=False, last_seen=last,
                            hint="the relay node is not polling the hub; check the pod")
 
@@ -478,6 +516,7 @@ class RelayLink(NodeLink):
             self.cancels = []
             # audit round 3: 192 random bits (was "s_" + new_id(): a millisecond clock + 32 random bits)
             self.session_id = "s_" + _secrets.token_urlsafe(24)
+            self.gone = None
             self.info = info
             acts = body.get("actions") if isinstance(body.get("actions"), list) else []
             self.actions_list = [a for a in acts if isinstance(a, str) and len(a) <= 64][:500]
@@ -501,6 +540,32 @@ class RelayLink(NodeLink):
             self.hub._audit_event("relay" if note is None else "warning", self.name, extra)
         return {"session_id": sid, "node": self.name, "poll_wait": float(self.cfg.poll_wait),
                 "server_time": iso_utc(), "max_result_bytes": int(self.cfg.max_result_bytes)}
+
+    def unregister(self, body: dict) -> dict:
+        """Final acceptance B5c: the node says it is going offline (``hive node panic``, pause of the relay, a stop):
+        the session ends now, so the node shows offline at once and calls fail fast instead of timing out. Queued
+        calls fail (not executed); calls already delivered fail as maybe executed. An unknown or superseded session
+        is ignored (a newer instance may hold the node)."""
+        sid = body.get("session_id")
+        why = body.get("reason") if body.get("reason") in ("panic", "paused", "stop") else "stop"
+        with self.lock:
+            if not isinstance(sid, str) or not sid or self.session_id is None or \
+                    not hmac.compare_digest(sid.encode("utf-8", "replace"), self.session_id.encode("utf-8")):
+                return {"unregistered": False}
+            self.session_id = None
+            self.gone = why
+            self.last_seen_wall = time.time()
+            for t in list(self.queue):
+                self.queue.remove(t)
+                self._finish(t, self._offline_error())
+            for t in list(self.delivered.values()):
+                self._finish(t, unavailable(f"node {self.name} went offline ({why}) while running the call",
+                                            reason="offline", maybe_executed=t.mutating))
+            self.cancels = []
+            self.poll_gen += 1
+            self.cond.notify_all()
+        self.hub._audit_event("relay", self.name, {"event": "relay unregister", "reason": why})
+        return {"unregistered": True}
 
     def _vet_node_id(self, nid: Any, *, rec: Optional[dict] = None, key_ok: bool = True
                      ) -> Tuple[str, Optional[str]]:
@@ -822,6 +887,9 @@ class DirectLink(NodeLink):
         with self.lock:
             row = dict(self._row) if self._row else summary_from_info(self.name, "direct", {}, {}, entry=self.entry)
         row["online"] = self.online()
+        with self.lock:
+            # final acceptance B5e: before the first check ends the node is "checking", not offline
+            row["checking"] = self._probes_done == 0 and not row["online"]
         row["identity_changed"] = False
         row["outdated"] = bool(row.get("version")) and row.get("version") != __version__
         gs = row.get("gpus_summary")
@@ -1131,17 +1199,36 @@ class Hub:
                         log.warning("relay reaper failed for %s", link.name, exc_info=True)
 
     def _prober(self) -> None:
+        """Probe every direct node at start and every ``PROBE_INTERVAL``; final acceptance B5e: a node not reached
+        yet since the hub started (just added with add-node, or its ``hive node token add --kind hub`` not done
+        yet) is probed again after 2 and 4 s, then every 5 s during the hub's first 10 minutes, so it shows online
+        within seconds of accepting the hub token."""
         nxt = 0.0
+        fast: Dict[str, Tuple[float, float]] = {}      # name -> (next fast probe, its delay)
+        started = time.monotonic()
         while not self.stopping.is_set():
-            if time.monotonic() >= nxt:
-                for link in list(self.links.values()):
-                    if isinstance(link, DirectLink) and not self.stopping.is_set():
-                        try:
-                            link.probe()
-                        except HiveError as e:
-                            log.info("probe of %s failed: %s", link.name, e.message)
-                        except Exception:  # noqa: BLE001
-                            log.warning("probe of %s failed", link.name, exc_info=True)
+            now = time.monotonic()
+            due_all = now >= nxt
+            for link in list(self.links.values()):
+                if not isinstance(link, DirectLink) or self.stopping.is_set():
+                    continue
+                f = fast.get(link.name)
+                if not due_all and (f is None or now < f[0]):
+                    continue
+                try:
+                    link.probe()
+                    fast.pop(link.name, None)
+                except HiveError as e:
+                    log.info("probe of %s failed: %s", link.name, e.message)
+                    reached = link._row_ok_at is not None
+                    delay = 2.0 if f is None else min(FAST_PROBE_MAX, f[1] * 2)
+                    if not reached and now - started < FAST_PROBE_WINDOW:
+                        fast[link.name] = (time.monotonic() + delay, delay)
+                    else:
+                        fast.pop(link.name, None)
+                except Exception:  # noqa: BLE001
+                    log.warning("probe of %s failed", link.name, exc_info=True)
+            if due_all:
                 nxt = time.monotonic() + PROBE_INTERVAL
             self.stopping.wait(1.0)
 
@@ -1382,9 +1469,7 @@ class Hub:
                 except HiveError as e:
                     if (e.details or {}).get("removed"):
                         raise
-                raise not_found(f"unknown action {action[:64]!r}",
-                                hint=f"the hub runs hive {__version__} which does not know {action[:64]!r}; "
-                                     "upgrade the hub")
+                raise _unknown_action(action, link)
             if spec.scope == "hub":
                 raise bad_request(f"{action} is a hub action", hint="call it without node")
             if action not in link.actions():
@@ -1967,6 +2052,10 @@ def build_server(hub: Hub) -> "ApiServer":
                                                             "ip": req.client_ip})
             raise
 
+    def relay_unregister(req: "Request") -> dict:
+        link, body = _relay_body(req)
+        return link.unregister(body)
+
     def relay_result_pre(headers: Any, ident: Any, length: int) -> Optional[dict]:
         # audit round 4 (finding 6): X-Hive-Task / X-Hive-Session name the task before the body is read; a result
         # for a task this relay node does not owe (unknown, finished, other session) is refused unread
@@ -2029,6 +2118,7 @@ def build_server(hub: Hub) -> "ApiServer":
     server.route("POST", "/v1/hub/nodes/{name}/ack", node_ack, auth="owner")
     server.route("POST", "/v1/relay/register", relay_register, auth="relay", max_body=(2 << 20) + 65536)
     server.route("POST", "/v1/relay/poll", relay_poll, auth="relay")
+    server.route("POST", "/v1/relay/unregister", relay_unregister, auth="relay")
     server.route("POST", "/v1/relay/result", relay_result, auth="relay",
                  max_body=int(cfg.relay.max_result_bytes) + 65536, pre_body=relay_result_pre)
     server.route("GET", "/v1/dist/hive.pyz", dist_pyz, auth="none", mode="raw")

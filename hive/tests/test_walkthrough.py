@@ -353,7 +353,8 @@ class TestInitClientToken(CliCase):
         self.assertIn("0600", out)
 
     def test_add_agent_prints_the_one_line_command(self):
-        self.assertEqual(run(["init", "hub", "--yes", "--name", "home"])[0], 0)
+        # the default port on purpose (only printed; nothing connects to it)
+        self.assertEqual(run(["init", "hub", "--yes", "--name", "home", "--listen", "127.0.0.1:7700"])[0], 0)
         code, out, err = run(["hub", "add-agent", "claude-desktop"])
         self.assertEqual(code, 0, err)
         self.assertIn("hive init client --name home --url http://127.0.0.1:7700 --token - --default", out)

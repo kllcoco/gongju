@@ -21,6 +21,22 @@ if TYPE_CHECKING:  # pragma: no cover
     from ..auth import Identity
 
 
+def auto_update_off(relay: Any) -> Optional[str]:
+    """Why ``relay.auto_update`` is off (final acceptance B5g; shown by ``hive hub restart-node --outdated``):
+    ``role:<role>`` (a narrowed relay role), ``deny_actions``, ``not_pod`` (not run by the watchdog loop of a cloud
+    pod) or ``off`` (turned off in the config); None when it is on or the node has no relay."""
+    if relay is None or not getattr(relay, "enabled", False) or getattr(relay, "auto_update", False):
+        return None
+    role = getattr(relay, "role", None) or "operator"
+    if role != "operator":
+        return f"role:{role}"
+    if getattr(relay, "deny_actions", None):
+        return "deny_actions"
+    if os.environ.get("HIVE_WATCHDOG") != "1":
+        return "not_pod"
+    return "off"
+
+
 def _try(fn: Any, default: Any) -> Any:
     try:
         return fn()
@@ -151,7 +167,8 @@ def node_info_result(rt: Any, identity: "Identity", policy: Any) -> dict:
         "modes": {"listen": listen_txt,
                   "relay": (relay.hub_url if relay is not None and relay.enabled else None),
                   "gateway": bool(getattr(getattr(cfg, "gateway", None), "enabled", False)),
-                  "auto_update": bool(getattr(relay, "auto_update", False))},
+                  "auto_update": bool(getattr(relay, "auto_update", False)),
+                  "auto_update_off": auto_update_off(relay)},
         "tags": list(getattr(cfg, "tags", []) or []), "description": getattr(cfg, "description", "") or "",
         "started_at": iso_utc(started) if started else iso_utc(),
         "time": iso_utc(), "paused": bool(_try(rt.is_paused, False)) if hasattr(rt, "is_paused") else False,

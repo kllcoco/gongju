@@ -203,9 +203,13 @@ class RelayAgent:
         self._thread = threading.Thread(target=self._loop, name="relay-poll", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop polling; running tasks get their cancel events and the executor is shut down (no wait)."""
+    def stop(self, *, goodbye: bool = False) -> None:
+        """Stop polling; running tasks get their cancel events and the executor is shut down (no wait).
+        ``goodbye``: tell the hub first that this node goes offline (a real stop, not a restart; final acceptance
+        B5c), so it shows offline at once instead of after ``offline_after``."""
         self._stop.set()
+        if goodbye:
+            self._unregister("stop")
         with self._lock:
             evs = list(self._running.values())
         for ev in evs:
@@ -240,9 +244,39 @@ class RelayAgent:
         base = min(BACKOFF_MAX, 2.0 ** max(0, self.failures - 1))
         return base * random.uniform(0.8, 1.2)
 
+    def _unregister(self, reason: str) -> None:
+        """Best effort ``POST /v1/relay/unregister`` for the current session (an older hub answers 404: ignored)."""
+        sid = self.session_id
+        if not sid:
+            return
+        try:
+            self.transport.request("POST", "/v1/relay/unregister",
+                                   {"node": self.rt.name, "session_id": sid, "reason": reason}, timeout=5.0)
+            log.info("relay: told %s that this node goes offline (%s)", self.hub_url, reason)
+        except HiveError as e:
+            log.info("relay: unregister not sent (%s)", e.message)
+        except Exception:  # noqa: BLE001 - never block a stop or panic
+            log.info("relay: unregister not sent", exc_info=True)
+
+    def _disabled_reason(self) -> str:
+        """"panic" when ``hive node panic`` wrote relay.disabled, else "paused"."""
+        try:
+            d = json.loads((Path(self.rt.data_dir) / "relay.disabled").read_text(encoding="utf-8") or "{}")
+        except (OSError, ValueError):
+            d = {}
+        return "panic" if isinstance(d, dict) and d.get("by") == "panic" else "paused"
+
+    def check_disabled(self) -> None:
+        """relay.disabled appeared (``hive node panic``): say goodbye to the hub now, not when the held poll ends
+        (called by the poll loop and by the node's 1 s PAUSED watcher)."""
+        if self.session_id is not None and self._disabled():
+            self._unregister(self._disabled_reason())
+            self.session_id = None
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             if self._disabled():
+                self.check_disabled()
                 self.session_id = None
                 self._sleep(1.0)
                 continue

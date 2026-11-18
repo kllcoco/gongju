@@ -727,11 +727,11 @@ class _Doctor:
                     continue
                 if node_preset == "cautious" and not t.require_approval:
                     self.add("policy", "warn", f"agent token '{t.name}' runs commands on this cautious node without "
-                                               "approvals", f"hive node token add {t.name} --cautious (re-create it)")
+                                               "approvals", f"hive node token set {t.name} --cautious")
                 elif self.hub_cfg is not None and not t.require_approval:
                     self.add("policy", "warn", f"agent token '{t.name}' can run commands on the hub's machine without "
                                                "approvals: an exec-capable agent on the hub machine can act as the "
-                                               "hub (T5)", "use --cautious tokens for agents on this machine")
+                                               "hub (T5)", f"hive node token set {t.name} --cautious")
         if self.hub_cfg is not None:
             local = self._hub_local_nodes()
             for t in self.hub_cfg.tokens:
@@ -742,12 +742,14 @@ class _Doctor:
                     self.add("policy", "warn", f"hub agent token '{t.name}' reaches {', '.join(hits)} on the hub's "
                                                "machine without approvals: an exec-capable agent on the hub machine "
                                                "can act as the hub (T5)",
-                             f"hive hub add-agent {t.name} --cautious (re-create it), or narrow its nodes")
+                             f"hive hub set-agent {t.name} --cautious, or narrow its nodes")
         if _is_wsl() and os.path.isdir("/mnt/c"):
             hubs = _windows_hub_configs()
             if hubs:
                 self.add("policy", "warn", f"agents on this WSL node can read the Windows hub's tokens ({hubs[0]}) "
-                                           "(T25)", "use --cautious hub tokens or set [automount] enabled=false")
+                                           "(T25)",
+                         "make the hub's agent tokens cautious (on the hub: hive hub set-agent NAME --cautious) or "
+                         "set [automount] enabled=false in /etc/wsl.conf")
 
     def _skipped_service_code_dirs(self) -> List[str]:
         """Service code dirs (§5.4 step 7, read offline from ``state/services.json``) that the node drops because they

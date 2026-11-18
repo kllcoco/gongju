@@ -1297,17 +1297,35 @@ def _apply_relay(raw: dict, *, url: str, token: Optional[str], pin: Optional[str
     rel["auto_update"] = bool(pod and role == "operator" and not rel.get("deny_actions"))
 
 
+def _set_auto_update(raw: dict, on: bool) -> None:
+    """relay.auto_update = ``on``; turning it on needs a relay with role operator and no deny_actions (B5g)."""
+    rel = raw.setdefault("relay", {})
+    if on:
+        if not rel.get("enabled") or not rel.get("hub_url"):
+            raise bad_request("auto-update is for relay nodes (pods) only", hint="join a hub first: hive join CODE")
+        if (rel.get("role") or "operator") != "operator":
+            raise bad_request(f"auto-update needs relay role operator (this node has {rel.get('role')!r})",
+                              hint="hive init node --relay-role operator --auto-update")
+        if rel.get("deny_actions"):
+            raise bad_request("auto-update needs a relay without deny_actions",
+                              hint="remove relay.deny_actions from the node config first")
+    rel["auto_update"] = bool(on)
+
+
 def init_node(*, name: Optional[str] = None, preset: str = "standard", topology: Optional[str] = None,
               listen: Optional[str] = None, roots: Sequence[str] = (), relay_url: Optional[str] = None,
               relay_token: Optional[str] = None, relay_role: Optional[str] = None, relay_proxy: Optional[str] = None,
               tls_pin: Optional[str] = None, join: Optional[str] = None, tls_cert: Optional[str] = None,
               tls_key: Optional[str] = None, proxy: Optional[str] = None, mirror: Optional[str] = None,
               models_dir: Optional[str] = None, wsl: bool = False, wsl_keepalive: Sequence[str] = (),
-              consent_by: str, force: bool = False) -> Tuple[NodeConfig, Dict[str, str]]:
+              consent_by: str, force: bool = False, auto_update: Optional[bool] = None
+              ) -> Tuple[NodeConfig, Dict[str, str]]:
     """Create (or edit in place, v7/v8) a node config; returns (config, plaintext tokens {"owner","agent"}).
 
     ``relay_role`` None = not given (a new config gets ``operator``); on an existing config any given role, including
-    ``operator``, replaces ``relay.role`` (§14.5 v8; CONTRACT-REQUEST WP6a)."""
+    ``operator``, replaces ``relay.role`` (§14.5 v8; CONTRACT-REQUEST WP6a). ``auto_update`` None = not given; True
+    / False sets ``relay.auto_update`` (final acceptance B5g; True needs a relay with role operator and no
+    deny_actions)."""
     paths = default_paths()
     cfg_path = paths["node_config"]
     if relay_role is not None and relay_role not in ROLES:
@@ -1320,7 +1338,8 @@ def init_node(*, name: Optional[str] = None, preset: str = "standard", topology:
         return _edit_existing_node(cfg_path, jd=jd, topology=topology, listen=listen, roots=roots,
                                    relay_url=relay_url, relay_token=relay_token, relay_role=relay_role,
                                    relay_proxy=relay_proxy, tls_pin=tls_pin, tls_cert=tls_cert, tls_key=tls_key,
-                                   proxy=proxy, mirror=mirror, models_dir=models_dir, wsl_keepalive=wsl_keepalive)
+                                   proxy=proxy, mirror=mirror, models_dir=models_dir, wsl_keepalive=wsl_keepalive,
+                                   auto_update=auto_update)
     host_name = _sanitize_name(socket.gethostname())
     raw: Dict[str, Any] = {"version": 1, "name": host_name, "node_id": "n_" + os.urandom(8).hex(),
                            "description": "", "tags": [], "consent": _consent(consent_by), "allow_root": False,
@@ -1372,6 +1391,8 @@ def init_node(*, name: Optional[str] = None, preset: str = "standard", topology:
             raise bad_request("relay mode needs a relay token (--join CODE, or --token-env/--token-file)")
         _apply_relay(raw, url=relay_url, token=relay_token, pin=tls_pin, role=relay_role or "operator",
                      proxy=relay_proxy, pod=pod)
+        if auto_update is not None:
+            _set_auto_update(raw, auto_update)
     elif pod:
         raise bad_request("--pod needs --join CODE or --relay URL")
     net_proxy = proxy if proxy is not None else _env_proxy()
@@ -1451,7 +1472,8 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
                         roots: Sequence[str], relay_url: Optional[str], relay_token: Optional[str],
                         relay_role: Optional[str], relay_proxy: Optional[str], tls_pin: Optional[str],
                         tls_cert: Optional[str], tls_key: Optional[str], proxy: Optional[str], mirror: Optional[str],
-                        models_dir: Optional[str], wsl_keepalive: Sequence[str]) -> Tuple[NodeConfig, Dict[str, str]]:
+                        models_dir: Optional[str], wsl_keepalive: Sequence[str],
+                        auto_update: Optional[bool] = None) -> Tuple[NodeConfig, Dict[str, str]]:
     changed: List[str] = []
     before: Dict[str, Any] = {}
 
@@ -1467,6 +1489,8 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
             rel = dict(raw.get("relay") or {})
             raw["relay"] = rel
             _apply_relay(raw, url=url, token=tok, pin=pin, role=relay_role or "operator", proxy=relay_proxy, pod=pod)
+            if auto_update is not None:
+                _set_auto_update(raw, auto_update)
             changed.append("relay")
             if jd is not None and jd.get("n"):
                 raw["name"] = jd["n"]
@@ -1532,6 +1556,9 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
                     rel["auto_update"] = False
             if relay_proxy:
                 rel["proxy"] = relay_proxy
+            changed.append("relay")
+        if auto_update is not None:
+            _set_auto_update(raw, auto_update)
             changed.append("relay")
         if not changed:
             raise bad_request("config exists; pass the settings to change, or --force to rewrite (new tokens)",

@@ -341,7 +341,8 @@ class TestHubChecks(_HubCase):
         with self.assertRaises(HiveError) as cm:
             self.client.call("fs.teleport", {}, node="pod-a")
         self.assertEqual(cm.exception.code, "not_found")
-        self.assertIn("upgrade the hub", cm.exception.hint)
+        self.assertIn("hive actions", cm.exception.hint)          # final acceptance B5a: a typo, not an upgrade
+        self.assertNotIn("upgrade the hub", cm.exception.hint)
         with self.assertRaises(HiveError) as cm:
             self.client.call("fs.write", {"path": "/x", "content": ""}, node="pod-a")
         self.assertEqual(cm.exception.code, "not_found")

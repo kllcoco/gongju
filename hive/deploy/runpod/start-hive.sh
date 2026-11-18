@@ -199,7 +199,8 @@ if [ ! -f "$HIVE_HOME/hive" ]; then
 fi
 
 export HIVE_WATCHDOG=1
-mkdir -p "$HIVE_HOME/node/logs"
+mkdir -p "$HIVE_HOME/node/logs" "$HIVE_HOME/node/run"
+echo $$ > "$HIVE_HOME/node/run/start-hive.pid"   # hive CLI: "applied by the watchdog" while the node restarts
 LOG="$HIVE_HOME/node/logs/stdout.log"
 while true; do
   "$PY" "$HIVE_HOME/hive.pyz" _update >> "$LOG" 2>&1 || true

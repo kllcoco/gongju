@@ -2320,6 +2320,10 @@ def _substitutions(text: str) -> List[str]:
     return out
 
 
+# programs that only print their arguments (no file is opened or run by a plain word after them)
+_PRINT_ONLY = frozenset({"echo", "printf", "write-output", "write-host"})
+
+
 def _scan_commands(argv_or_command: Union[List[str], str], *, shell: Optional[str], os_name: Optional[str]
                    ) -> _Roles:
     """Roles of the words of a command (argv or shell line)."""
@@ -2352,6 +2356,11 @@ def _scan_commands(argv_or_command: Union[List[str], str], *, shell: Optional[st
                 roles.hush(w)         # output targets are written, not run: never a header item (verification)
         plain = [w for w in seg if not w.redir]
         prog = _scan_command(plain, roles, "pwsh" if dialect == "pwsh-fallback" else dialect)
+        if prog is not None and _cmd_base(plain[prog].text) in _PRINT_ONLY:
+            # final acceptance B5b: echo/printf only print their words; a plain word (no . / \\) is no file to bind
+            for w in plain[prog + 1:]:
+                if not any(c in w.text for c in "./\\"):
+                    roles.hush(w)
         for w in seg:
             if w.redir == "herestr":  # bash <<< 'cmd': the here-string is the script a shell reads from stdin
                 roles.hush(w)

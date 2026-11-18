@@ -486,7 +486,9 @@ class TestHubCliFixes(_HubCli):
         self.assertIn("pod-a: restart queued", out)
         self.assertIn("pod-b: outdated (version 0.8.0), offline", out)
         self.assertIn("pod-c: outdated", out)
-        self.assertIn("auto_update off: upgrade by hand", out)
+        self.assertIn("no auto-update: it is not a cloud pod run by the watchdog, or its relay role is narrowed",
+                      out)                            # final acceptance B5g: why, and how to upgrade it
+        self.assertIn("upgrade by hand on that machine", out)
         self.assertIn("desk: outdated (version 0.9.1), direct node: upgrade by hand", out)
         self.assertNotIn("\x1b", out)
         self.assertIn("all restarted nodes are up to date", out)

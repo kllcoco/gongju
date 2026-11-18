@@ -97,7 +97,7 @@ def _via_hub_hint(hint: Optional[str]) -> Optional[str]:
         conns = list(load_client_config().connections)
     except Exception:  # noqa: BLE001 - only a hint
         return hint
-    hubs = [c for c in conns if c == "hub-local"] + [c for c in conns if c != "hub-local" and "hub" in c.lower()]
+    hubs = _hub_connections(conns)
     if not hubs:
         return hint
     return (hint + "; " if hint else "") + f"other nodes are reached through the hub: --connection {hubs[0]}"
@@ -164,10 +164,69 @@ def _confirm(question: str, *, yes: bool = False) -> bool:
 # ---------------------------------------------------------------------------------------------------------------
 # connections
 
-def _connect(args: argparse.Namespace, *, owner_default: bool = False, default_node: Optional[str] = None) -> Any:
-    """Client for --connection / env / ``this-pc-owner`` (CLI admin default, §14.4) / client.json default."""
+LOCAL_CONNECTIONS = ("this-pc", "this-pc-owner")
+
+
+def _hub_connections(names: Sequence[str]) -> List[str]:
+    """client.json connections that reach a hub: ``hub-local`` first, then names containing "hub"."""
+    return [c for c in names if c == "hub-local"] + sorted(c for c in names if c != "hub-local" and "hub" in c.lower())
+
+
+def _local_node_name() -> Optional[str]:
+    """This computer's node name (from its config file), None without a readable node config."""
+    from .config import default_paths
+    try:
+        raw = json.loads(Path(default_paths()["node_config"]).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    name = raw.get("name") if isinstance(raw, dict) else None
+    return name.lower() if isinstance(name, str) and name else None
+
+
+def _auto_hub_connection(args: argparse.Namespace, node: Optional[str], *, owner_default: bool) -> Optional[str]:
+    """Final acceptance B2: ``--node X`` (or a NODE argument) without ``--connection``, where the connection in use
+    would be this computer's own node (``this-pc``/``this-pc-owner``) and X is another node: the hub connection of
+    client.json (``hub-local`` first, then a client.json default that is not this computer's node, then names with
+    "hub"), else None. Never with HIVE_URL / HIVE_CONNECTION set."""
+    if not node or getattr(args, "connection", None):
+        return None
+    if os.environ.get("HIVE_URL", "").strip() or os.environ.get("HIVE_CONNECTION", "").strip():
+        return None
+    n = str(node).strip().lower()
+    if not n or n in (".", "-", "local", "self"):
+        return None
+    try:
+        from .config import load_client_config
+        cc = load_client_config()
+    except (HiveError, OSError, ValueError):
+        return None
+    current = "this-pc-owner" if owner_default and "this-pc-owner" in cc.connections else cc.default
+    if current not in LOCAL_CONNECTIONS:
+        return None
+    hubs = _hub_connections(list(cc.connections))
+    if cc.default and cc.default not in LOCAL_CONNECTIONS and cc.default in cc.connections:
+        hubs = [h for h in hubs if h == "hub-local"] + [cc.default] + [h for h in hubs if h not in ("hub-local",
+                                                                                                  cc.default)]
+    local = _local_node_name()
+    if not hubs or local is None or n == local:
+        return None
+    return hubs[0]
+
+
+def _connect(args: argparse.Namespace, *, owner_default: bool = False, default_node: Optional[str] = None,
+             node: Optional[str] = None) -> Any:
+    """Client for --connection / env / ``this-pc-owner`` (CLI admin default, §14.4) / client.json default.
+
+    ``node``: the node the command targets; another node than this computer's own is reached through the hub
+    connection of client.json when no connection was chosen (``_auto_hub_connection``, said on stderr)."""
     from .client import connect
     from .config import load_client_config
+    hub = _auto_hub_connection(args, node or default_node, owner_default=owner_default)
+    if hub:
+        sys.stderr.write(util.escape_terminal(
+            f"note: '{node or default_node}' is not this computer's node ('{_local_node_name()}'): using the hub "
+            f"connection '{hub}' (pass --connection to choose another)") + "\n")
+        args.connection = hub
     name = getattr(args, "connection", None)
     kw: Dict[str, Any] = {}
     if default_node:
@@ -209,7 +268,13 @@ def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> bool:
     from .config import default_paths
     d = default_paths()["node_data" if kind == "node" else "hub_data"]
     if util.FileLock(d / f"{kind}.lock").holder() is None:
-        out.line(f"the {kind} is not running: will apply on next start")
+        sup = _supervisor(kind)
+        if sup:
+            # final acceptance B5f: a watchdog / service loop starts it again within seconds with the new config
+            out.line(f"the {kind} is not running right now; applied by the {sup}, which starts it again within a "
+                     f"few seconds (check: hive {kind} status)")
+        else:
+            out.line(f"the {kind} is not running: will apply on next start")
         return False
     if no_restart:
         out.line(f"restart to apply: hive {kind} restart")
@@ -228,6 +293,15 @@ def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> bool:
         else:
             out.line(f"not applied yet: {e.message}; run hive {kind} restart" + (f" ({e.hint})" if e.hint else ""))
         return False
+
+
+def _supervisor(kind: str) -> Optional[str]:
+    """install.supervisor: what restarts a stopped daemon by itself now (watchdog, launcher, systemd), else None."""
+    try:
+        from . import install
+        return install.supervisor(kind)
+    except Exception:  # noqa: BLE001 - only changes a message
+        return None
 
 
 def _console_command() -> List[str]:
@@ -415,7 +489,7 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
             relay_proxy=args.relay_proxy, tls_pin=args.tls_pin,
             join=args.join, tls_cert=args.tls_cert, tls_key=args.tls_key, proxy=args.proxy, mirror=args.mirror,
             models_dir=args.models_dir, wsl=bool(args.wsl) and not exists, wsl_keepalive=args.wsl_keepalive or (),
-            consent_by=_consent_by(), force=args.force)
+            consent_by=_consent_by(), force=args.force, auto_update=args.auto_update)
     except HiveError as e:
         if exists and e.code == "bad_request" and e.message.startswith("config exists"):
             # v8.1 (external review round 2): a bare `hive init node` on a configured node is not an error
@@ -556,7 +630,7 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
     if args.with_local_node:
         _apply_local_node(cfg, out)
         out.line("warning: an exec-capable agent on this machine can act as the hub (all nodes, approvals, "
-                 "auto-update pods); give agents here --cautious tokens")
+                 "auto-update pods); make the agent token here cautious: hive node token set this-pc --cautious")
     if args.force and util.FileLock(paths["hub_data"] / "hub.lock").holder() is not None:
         _restart_daemon("hub", out)
     else:
@@ -965,6 +1039,45 @@ def cmd_node_token_add(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
+def _cautious_flag(args: argparse.Namespace) -> bool:
+    """--cautious (True) or --no-cautious (False): exactly one of them."""
+    if bool(args.cautious) == bool(args.no_cautious):
+        raise CliError("give --cautious or --no-cautious")
+    return bool(args.cautious)
+
+
+def cmd_node_token_set(args: argparse.Namespace, out: Out) -> int:
+    """``hive node token set NAME --cautious|--no-cautious`` (final acceptance B3): flips the token's approval rule;
+    the token value stays the same, so no agent config changes."""
+    from . import config
+    from .auth import CAUTIOUS_ACTIONS
+    cautious = _cautious_flag(args)
+    cfg = _node_config(args)
+    name = args.name.lower()
+    tok = [t for t in cfg.auth.tokens if t.name == name]
+    if not tok:
+        out.error("not_found", f"no token named {name!r}", "hive node token list")
+        return EXIT_ACTION
+    if tok[0].kind != "agent":
+        raise CliError(f"token {name!r} is a {tok[0].kind} token; approvals apply to agent tokens only")
+
+    def fn(raw: dict) -> None:
+        for t in raw.setdefault("auth", {}).setdefault("tokens", []):
+            if isinstance(t, dict) and t.get("name") == name:
+                if cautious:
+                    t["require_approval"] = list(CAUTIOUS_ACTIONS)
+                else:
+                    t.pop("require_approval", None)
+    config.edit_config(Path(cfg._path), fn, kind="node")
+    if cautious:
+        out.line(f"token {name}: cautious (its shell/service/delete calls wait for your approval: hive approvals "
+                 "list); the token itself is unchanged")
+    else:
+        out.line(f"token {name}: no approvals needed any more; the token itself is unchanged")
+    _restart_daemon("node", out, no_restart=args.no_restart)
+    return EXIT_OK
+
+
 def cmd_node_token_list(args: argparse.Namespace, out: Out) -> int:
     """``hive node token list``."""
     cfg = _node_config(args)
@@ -1104,7 +1217,7 @@ def cmd_call(args: argparse.Namespace, out: Out) -> int:
             raise CliError(f"expected key=value, got {kv!r}")
         k, v = kv.split("=", 1)
         params[k.strip()] = _parse_value(v)
-    client = _connect(args, owner_default=True)
+    client = _connect(args, owner_default=True, node=args.node)
     try:
         res = client.call(args.action, params, node=args.node, timeout=args.timeout, approval_id=args.approval)
     except HiveError as e:
@@ -1170,7 +1283,7 @@ def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
         params["timeout"] = a.timeout
     client = None
     try:
-        client = _connect(gl, owner_default=True)
+        client = _connect(gl, owner_default=True, node=node)
         res = client.call("shell.run", params, node=node, approval_id=a.approval)
     except HiveError as e:
         Out(False).error(e.code, e.message, e.hint)
@@ -1202,6 +1315,13 @@ def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
     return SH_FAILURE
 
 
+def _node_state(row: dict) -> str:
+    """STATE column: online / checking (the hub's first check of a direct node still runs, B5e) / offline."""
+    if row.get("online"):
+        return "online"
+    return "checking" if row.get("checking") else "offline"
+
+
 def cmd_nodes(args: argparse.Namespace, out: Out) -> int:
     """``hive nodes``."""
     client = _connect(args)
@@ -1212,7 +1332,7 @@ def cmd_nodes(args: argparse.Namespace, out: Out) -> int:
     if out.as_json:
         out.data(rows)
         return EXIT_OK
-    out.line(_table([[r.get("name"), "online" if r.get("online") else "offline", r.get("mode"), r.get("os_label"),
+    out.line(_table([[r.get("name"), _node_state(r), r.get("mode"), r.get("os_label"),
                       r.get("gpus_summary"), ",".join(r.get("tags") or [])] for r in rows],
                     ["NAME", "STATE", "MODE", "OS", "GPUS", "TAGS"]))
     hint = _hub_local_hint(args, len(rows))
@@ -1240,7 +1360,7 @@ def _hub_local_hint(args: argparse.Namespace, n_rows: int) -> Optional[str]:
 
 def cmd_actions(args: argparse.Namespace, out: Out) -> int:
     """``hive actions``."""
-    client = _connect(args)
+    client = _connect(args, node=args.node)
     try:
         rows = client.actions(args.node)
     finally:
@@ -1618,7 +1738,7 @@ def cmd_hub_status(args: argparse.Namespace, out: Out) -> int:
     srv = who.get("server") or {}
     out.foreign(f"hub '{srv.get('name')}' running (version {srv.get('version')}), {len(rows)} node(s)")
     if rows:
-        out.line(_table([[r.get("name"), "online" if r.get("online") else "offline", r.get("mode"),
+        out.line(_table([[r.get("name"), _node_state(r), r.get("mode"),
                           r.get("os_label"), r.get("version"), _node_notes(r)] for r in rows],
                         ["NAME", "STATE", "MODE", "OS", "VERSION", "NOTE"]))
     return EXIT_OK
@@ -1942,6 +2062,35 @@ def cmd_hub_remove_agent(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
+def cmd_hub_set_agent(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub set-agent NAME --cautious|--no-cautious`` (final acceptance B3): flips a hub agent token's
+    approval rule; the token value stays the same."""
+    from .auth import CAUTIOUS_ACTIONS
+    cautious = _cautious_flag(args)
+    cfg = _hub_config(args)
+    name = args.name.lower()
+    tok = [t for t in cfg.tokens if t.name == name]
+    if not tok:
+        out.error("not_found", f"no token named {name!r}", "hive hub list")
+        return EXIT_ACTION
+    if tok[0].kind != "agent":
+        raise CliError(f"token {name!r} is a {tok[0].kind} token; approvals apply to agent tokens only")
+
+    def fn(raw: dict) -> None:
+        for t in raw.get("tokens") or []:
+            if isinstance(t, dict) and t.get("name") == name:
+                if cautious:
+                    t["require_approval"] = list(CAUTIOUS_ACTIONS)
+                else:
+                    t.pop("require_approval", None)
+    _hub_edit(args, fn)
+    out.line(f"agent token '{name}': " + ("cautious (its shell/service/delete calls wait for your approval: hive "
+                                          "approvals list)" if cautious else "no approvals needed any more")
+             + "; the token itself is unchanged")
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
 def cmd_hub_rotate_token(args: argparse.Namespace, out: Out) -> int:
     """``hive hub rotate-token NAME``: a relay node gets a fresh join block (the revocation path of a leaked code);
     a direct node a new hub token (only its hash goes to the node); an agent/models token a new token."""
@@ -2066,6 +2215,33 @@ _now = time.monotonic
 _sleep = time.sleep
 
 
+UPGRADE_BY_HAND = ("upgrade by hand on that machine: pip install -U ./hive (or put a new hive.pyz in place), then "
+                   "hive node restart")
+
+
+def _auto_update_off_lines(name: str, ver: str, why: Any) -> List[str]:
+    """``restart-node --outdated`` lines for an outdated relay node without auto-update (final acceptance B5g): why
+    it is off (the node's ``auto_update_off``) and how to turn it on, or how to upgrade it by hand."""
+    head = f"{name}: outdated (version {ver}), no auto-update"
+    why = why if isinstance(why, str) else ""
+    if why.startswith("role:"):
+        role = why[5:]
+        return [f"{head}: its relay role is '{role}' (only a pod with role operator may replace its own program)",
+                f"  to turn it on, on that machine: hive init node --relay-role operator --auto-update; or "
+                + UPGRADE_BY_HAND]
+    if why == "deny_actions":
+        return [f"{head}: its relay config denies some actions (relay.deny_actions), so the hub may not update it",
+                "  " + UPGRADE_BY_HAND]
+    if why == "not_pod":
+        return [f"{head}: it is not a cloud pod (auto-update needs the pod's watchdog loop: hive join --install on "
+                "a pod, or deploy/runpod/start-hive.sh)", "  " + UPGRADE_BY_HAND]
+    if why == "off":
+        return [f"{head}: relay.auto_update is off in its config",
+                "  to turn it on, on that machine: hive init node --auto-update; or " + UPGRADE_BY_HAND]
+    return [f"{head}: it is not a cloud pod run by the watchdog, or its relay role is narrowed (auto-update needs both "
+            "a pod and relay role operator)", "  " + UPGRADE_BY_HAND]
+
+
 def cmd_hub_restart_node(args: argparse.Namespace, out: Out) -> int:
     """``hive hub restart-node NAME | --outdated`` (relay refresh "restart" via the hub owner route, D49)."""
     if bool(args.name) == bool(args.outdated):
@@ -2105,7 +2281,8 @@ def cmd_hub_restart_node(args: argparse.Namespace, out: Out) -> int:
                 out.line(f"{rname}: outdated (version {ver}), offline: upgrade by hand when it is back")
                 continue
             if not r.get("auto_update"):
-                out.line(f"{rname}: outdated (version {ver}), auto_update off: upgrade by hand")
+                for line in _auto_update_off_lines(rname, ver, r.get("auto_update_off")):
+                    out.line(line)
                 continue
             res = _owner_request(client, "POST", f"/v1/hub/nodes/{r.get('name')}/restart", {})
             if res.get("queued"):
@@ -2340,8 +2517,10 @@ def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
     _gateway_settings(out, bases, model, "<your gateway token>")
     out.line("browser apps on an https:// page need the https (public) URL or a http://127.0.0.1 URL on the same "
              "machine; a model_endpoints name such as ollama or lmstudio works as SERVICE too")
-    out.line("no token yet? hive gateway token add APP --models '" + (f"{svc}'" if args.node else f"{node}/{svc}'")
-             + (" --node" if args.node else ""))
+    if not args.token_file:     # final acceptance B5d: with --token-file the user has a token already
+        out.line("no token yet? hive gateway token add APP --models '" + (f"{svc}'" if args.node else
+                                                                          f"{node}/{svc}'")
+                 + (" --node" if args.node else ""))
     return EXIT_OK
 
 
@@ -2605,6 +2784,38 @@ def _write_mcp_json(path: Path, server: dict, out: Out) -> None:
     out.line(f"wrote {path} (restart the app to load it)")
 
 
+def _mcp_remove(client: str, out: Out) -> int:
+    """``hive mcp-config --client X --remove`` (final acceptance B4): take the "hive" server out of the app's MCP
+    config (a .bak copy is kept), or print the command that does it (Claude Code)."""
+    if client == "claude-code":
+        out.line("run: claude mcp remove hive   (if you added it with -s user: claude mcp remove -s user hive)")
+        return EXIT_OK
+    if client == "generic":
+        raise CliError("--remove works with --client claude-desktop, cursor or claude-code",
+                       hint="for another MCP client, delete its \"hive\" server entry by hand")
+    path = Path.home() / ".cursor" / "mcp.json" if client == "cursor" else _desktop_config_path()
+    data: Any = None
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig") or "{}")
+        except (OSError, ValueError) as e:
+            raise CliError(f"cannot read {path}: {e}", hint="fix it, or delete its \"hive\" entry by hand")
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict) or "hive" not in servers:
+        out.line(f"nothing to remove: no \"hive\" entry in {path}")
+        if client == "cursor":
+            out.line("(a project's own .cursor/mcp.json is not touched; delete its \"hive\" entry by hand)")
+        return EXIT_OK
+    try:
+        util.atomic_write_bytes(Path(str(path) + ".bak"), path.read_bytes(), private=True)
+    except OSError:
+        pass
+    del servers["hive"]
+    util.atomic_write_bytes(path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    out.line(f"removed \"hive\" from {path} (restart the app; the old file is kept as {path.name}.bak)")
+    return EXIT_OK
+
+
 def _local_token_kind(token: Optional[str]) -> Optional[str]:
     """Kind of ``token`` from the configs on this machine (node ``auth.tokens``, hub ``tokens``), None if unknown."""
     if not token:
@@ -2650,6 +2861,8 @@ def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
     this machine; a kind that stays unknown is refused like an owner token unless ``--allow-owner``."""
     from .client import _cfg_base, _conn_token, connect
     from .config import load_client_config
+    if getattr(args, "remove", False):
+        return _mcp_remove(args.client or "claude-desktop", out)
     cc = load_client_config()
     if args.local:
         conn = "this-pc"
@@ -2875,7 +3088,7 @@ def cmd_service_define(args: argparse.Namespace, out: Out) -> int:
             raise CliError(f"--param expects key=value, got {kv!r}")
         k, v = kv.split("=", 1)
         params[k.strip()] = _parse_value(v)
-    client = _connect(args, owner_default=True)
+    client = _connect(args, owner_default=True, node=args.node)
     try:
         res = client.call("service.define", params, node=args.node, approval_id=args.approval)
     except HiveError as e:
@@ -3092,7 +3305,7 @@ class _Bar:
 
 
 def _transfer(args: argparse.Namespace, out: Out, src: str, dst: str) -> int:
-    client = _connect(args, owner_default=True)
+    client = _connect(args, owner_default=True, node=_node_spec(args.node))
     bar = _Bar(f"{args.node}")
     try:
         res = client.transfer(src, dst, overwrite=args.overwrite, progress=bar)
@@ -3130,7 +3343,7 @@ def cmd_logs(args: argparse.Namespace, out: Out) -> int:
     if bool(args.job_id) == bool(args.service):
         raise CliError("give a JOB_ID or --service NAME")
     node = _node_spec(args.node)
-    client = _connect(args, owner_default=True)
+    client = _connect(args, owner_default=True, node=node)
 
     def show(text: str) -> None:
         if not text:
@@ -3224,6 +3437,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what the hub may do here (default operator); on an existing config it changes relay.role")
     p.add_argument("--relay-proxy")
     p.add_argument("--pod", action="store_true")
+    au = p.add_mutually_exclusive_group()
+    au.add_argument("--auto-update", dest="auto_update", action="store_const", const=True, default=None,
+                    help="pods: the hub may update this node (hive hub restart-node --outdated)")
+    au.add_argument("--no-auto-update", dest="auto_update", action="store_const", const=False)
     p.add_argument("--proxy", help="URL or off")
     p.add_argument("--mirror", choices=["cn", "none"])
     p.add_argument("--models-dir")
@@ -3280,6 +3497,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-cautious", action="store_true")
     p.add_argument("--expires")
     p.add_argument("--sha256")
+    p.add_argument("--config")
+    p.add_argument("--no-restart", action="store_true")
+    p = leaf(tok, "set", cmd_node_token_set, help="change a token's approval rule (the token stays the same)")
+    p.add_argument("name")
+    p.add_argument("--cautious", action="store_true", help="its risky calls wait for approval")
+    p.add_argument("--no-cautious", action="store_true", help="no approvals")
     p.add_argument("--config")
     p.add_argument("--no-restart", action="store_true")
     p = leaf(tok, "list", cmd_node_token_list)
@@ -3375,6 +3598,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expires")
     p.add_argument("--config")
     p.add_argument("--no-restart", action="store_true")
+    p = leaf(hub, "set-agent", cmd_hub_set_agent, help="change an agent token's approval rule")
+    p.add_argument("name")
+    p.add_argument("--cautious", action="store_true", help="its risky calls wait for approval")
+    p.add_argument("--no-cautious", action="store_true", help="no approvals")
+    p.add_argument("--config")
+    p.add_argument("--no-restart", action="store_true")
     for name, fn in (("remove-node", cmd_hub_remove_node), ("remove-agent", cmd_hub_remove_agent),
                      ("rotate-token", cmd_hub_rotate_token)):
         p = leaf(hub, name, fn)
@@ -3450,6 +3679,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--remote", action="store_true")
     p.add_argument("--write", action="store_true")
     p.add_argument("--allow-owner", action="store_true")
+    p.add_argument("--remove", action="store_true", help="take Hive out of the app's MCP config (uninstall)")
 
     svc = sub.add_parser("service", help="start the node/hub with the OS").add_subparsers(dest="what")
     p = leaf(svc, "install", cmd_service_install)

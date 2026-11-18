@@ -261,6 +261,9 @@ _NODE_SUMMARY = _ro({
     "queued": _i("Queued relay tasks."), "identity_changed": _b("Relay node awaiting ack-node."),
     "outdated": _b("Version differs from the hub."), "preset": _any("Policy preset or null (unknown)."),
     "auto_update": _b("relay.auto_update."), "max_timeout": _any("Node exec max_timeout or null."),
+    "auto_update_off": _any("Why auto_update is off (relay nodes): not_pod | role:<role> | deny_actions | off; "
+                            "null when on or unknown."),
+    "checking": _b("Direct node: the hub's first check is still running (online stays false until it ends)."),
     "status": _map("Live status (cpu_pct, mem_pct, gpus …)."),
 }, "NodeSummary (§9.10).")
 
@@ -288,7 +291,9 @@ def _specs() -> List[ActionSpec]:
             "data_dir": _s("Node data directory."), "default_shell": _any("Default shell or null."),
             "shells": _a(_s("Shell."), "Available shells."),
             "modes": _ro({"listen": _any("host:port or null."), "relay": _any("Hub URL or null."),
-                          "gateway": _b("Gateway enabled."), "auto_update": _b("relay.auto_update.")},
+                          "gateway": _b("Gateway enabled."), "auto_update": _b("relay.auto_update."),
+                          "auto_update_off": _any("Why auto_update is off: not_pod | role:<role> | deny_actions | "
+                                                  "off; null when on or without a relay.")},
                          "Connection modes."),
             "tags": _a(_s("Tag."), "Tags."), "description": _s("Description."),
             "started_at": _s("ISO UTC start time."), "time": _s("ISO UTC now."), "paused": _b("Node is paused."),

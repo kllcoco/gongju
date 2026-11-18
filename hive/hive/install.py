@@ -638,6 +638,40 @@ def _launcher_alive(ctx: _Ctx) -> bool:
     return _pid_alive(rec["pid"], rec.get("ctime"))
 
 
+def supervisor(kind: str) -> Optional[str]:
+    """What starts the stopped daemon again by itself right now (final acceptance B5f): "watchdog" (run-<kind>.sh
+    or deploy/runpod/start-hive.sh is looping), "launcher" (the Windows launcher loop), "systemd" (the unit is
+    active or restarting), else None."""
+    try:
+        ctx = _context(kind, strict=False)
+    except HiveError:
+        return None
+    if _watchdog_alive(ctx) or _start_hive_alive(ctx):
+        return "watchdog"
+    if _launcher_alive(ctx):
+        return "launcher"
+    method, system = _installed(ctx)
+    if method == "systemd":
+        code, out = _execute(_systemctl(system, "is-active", _unit_name(kind)), timeout=10)
+        state = out.strip().splitlines()[0] if out.strip() else ""
+        if state in ("active", "activating", "reloading"):
+            return "systemd"
+    return None
+
+
+def _start_hive_alive(ctx: _Ctx) -> bool:
+    """deploy/runpod/start-hive.sh records its loop's pid in run/start-hive.pid (node only)."""
+    try:
+        pid = int((ctx.data_dir / "run" / "start-hive.pid").read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return False
+    if not util.pid_alive(pid, None):
+        return False
+    from . import procinfo
+    info = procinfo.process_info(pid) or {}
+    return "start-hive" in " ".join(info.get("cmdline") or [])
+
+
 def status(kind: str) -> dict:
     """Installation status: ``{kind, installed, method, system, files, running, pid, data_dir, active}``."""
     ctx = _context(kind, strict=False)

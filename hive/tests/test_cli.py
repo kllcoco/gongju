@@ -20,8 +20,27 @@ class _Stdin(io.StringIO):
         return False
 
 
+# final acceptance Part A: flags that already decide where a new node/hub config listens
+_LISTEN_CHOICE = ("--listen", "--no-listen", "--tailscale", "--lan", "--pod", "--funnel", "--public-url")
+
+
+def free_port_init(argv):
+    """Part A: a ``hive init node|hub`` that creates (or --force rewrites) a config gets ``--listen 127.0.0.1:<free
+    port>`` unless the test chose the listener itself, so no test config uses the default 7701/7700, where a
+    developer's own node or hub may be answering (a later ``node status`` / ``hub status`` would reach it)."""
+    argv = list(argv)
+    if len(argv) < 2 or argv[0] != "init" or argv[1] not in ("node", "hub"):
+        return argv
+    if any(a in _LISTEN_CHOICE or a.startswith("--listen=") for a in argv):
+        return argv
+    if config.default_paths()[f"{argv[1]}_config"].exists() and "--force" not in argv:
+        return argv            # an edit of an existing config keeps its port
+    return argv + ["--listen", f"127.0.0.1:{helpers.free_port()}"]
+
+
 def run(argv, stdin: str = "", env=None):
-    """cli.main in-process -> (exit code, stdout, stderr)."""
+    """cli.main in-process -> (exit code, stdout, stderr); ``free_port_init`` applies to ``init node|hub``."""
+    argv = free_port_init(argv)
     out, err = io.StringIO(), io.StringIO()
     with mock.patch.dict(os.environ, env or {}), mock.patch.object(cli.sys, "stdin", _Stdin(stdin)), \
             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):

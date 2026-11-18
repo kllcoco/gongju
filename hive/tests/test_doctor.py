@@ -213,7 +213,8 @@ class TestPolicyChecks(DoctorCase):
         self.assertFalse([r for r in self.rows(res, "policy", "warn") if "T5" in r["detail"]])
         self.add_hub()
         res = self.run_doc()
-        self.assertRow(res, "policy", "warn", "on the hub's machine without approvals")
+        row = self.assertRow(res, "policy", "warn", "on the hub's machine without approvals")
+        self.assertRegex(row["fix"], r"^hive node token set \S+ --cautious$")      # final acceptance B3: exact
 
     def test_hub_agent_reaching_local_nodes(self):
         tok = {"name": "claude", "sha256": util.hash_token("hv_" + "a" * 40), "kind": "agent", "role": "operator",
@@ -229,10 +230,12 @@ class TestPolicyChecks(DoctorCase):
         self.assertIn("desk", row["detail"])
         self.assertIn("desk-wsl", row["detail"])                          # wsl-host:<hub hostname> counts
         self.assertNotIn("pod-a", row["detail"])
+        self.assertEqual(row["fix"], "hive hub set-agent claude --cautious, or narrow its nodes")
 
     def test_cautious_node_with_open_agent(self):
         self.edit(lambda r: r["policy"].update(preset="cautious"))
-        self.assertRow(self.run_doc(), "policy", "warn", "on this cautious node without approvals")
+        row = self.assertRow(self.run_doc(), "policy", "warn", "on this cautious node without approvals")
+        self.assertRegex(row["fix"], r"^hive node token set \S+ --cautious$")
 
 
 @unittest.skipUnless(POSIX, "fake tools are POSIX scripts")

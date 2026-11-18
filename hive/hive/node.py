@@ -352,6 +352,12 @@ class NodeRuntime:
             self.request_stop(EXIT_RESTART if cmd == "restart" else EXIT_STOP)
 
     def _watch_paused(self) -> None:
+        relay = self.relay
+        if relay is not None and hasattr(relay, "check_disabled"):
+            try:
+                relay.check_disabled()         # final acceptance B5c: the hub learns of a panic within a second
+            except Exception:  # noqa: BLE001
+                log.debug("relay goodbye failed", exc_info=True)
         paused = (self.data_dir / "PAUSED").exists()
         self._paused_cache = (time.monotonic(), paused)
         if paused and not self._was_paused:
@@ -707,6 +713,7 @@ class NodeRuntime:
                 "inflight": self.gate.inflight if self.gate else 0, "queued": self.gate.queued if self.gate else 0,
                 "identity_changed": False, "outdated": False, "preset": self.policy.preset if self.policy else None,
                 "auto_update": bool(self.config.relay.auto_update),
+                "auto_update_off": _auto_update_off(self.config.relay),
                 "max_timeout": self.policy.limits.exec_max_timeout if self.policy else None, "status": status}
 
     def _wsl_distros(self) -> List[str]:
@@ -1101,11 +1108,16 @@ def run_node(config_path: Optional[str] = None, *, foreground: bool = True, rela
             server.stop()
         if relay is not None:
             try:
-                relay.stop()
+                relay.stop(goodbye=rt.exit_code != EXIT_RESTART)   # a restart comes back at once: no goodbye
             except Exception:  # noqa: BLE001
                 pass
         rt.stop()
     return rt.exit_code
+
+
+def _auto_update_off(relay: Any) -> Optional[str]:
+    from .actions.node import auto_update_off
+    return auto_update_off(relay)
 
 
 def foreground_restart_ok(*, relaunched: bool = False, supervise: bool = False) -> bool:
