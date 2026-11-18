@@ -1546,3 +1546,58 @@ R-3. **README.md** rewritten for the owner (Chinese, beginner level): parts, ins
     with their own parsers) and checks file links and in-page anchors. Note for README authors: `call`/`sh`/
     `logs`/`push`/`pull` default to `this-pc-owner` when it exists (not to client.json `default`), so hub examples
     pass `--connection`.
+
+## External review fixes
+
+### Beginner README walkthrough (CLI, install, README)
+
+X-W1. **Foreground restart (owner decision A; `cli.py`, `node.py`, `hub.py`, `install.py`):** `hive node run` /
+    `hive hub run` started by hand in a terminal (`node.foreground_restart_ok`: stdin or stderr is a TTY, not
+    `--relaunched`/`--supervise`, no `HIVE_WATCHDOG=1`, no systemd `INVOCATION_ID`, not the Windows loop's child
+    `HIVE_FOREGROUND_CHILD=1`) re-exec themselves after exit 75 (`node.reexec_foreground`: prints "restarting to apply
+    new settings…", chdir back to the original cwd, POSIX `os.execv(util.self_command() + CLI args)`; Windows runs the
+    same command as a child in a loop). Supervised runs keep exit 75. Contract change: the node and hub lock notes are
+    `"node <hex>"` / `"hub <hex>"` (per start), and `install.restart` compares holders by `(pid, ctime, note)` — its
+    exit wait ends when the pid exits or the holder changes, `_wait_new_holder(ctx, old_holder, …)` accepts any
+    different holder. `cli._restart_daemon` prints "applied (restarted the <kind>)", "the <kind> is not running: will
+    apply on next start", or for a foreground run without a terminal "… start it again: hive <kind> run"; it returns
+    True when a running daemon was restarted. DESIGN §13.1, §8.6, §19 (v8.1).
+X-W2. **`init hub --with-local-node` (B; `config.py` init_* only, `cli.py`):** registration moved to
+    `config._local_node_entry(hub_name)` (refuses a local node without a listener); `cfg._local_node` names the entry
+    (`hubhost` when node and hub names are equal, else the node name). The CLI prints the name and its URL and restarts
+    a running local node (`_restart_daemon("node")`), so it loads the new hub token at once (with X-W1 also in a
+    foreground terminal). README 4.2 explains the name.
+X-W3. **`init hub` on an existing config (F; `config.edit_hub_init`):** `--listen`/`--tailscale`/`--public-url`/
+    `--funnel`/`--with-local-node` change only that setting under `edit_config`, tokens kept, a running hub restarted;
+    nothing to change -> exit 2 with the `--force` hint (a name clash for the local node is refused before any token is
+    minted). `--name`/`--tls-*` on an existing hub print "applies only when creating". `init_hub()` itself still
+    raises `conflict` on an existing config without `force`.
+X-W4. **`hive service define` / `hive guide` (D):** `service define NAME` maps `--preset/--model/--arg/--argv/--command/
+    --port/--endpoint/--cwd/--autostart/--no-start/--wait (30)/--param K=V/--node/--approval` onto `service.define`
+    (`--model` -> the preset's `model` or `model_path` arg; exactly one of preset/argv/command); `hive guide [TOPIC]
+    [--list]` prints `guides.topic_text`. README section 6.1 (Ollama, vLLM, llama.cpp, a stub via `--argv`).
+X-W5. **Agent token on the agent's machine (E):** `--token -` (all commands using `_read_token_arg`) reads one line
+    from a pipe or a no-echo prompt (Ctrl-D/Ctrl-C -> "cancelled; nothing was saved", exit 2). `init client --token -`
+    saves `tokens/<name>.token` 0600 (or the `--token-file` path, written 0600 by Hive); an existing `--token-file`
+    readable by others is chmod 0600 with a note. `hub add-agent` prints the one line
+    `hive init client --name <hub> --url <url> --token - --default` and the mcp-config line with `--connection`.
+X-W6. **Small items (F):** `init node` warns at once as root/Administrator (explains `allow_root`; not for `--pod`
+    or when the config already allows root); `init node|hub --tailscale` runs `tailscale_info()` and warns with an
+    install/`tailscale up` hint; `mcp-config` (and the `init node` snippet) put `HIVE_HOME` into `env` /
+    `claude mcp add -e HIVE_HOME=…` when it is set and not `~/.hive`; non-TTY `approvals approve|deny` and
+    `node panic` print the exact `--yes` command; `hive sh --approval AP` passes `approval_id`, and `sh`/`call` print
+    the retry line after `approval_required`; `hive nodes` with one row, no `--connection` and a `hub-local`
+    connection that is not the default prints the `--connection hub-local` hint; `node secret set` prompts end cleanly
+    on Ctrl-D/Ctrl-C (and refuse an empty value); `node pause` polls `node.info` (≤ 3 s) and says whether the running
+    node confirmed; `join --install` follows the node log (≤ `JOIN_VERIFY_S` 30 s, stops `JOIN_FAIL_GRACE_S` 8 s after
+    a logged start failure) and prints "joined: …" only after "relay registered with", else exit 4 with the cause
+    (port in use -> `--no-listen` / `--listen 127.0.0.1:7721`); `doctor` without a kind checks node and hub when both
+    configs exist (JSON rows then carry `target`); the watchdog install notes explain the no-systemd fallback and the
+    login-script line in desktop terms; `service define` prints `hive gateway url self NAME --node` for a local node.
+X-W7. **README:** upgrade/uninstall rewritten (venv pip first, `service uninstall` + `rm -rf ~/.venvs/hive
+    ~/.local/bin/hive`, optional `~/.hive`, Windows and pyz variants); `--yes`; a sample of command output with
+    Chinese explanations; foreground restart wording; `hubhost`; `--token -`; Linux Claude Desktop path;
+    `service_start` -> `service_control`; approval retry flow; `hive nodes --connection hub-local`; `hive guide`;
+    `pip install` leftovers (`build/`, `*.egg-info`). `tests/test_readme.py`'s `sh` parser knows `--approval`.
+    Regression tests: `tests/test_walkthrough.py` (incl. a real pty `node run` that survives `node token add` with the
+    same pid), plus assertions in `test_cli_wp6b.py`.
