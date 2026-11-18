@@ -1291,3 +1291,50 @@ S7. **Open items (WP6b):** the README is a first version for the lead's review; 
     Desktop config locations, `_console_command` on Windows) are written but only run here through mocks; `service
     install` from a bare source checkout is refused by WP4's `check_launcher` (expected: install with pip first);
     E2E M2 (hub + relay + join + `/mcp` with real processes) remains the lead's.
+
+## WP6b review fixes
+
+(Items numbered R6b-1… so they cannot collide with the notes of parallel review packages. Regression tests:
+`tests/test_wp6b_review.py`.)
+
+R6b-1. **/mcp sessions (amends S3):** the per-token (16) and total (256) caps evict the least recently used **idle**
+    session (`active == 0`, §18.5 "the oldest idle one"); a session with a request in flight is never evicted. When a
+    cap is reached and every candidate is busy, `HttpSessions.create` raises `HiveError("unavailable")` without
+    evicting anything and the `initialize` POST answers HTTP 503 (`Retry-After: 10`) with JSON-RPC `-32603`.
+    Closing a session (DELETE, idle expiry, eviction) also calls the session Toolkit's `close()`, which cancels its
+    hub-process `fs_transfer` copies (part files stay for a resume).
+R6b-2. **/mcp body (amends S3):** the body passes `httpserver.json_depth_ok` first (else 400 `-32600` "JSON nested too
+    deeply"); a `RecursionError` from the parser is the same 400.
+R6b-3. **McpCore (stdio and HTTP):** a `tools/call` whose id is already in flight in the same session is answered
+    `-32600` "duplicate request id in flight"; a finishing call removes its `inflight` entry only if it is still its
+    own handle.
+R6b-4. **CONTRACT-REQUEST (WP6b → WP6a `tools.py`, WP5b `transfer.py`), additive:** `Toolkit.close() -> int` (cancels
+    the Toolkit's TransferManager transfers; 0 when none was started) and `TransferManager.cancel_all() -> int`
+    (cancels every running transfer). Used by R6b-1 only.
+R6b-5. **mcp-config fails closed (amends S4, §5.1, §18.4):** the token kind comes from `whoami`; with the server
+    unreachable, from the configs on this machine (the connection token's hash against node `auth.tokens` and hub
+    `tokens`; an owner match → owner), and `this-pc-owner`/`hub-local` still count as owner. Owner → exit 3 unless
+    `--allow-owner`; a kind that stays unknown → exit 4 ("cannot check the token…") unless `--allow-owner`.
+    `--remote` needs a reachable server whose `whoami.server.role` is `hub` and that serves `/mcp` (a session-less
+    `POST /mcp` probe: 404 = `listen.mcp_http` off) — else exit 2 "remote MCP is served by a hub only; use the stdio
+    snippet" (exit 4 when unreachable), and an `http://` URL whose host is not loopback/private/tailnet
+    (`transport.plaintext_ok`) is refused (exit 2). Nothing is printed with the token in those cases. `--write` keeps
+    the `.bak` private (0600, `util.atomic_write_bytes(private=True)`).
+R6b-6. **hub add-agent T5 (amends S4):** the warning is printed unless every exec action (`shell.run`, `job.start`,
+    `service.define`, `service.start`, `service.restart`) is denied or approval-gated by the token (or the role has no
+    exec), so a narrow `--approval fs.delete` still warns. This covers the §5.2 `auth.exec_gated` rule (shell.run) and
+    also job/service starts, which run commands too.
+R6b-7. **hub add-node --direct (§14.3, C1):** an `http://` URL must pass `transport.plaintext_ok(host,
+    resolve_host(host, port))` (loopback, private/tailnet IPs, local or `*.ts.net` names), else exit 2 with "use the
+    node's tailnet/LAN address, or https with --tls-pin" and nothing written or printed; `https://` to a non-private
+    host without `--tls-pin` prints a warning (system CAs / `network.ca_file` may still be fine).
+R6b-8. **hub restart-node --outdated (amends S4):** after the online wait every outdated `hub.nodes` row is named:
+    direct nodes "direct node: upgrade by hand", offline relay nodes "offline: upgrade by hand when it is back",
+    relay nodes without auto_update "auto_update off: upgrade by hand"; restarts are queued only for online
+    auto-updating relay nodes. Node-supplied versions are escaped.
+R6b-9. **gateway (amends S4):** `gateway token add` with a non-glob first model prints the app settings block (the
+    `gateway url` bases; "API key: the API key above" so the token itself appears once; Model `<model name>`) plus a
+    `gateway url … --token-file FILE` pointer for the served ids; glob entries keep the pointer only. `gateway url`
+    escapes the model id it puts into the Provider line (§19).
+R6b-10. **approvals list:** when every place fails, it prints the per-place lines but not "no pending approvals" and
+    exits with that failure's code (4 for "not running"), like `approvals revoke`.

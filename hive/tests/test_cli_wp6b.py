@@ -235,13 +235,13 @@ class TestHubConfigCommands(_HubCli):
         config.edit_config(config.default_paths()["hub_config"], lambda r: r["listen"].update(port=stub.port),
                            kind="hub")
         tf = self.home / "gw.token"
-        tf.write_text(util.new_token())
+        gtok = util.new_token()
+        tf.write_text(gtok)
         code, out, err = run(["gateway", "url", "desk", "qwen", "--token-file", str(tf)])
         self.assertEqual(code, 0, err)
         self.assertIn("served models: qwen2.5-7b", out)
         self.assertIn("Model: qwen2.5-7b", out)
-        self.assertTrue(any(r.get("headers", {}).get("Authorization", "").startswith("Bearer ") or True
-                            for r in stub.requests))
+        self.assertEqual([r["headers"].get("Authorization") for r in stub.requests], [f"Bearer {gtok}"])
 
 
 class TestHubOwnerRoutes(CliCase):
