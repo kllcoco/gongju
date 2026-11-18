@@ -483,8 +483,7 @@ class TestSmallItems(CliCase):
         fc = _FakeClient(result={"paused": False})
         with mock.patch.object(cli, "_holder", return_value={"pid": 1}), \
                 mock.patch.object(cli, "_connect", return_value=fc), \
-                mock.patch.object(cli.time, "sleep"), \
-                mock.patch.object(cli.time, "monotonic", side_effect=[0.0] + [10.0] * 20):
+                mock.patch.object(cli, "PAUSE_CONFIRM_S", 0.3):
             code, out, err = run(["node", "pause"])
         self.assertIn("did not confirm within 3 s", out)
 

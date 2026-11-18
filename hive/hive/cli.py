@@ -738,7 +738,7 @@ def cmd_node_pause(args: argparse.Namespace, out: Out) -> int:
     if _holder(d) is None:
         out.line("paused (the node is not running; it starts paused): non-read calls are refused and nothing is "
                  "spawned; resume with: hive node resume")
-    elif _wait_paused(args, 3.0):
+    elif _wait_paused(args, PAUSE_CONFIRM_S):
         out.line("paused (confirmed by the running node): non-read calls are refused and nothing is spawned; resume "
                  "with: hive node resume")
     else:
@@ -748,6 +748,9 @@ def cmd_node_pause(args: argparse.Namespace, out: Out) -> int:
     for line in _wsl_lines(cfg):
         out.line(line)
     return EXIT_OK
+
+
+PAUSE_CONFIRM_S = 3.0     # v8.1: node pause waits this long for the running node to report paused
 
 
 def _wait_paused(args: argparse.Namespace, budget: float) -> bool:
