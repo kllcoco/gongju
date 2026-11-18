@@ -2057,3 +2057,77 @@ A4-7. **One token could take every node call slot (MEDIUM):** `ConcurrencyGate` 
     against a dribbling head, owner reserve with the authenticated pool full, 429 / 503 answered before a 30 MiB body
     is sent and the owner exempt, `pre_body` short-circuit, a real hub refusing unexpected relay results unread and
     checking header/body agreement, `RelayAgent` sending the headers.
+
+Findings 1, 2, 4, 5, 8 (the regex / local-user part): changes in `audit.py`, `secretstore.py` (masking),
+`actions/system.py`, `jobs.py` (display only), `fsops.py` (`check_regex`), `actions/files.py` (fs.search),
+`services.py` (`ready_pattern` matching), new module `_regexworker.py` (layout test and §3 count: 55 modules),
+`util.py` (btime file), `hfhub.py`; package-wide regex sweep: `presets.py`, `policy.py`, `_download.py`. Tests
+`tests/test_audit4_regex.py`, `tests/test_imports.py`; DESIGN §3, §4.2 (`process_create_time`), §5.8, §9.7
+(fs.search, proc.list), §10 (`ready_pattern`), §11.5 (model.pull listing); SECURITY rows Audit / Agent regexes /
+Local users and one limit. PROTOCOL unchanged (no wire change: fs.search `cut` now means "past the first 1 KiB",
+`reason` may be `"regex_worker_failed"`). Timings on this container (CPython 3.13).
+
+A4-1. **Quadratic redaction regexes (CRITICAL):** the URL-userinfo rule (`scheme*://`), the `--flag` rule
+    (`X*KEY X*`), the `NAME=` rule and the mysql `-p` rule (lazy scan to end of line from every client name) were
+    quadratic, and `_short()` redacted the whole string before cutting it. Now: flag and NAME words are consumed
+    atomically (`(?=lazy…secret word)(?=(word*))\1`: Python 3.9 has no atomic groups), URL userinfo is matched from
+    `://` on (whatever precedes it is kept), the mysql rule is a small linear scanner (the first `-p` with a value
+    after each client name within its `\n ; | &` segment; a `\n` may be the blank before `-p`, as before);
+    differential fuzz against the old rules: 0 differences in 2 × 200 000 random command lines. `audit.redact_head(s,
+    limit)` redacts only a 2 × limit + 64 window (secret-value mask 16 KiB further, so a value straddling the cut is
+    masked whole; the word cut by the window is dropped, never half-shown); `_short`, proc.list and job display use
+    it. `SecretStore.mask`: `str.find` per value + union of overlapping occurrences (the regex alternation re-compared
+    a long value at every position). Before → after: `redact_params` with a 200 KB value `'a1'*` 13.9 s → 0.4 ms,
+    `'KEY'*` 105.6 s → 0.3 ms; whole-text `redact_text` on 1 MB adversarial inputs (43 shapes) ≤ ~0.3 s, linear
+    (20 KB `'--key'*` was 2.2 s); `mask` of 1 MB `'A'` with a value `'A'*16383+'B'` 49.9 s → 0.03 s.
+A4-2. **proc.list / job display froze on a huge argv (HIGH):** `_cmd_text` and `display_command` redacted the
+    full command before cutting it to 300 / 200 chars; now `redact_head`. The proc.list `filter` (matched against
+    the redacted command line so `total` is no secret oracle) now sees the name + the first 4 KiB
+    (`system.FILTER_MAX`). A 1 MB argv: ~100 s (`'KEY'*` shape) → < 1 ms per process.
+A4-4. **Polynomial fs.search regexes (HIGH):** (a) regex matching runs only in the new `_regexworker` child:
+    `python -I -c WORKER_SOURCE` (stdlib only, never imports hive, no cwd/PYTHONPATH/user site), 4-byte length +
+    ASCII JSON frames over pipes, header `{pattern, flags, alarm_s}` then `{"lines": […]}` batches (≤ 1 MiB / 8192
+    lines) → `{"hits": [i…]}`; a watchdog thread kills it at the call deadline or on cancel (POSIX: plus
+    `signal.alarm` in the child, default action, so an orphan dies too); fs.search returns partial results
+    `truncated:true, reason:"timeout"` (`"regex_worker_failed"` for any other death); the pattern is still compiled
+    in the node by `check_regex` (validation only, never matched); literal search unchanged. (b) `check_regex` also
+    refuses adjacent unbounded quantifiers over overlapping characters (only optional items between: `A*A*c`,
+    `\w+\d+`, `.*\s*x`, `(?i)a*A*b`) and chains of three unbounded quantifiers joined by atoms all of them can consume
+    (`.*a.*a.*c`), analysed on the `re` parser tree (`re._parser`, `sre_parse` on 3.9/3.10) with a sample alphabet;
+    common patterns (`.*foo.*`, `a.*b.*c`, `\w+\s*=\s*\w+`, `def \w+\(.*\)`) still pass; `ignore_case` is passed as
+    flags. (c) Regex mode matches the first 1 KiB of a line (was 2 KiB; catalog `cut` text updated). (d) Service
+    `ready_pattern` is matched per new log line (first 1 KiB) in the same worker with a 5 s limit, and only when the
+    log grew since the last check (was `rx.search` over up to 1 MiB in the node). Audit example `A*A*A*A*c` on a
+    250-char line: 19.9 s frozen → refused (`bad_request`); with the check bypassed (test) the child is killed at the
+    deadline and a ticker thread in the node keeps running throughout; a worker round trip costs ~15 ms.
+    Note: the code of this item landed inside the concurrent commit 0ccfb7e (another agent's commit picked up the
+    files); its tests are in 7c82465.
+A4-5. **btime FIFO at a predictable shared path (HIGH):** `_stable_btime` now writes only to private per-user
+    directories (`$XDG_RUNTIME_DIR` when it is ours and not group/other-writable, else `<passwd home>/.hive/run` —
+    the account's home, not `$HOME`, so a job env cannot split it — else `$HIVE_HOME/run`; created 0700), reads with
+    `O_NONBLOCK | O_NOFOLLOW | O_NOCTTY` and accepts only a regular file owned by this uid with no group/other bits;
+    files of earlier boots are pruned. The pre-round-4 locations (`/dev/shm`, temp dir) are read once, with the same
+    checks, so a node upgraded mid-boot keeps the value its older processes used (then copied to the private dir);
+    they are never written. Before: a FIFO planted at `/dev/shm/hive-btime-<uid>-<boot_id>` blocked every Hive
+    process at startup; after: ignored (test with FIFOs in the shared and in the private dir).
+A4-8. **Unbounded model listings (LOW/MEDIUM):** `hfhub.MAX_ENTRIES = 200_000` listing entries in all (every HF page
+    counted before parsing its files; one ModelScope reply) → `too_large` `details.max_entries`, hint naming
+    `net.download` (deviation from the suggested "use include" hint: include/exclude only filter a listing that was
+    already fetched, so they cannot shrink it); only listings of ≤ 20 000 files are cached (`CACHE_MAX_ENTRIES`), so
+    a very large listing that timed out is listed again rather than held.
+A4-sweep. **Other regexes on attacker-controlled text** (every module-level pattern of the package run against
+    adversarial inputs: single/paired characters and the pattern's own literals, plus the inline `re.*` calls
+    reviewed): `presets._DYNAMIC_TEXT_RE` (approval review of a command: `\s*` after a separator rescanned every
+    following newline; 40 k newlines 11 s → 1 MB 0.03 s, `[^\S\n]*`, 0 differences in 300 000 fuzz cases);
+    `policy._HIVE_CMD_RE` in `check_kill` (a local process whose cmdline repeats "hive": 100 KB 18–29 s → 1 MB
+    0.015 s via `_is_hive_cmd`: first start token per line, then a role word after it; 0 fuzz differences);
+    `hfhub.LINK_NEXT_RE` (a mirror's `Link` header of 64 KiB of `<`: 16.9 s → < 1 ms, `<([^<>]{1,8192})>`);
+    `_download` `filename*=` (65 KB header 1.0 s → 7 ms; that one ran in the `_download` child). Not changed: owner
+    `command_allow`/`command_deny` regexes (owner-written; SECURITY limit added), local tool output parsers
+    (doctor, sysinfo, gpu), catalog schema patterns (checked: linear).
+    Tests (`tests/test_audit4_regex.py`, 24): every redaction entry point on 1 MB (whole-text `redact_text` on
+    256 KB) adversarial inputs with generous bounds (0.5–1 s; the old code took minutes to hours), redact_head
+    cut/straddle cases and rule goldens, mask on 1 MB and union semantics, check_regex reject/accept tables, worker
+    matching / kill at deadline with a responsive parent / cancel, fs.search never matching in-process (patched
+    `re.compile`) and killing a bypassed `A*A*A*A*c`, `ready_pattern` via the worker, btime FIFOs and private dirs,
+    listing caps and cache limit, the swept regexes on 1 MB.

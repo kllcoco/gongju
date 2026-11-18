@@ -73,7 +73,7 @@ _SECRET_WORDS = r"(?:key|token|secret|passw(?:or)?d|passwd|auth|cred|cookie|bear
 # proved it contains a secret word; nothing can backtrack into the word (the old ``X*KEY X*`` forms were quadratic).
 _FLAG_RE = re.compile(r"(?i)(?<![\w-])(?=--?[A-Za-z0-9_-]*?" + _SECRET_WORDS + r")(?=(--?[A-Za-z0-9_-]*))\1"
                       r"(=|[ \t]+)(\"[^\"]*\"|'[^']*'|[^\s\"']+)")
-_FLAG_WORD_RE = re.compile(r"(?i)(?=--?[A-Za-z0-9_-]*?" + _SECRET_WORDS + r")(?=(--?[A-Za-z0-9_-]*))\1\n?\Z")
+_FLAG_WORD_RE = re.compile(r"(?i)(?<![\w-])(?=--?[A-Za-z0-9_-]*?" + _SECRET_WORDS + r")(?=(--?[A-Za-z0-9_-]*))\1\n?\Z")
 _MYSQL_WORD = re.compile(r"(?i)\b(?:mysql|mysqldump|mysqladmin|mariadb|psql)\b")
 _MYSQL_P = re.compile(r"(?i)\s-p")
 _MYSQL_VALUE = re.compile(r"[ \t]*([^\s-]\S*)")
