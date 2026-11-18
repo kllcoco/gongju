@@ -94,6 +94,15 @@ DEFAULT_EXEC_PATHS: Tuple[str, ...] = (
     "~/.vimrc", "~/.config/nvim/**", "~/.ipython/**/startup/**", "~/.jupyter/**", "**/etc/conda/activate.d/**",
     "**/.vscode/tasks.json", "**/.envrc", "~/AppData/Local/Programs/**", "~/AppData/**/*.exe", "~/AppData/**/*.dll",
     "~/Applications/**",
+    # v8.1 (external review): more autoruns a gated token could plant (sourced rc folders, login/session scripts,
+    # Jupyter kernel specs, editor/terminal/WM configs that run commands, VCS and package-manager hooks)
+    "~/.local/share/jupyter/**", "~/Library/Jupyter/**", "~/AppData/Roaming/jupyter/**", "~/.bashrc.d/**",
+    "~/.zshrc.d/**", "~/.zlogout", "~/.oh-my-zsh/custom/**", "~/.xsession", "~/.pam_environment",
+    "~/.config/plasma-workspace/**", "~/.kde*/Autostart/**", "~/.kde*/env/**", "~/.config/i3/**",
+    "~/.config/sway/**", "~/.config/hypr/**", "~/.Rprofile", "~/.Renviron", "~/.gdbinit", "~/.emacs",
+    "~/.emacs.d/**", "~/.config/emacs/**", "~/.vim/**", "~/.tmux.conf", "~/.config/tmux/**", "~/.wezterm.lua",
+    "~/.config/wezterm/**", "~/.hgrc", "**/.hg/hgrc", "**/.yarnrc.yml", "~/.config/direnv/**",
+    "~/.config/systemd/*.conf", "~/.config/systemd/*.conf.d/**",
 )
 
 DEFAULT_COMMAND_DENY: Tuple[str, ...] = (

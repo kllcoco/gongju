@@ -166,6 +166,16 @@ class _Closed(Exception):
     pass
 
 
+# v8.1 (external review): a Host header is host[:port] only: a name, an IPv4 address or a bracketed IPv6 literal,
+# then optionally ``:`` and 1-5 digits; anything else (``localhost:7700@evil.com``, spaces, a bare IPv6) is 400
+_HOST_RE = re.compile(r"(?:\[[0-9A-Fa-f:.]+(?:%[A-Za-z0-9._~-]+)?\]|[A-Za-z0-9_](?:[A-Za-z0-9._-]*))(?::[0-9]{1,5})?")
+
+
+def valid_host_header(host: str) -> bool:
+    """Strict ``host[:digits]`` form of a Host header value (bracketed IPv6 allowed)."""
+    return isinstance(host, str) and bool(_HOST_RE.fullmatch(host.strip()))
+
+
 def _strip_port(host: str) -> str:
     h = (host or "").strip().lower()
     if h.startswith("["):
@@ -621,6 +631,8 @@ class ApiServer:
                 from .errors import not_found
                 raise _Reject(404, not_found(f"no route for {method} {path}"))
             # transport and proxy rules
+            if "host" in headers and not valid_host_header(headers.get("host", "")):
+                raise _Reject(400, bad_request("invalid Host header", hint="send Host as name[:port]"))
             client_ip, proxied = self._client(peer, local_ip, server, headers, route)
             api = headers.get("x-hive-api")
             if api is not None and api.strip() != str(API_VERSION):

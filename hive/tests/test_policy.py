@@ -291,7 +291,23 @@ class TestDenyWrite(Base):
              "~/.config/nvim/init.lua", "~/proj/.envrc", "~/proj/.vscode/tasks.json",
              "~/.ipython/profile_default/startup/a.py", "~/AppData/Local/Programs/Ollama/ollama app.exe",
              "~/AppData/Roaming/x/y.dll", "~/Applications/X.app/Contents/MacOS/x", "~/.config/autostart/x.desktop",
-             "~/x/lib.pth", "~/.gitconfig"]
+             "~/x/lib.pth", "~/.gitconfig",
+             # v8.1 external review (audit finding 4): every path the audit planted with a cautious operator token
+             "~/.local/share/jupyter/kernels/python3/kernel.json", "~/.bashrc.d/x.sh", "~/.xsession",
+             "~/.config/plasma-workspace/env/x.sh", "~/.kde/Autostart/x.sh", "~/.kde4/Autostart/x.sh",
+             "~/.oh-my-zsh/custom/x.zsh", "~/.pam_environment", "~/.Rprofile", "~/.gdbinit", "~/.emacs.d/init.el",
+             "~/.emacs", "~/.config/emacs/init.el", "~/.tmux.conf", "~/.wezterm.lua", "~/.config/wezterm/w.lua",
+             "~/.config/i3/config", "~/.config/sway/config", "~/.config/hypr/hyprland.conf", "~/.hgrc",
+             "~/proj/.yarnrc.yml", "~/.yarnrc.yml", "~/.config/direnv/direnvrc", "~/.config/systemd/user.conf",
+             "~/.zshrc.d/a.zsh", "~/Library/Jupyter/kernels/k/kernel.json",
+             "~/AppData/Roaming/jupyter/kernels/k/kernel.json", "~/proj/.hg/hgrc", "~/.vim/plugin/x.vim"]
+
+    def test_v81_exec_paths_not_overbroad(self):
+        pol = build_policy(self.fh)
+        for p in ("~/.config/systemd/notes.txt", "~/proj/yarnrc.yml", "~/.local/share/other/x", "~/kde/x.sh",
+                  "~/.config/i3x/config"):
+            with self.subTest(p=p):
+                eff(pol, FILES).resolve_path(p, write=True)
 
     def test_exec_paths_for_files_token(self):
         pol = build_policy(self.fh)

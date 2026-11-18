@@ -204,6 +204,21 @@ class TestBasics(Base):
         st, _, b = http(u + "/v1/echo", token=T["agent"], headers={"X-Hive-Api": "2"})
         self.assertEqual((st, b["error"]["message"]), (400, "api mismatch"))
 
+    def test_v81_strict_host_header(self):
+        # audit finding 6: "localhost:7700@evil.com" was read as "localhost"; now only host[:digits] is accepted
+        u = self.s.url
+        for bad in ("localhost:7700@evil.com", "localhost:x", "localhost:", "localhost:123456", "local host",
+                    "::1", "[::1", "localhost/evil", "user@localhost", "-localhost", "localhost:80:80"):
+            with self.subTest(host=bad):
+                st, _, b = http(u + "/v1/echo", token=T["agent"], headers={"Host": bad})
+                self.assertEqual((st, b["error"]["message"]), (400, "invalid Host header"))
+        for good in ("localhost", "localhost:7701", "127.0.0.1:7701", "[::1]:7701", "[::1]", "LOCALHOST.:9"):
+            with self.subTest(host=good):
+                self.assertTrue(httpserver.valid_host_header(good))
+        self.assertEqual(http(u + "/v1/echo", token=T["agent"], headers={"Host": "[::1]:7701"})[0], 200)
+        self.assertFalse(httpserver.valid_host_header("[fe80::1%eth0]:80@x"))
+        self.assertTrue(httpserver.valid_host_header("[fe80::1%eth0]:80"))
+
     def test_route_options_and_modes(self):
         u = self.s.url
         self.assertEqual(http(u + "/v1/post", token=T["agent"])[0], 405)
