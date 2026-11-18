@@ -107,7 +107,8 @@ DEFAULT_EXEC_PATHS: Tuple[str, ...] = (
     # terminal and window-manager configs that name the program to start, REPL startup files, editor extensions and
     # the pyvenv.cfg of any venv (its home= key picks the interpreter)
     "~/.cargo/**", "~/.rustup/**", "~/go/bin/**", "~/.bun/**", "~/.deno/**", "~/.npm-global/**", "~/.nvm/**",
-    "~/.volta/**", "~/.local/share/pnpm/**", "~/.pyenv/**", "~/.rbenv/**", "~/.sdkman/**", "~/*conda*/**",
+    "~/.volta/**", "~/.local/share/pnpm/**", "~/.pyenv/**", "~/.rbenv/**", "~/.sdkman/**", "~/miniconda*/**",
+    "~/anaconda*/**", "~/miniforge*/**", "~/mambaforge*/**", "~/.conda/**",
     "~/.oh-my-zsh/**", "~/.config/zsh/**", "~/.zsh/**", "~/.config/starship.toml", "~/.tcshrc", "~/.cshrc",
     "~/.login", "~/.kshrc", "~/.xonshrc", "~/.config/xonsh/**", "~/.config/nushell/**",
     "~/.config/alacritty/**", "~/.alacritty.toml", "~/.alacritty.yml", "~/.config/kitty/**", "~/.config/foot/**",

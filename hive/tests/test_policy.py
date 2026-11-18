@@ -303,7 +303,7 @@ class TestDenyWrite(Base):
              "~/AppData/Roaming/jupyter/kernels/k/kernel.json", "~/proj/.hg/hgrc", "~/.vim/plugin/x.vim",
              # v8.1 external review, round 2 (exec-path denylist): PATH dirs, sourced files, terminal/WM/REPL configs
              "~/.cargo/bin/ls", "~/.cargo/env", "~/go/bin/x", "~/.bun/bin/x", "~/.deno/bin/x", "~/.npm-global/bin/x",
-             "~/.pyenv/shims/python", "~/miniconda3/bin/python", "~/anaconda3/bin/x", "~/.nvm/nvm.sh",
+             "~/.pyenv/shims/python", "~/miniconda3/bin/python", "~/anaconda3/bin/x", "~/miniforge3/bin/x", "~/.conda/envs/a/bin/x", "~/.nvm/nvm.sh",
              "~/.oh-my-zsh/oh-my-zsh.sh", "~/.oh-my-zsh/tools/x.sh", "~/.config/zsh/.zshrc", "~/.zsh/x.zsh",
              "~/.config/starship.toml", "~/.tcshrc", "~/.cshrc", "~/.kshrc", "~/.xonshrc", "~/.config/nushell/config.nu",
              "~/.config/alacritty/alacritty.toml", "~/.config/kitty/kitty.conf", "~/.config/foot/foot.ini",

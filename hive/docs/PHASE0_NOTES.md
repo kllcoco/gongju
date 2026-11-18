@@ -1692,7 +1692,8 @@ R2-2. **cd detection (major; `presets.text_may_change_cwd`):** for shell strings
     text. `Hub._split` returns the 3-tuple and drops words either reading moved. DESIGN §5.6.
 R2-3. **Exec paths (major; `policy.DEFAULT_EXEC_PATHS`):** toolchain homes (`~/.cargo/**`, `~/.rustup/**`,
     `~/go/bin/**`, `~/.bun/**`, `~/.deno/**`, `~/.npm-global/**`, `~/.nvm/**`, `~/.volta/**`, `~/.local/share/pnpm/**`,
-    `~/.pyenv/**`, `~/.rbenv/**`, `~/.sdkman/**`, `~/*conda*/**`), `~/.oh-my-zsh/**`, zsh/tcsh/csh/ksh/xonsh/nushell
+    `~/.pyenv/**`, `~/.rbenv/**`, `~/.sdkman/**`, `~/miniconda*/**`, `~/anaconda*/**`, `~/miniforge*/**`,
+    `~/mambaforge*/**`, `~/.conda/**`; a `*` in these patterns also crosses `/`, so no `~/*conda*/**`), `~/.oh-my-zsh/**`, zsh/tcsh/csh/ksh/xonsh/nushell
     startup files, starship, terminal configs (alacritty, kitty, foot, ghostty, konsole), WM autostarts (openbox,
     labwc, river, bspwm/sxhkd, awesome, qtile, niri, herbstluftwm, xmonad, xfce4 xinitrc, lxsession), REPL rc files
     (julia, octave, ghci, irb, pry, psql, sqlite, lldb), `~/.mailcap`, VS Code extensions, `**/pyvenv.cfg`. The generic
