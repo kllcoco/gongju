@@ -192,10 +192,14 @@ def atomic_write_bytes(path: "os.PathLike[str] | str", data: bytes, private: boo
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(p.parent))
     try:
         with os.fdopen(fd, "wb") as f:
+            if private and not IS_WINDOWS:
+                # Phase 2: chmod through the fd (mkstemp already gives 0600); a path-based chmod raced a concurrent
+                # removal of the parent dir (job record removed during _save) and logged a spurious warning
+                os.fchmod(f.fileno(), 0o600)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        if private:
+        if private and IS_WINDOWS:
             secure_file(tmp)
         replace_with_retry(tmp, p)
     except BaseException:
