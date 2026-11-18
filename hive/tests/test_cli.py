@@ -268,9 +268,9 @@ class TestMisc(CliCase):
         from hive import __version__
         self.assertEqual(run(["version"])[1].strip(), f"hive {__version__}")
         self.assertEqual(run(["--version"])[1].strip(), f"hive {__version__}")
-        code, out, err = run(["gateway", "url", "a", "b"])
+        code, out, err = run(["gateway", "url", "a", "b"])       # WP6b: no hub config here
         self.assertEqual(code, 2)
-        self.assertIn("WP6b", err)
+        self.assertIn("no hub config", err)
         self.assertEqual(run([])[0], 2)
         self.assertEqual(run(["bogus"])[0], 2)
 
