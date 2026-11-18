@@ -41,6 +41,7 @@ GIB = 1 << 30
 IS_WINDOWS = sys.platform == "win32"
 CASEFOLD_DEFAULT = IS_WINDOWS or sys.platform == "darwin"
 PART_SUFFIX = ".hive-part"
+SYMLINK = "target is a symbolic link"
 MANIFEST = ".hive-pull.json"
 
 
@@ -342,7 +343,9 @@ def choose_name(headers: Dict[str, str], url: str) -> str:
             raw = unquote(urlsplit(url).path.rsplit("/", 1)[-1])
         except ValueError:
             raw = ""
-    base = re.split(r"[/\\]", raw or "")[-1].strip()
+    if raw and re.search(r"[/\\]", raw):      # a server-sent path ("../x", "a/b") never picks a name
+        return "download.bin"
+    base = (raw or "").strip()
     name = util.safe_remote_name(base) if base else None
     if not name or name.startswith(".") or "/" in name:
         return "download.bin"
@@ -354,7 +357,7 @@ def _name_allowed(directory: str, target: str, deny: List[str], casefold: bool) 
     if os.path.normcase(os.path.realpath(os.path.dirname(target))) != os.path.normcase(directory):
         return "name leaves the folder"
     if os.path.islink(target):
-        return "target is a symbolic link"
+        return SYMLINK
     if util.match_deny(deny, util.path_key(target, casefold=casefold)):
         return "name denied by policy"
     return None
@@ -376,9 +379,9 @@ def _publish_exclusive(part: Path, directory: str, name: str, deny: List[str], c
     for cand in _candidates(name):
         target = os.path.join(directory, cand)
         why = _name_allowed(directory, target, deny, casefold)
+        if why == SYMLINK:
+            continue
         if why is not None:
-            if os.path.lexists(target):
-                continue
             raise Failure(f"{why}: {cand}", EXIT_NAME)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
         try:
@@ -421,6 +424,13 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
         dest = None
         part = Path(directory) / (".hive-download-" + os.path.basename(os.getcwd())[-16:] + PART_SUFFIX)
         resume = resume and part.exists()
+    name_check: Optional[Callable[[Dict[str, str]], None]] = None
+    if directory is not None:
+        def name_check(rh: Dict[str, str]) -> None:
+            name = choose_name(rh, url)
+            why = _name_allowed(str(directory), os.path.join(str(directory), name), deny, casefold)
+            if why is not None and why != SYMLINK:
+                raise Failure(f"{why}: {name}", EXIT_NAME)
     progress = Progress(0)
     progress.note = url.rsplit("/", 1)[-1][:80]
     progress.start()
@@ -429,7 +439,8 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
         while True:
             try:
                 h, size, rh, final = _fetch_checked(url, part, guard=guard, auth=auth, headers=headers,
-                                                     resume=resume, progress=progress, stop=stop)
+                                                     resume=resume, progress=progress, stop=stop,
+                                                     name_check=name_check)
                 break
             except Stopped:
                 raise
@@ -468,13 +479,18 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
 
 
 def _fetch_checked(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec], headers: Dict[str, str],
-                   resume: bool, progress: Progress, stop: threading.Event) -> Tuple[Any, int, Dict[str, str], str]:
-    """One attempt; the free-space check runs against Content-Length before the first byte is written."""
+                   resume: bool, progress: Progress, stop: threading.Event,
+                   name_check: Optional[Callable[[Dict[str, str]], None]] = None
+                   ) -> Tuple[Any, int, Dict[str, str], str]:
+    """One attempt; the server-chosen name and the free-space check (against Content-Length) are checked before
+    the first byte is written."""
     with progress.lock:
         progress.done = 0
         progress.downloaded = 0
 
-    def check(start: int, remaining: int, _rh: Dict[str, str]) -> None:
+    def check(start: int, remaining: int, rh: Dict[str, str]) -> None:
+        if name_check is not None:
+            name_check(rh)
         if remaining < 0:
             return
         with progress.lock:
@@ -491,6 +507,13 @@ def _fetch_checked(url: str, part: Path, *, guard: Any, auth: Optional[netutil.A
             part.unlink()
         return _fetch(url, part, guard=guard, auth=auth, headers=headers, resume=False, max_size=None,
                       hasher_factory=hashlib.sha256, progress=progress, stop=stop, on_headers=check)
+    except BaseException:
+        if name_check is not None and part.exists():     # dir mode: the hidden part is never resumed
+            try:
+                part.unlink()
+            except OSError:
+                pass
+        raise
 
 
 # ---------------------------------------------------------------------------------------------------------------

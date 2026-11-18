@@ -494,12 +494,16 @@ def _read_head(sock: socket.socket, deadline: float) -> bytes:
         if not peek:
             raise ConnectionError("the proxy closed the connection")
         end = (buf + peek).find(b"\r\n\r\n")
-        if end >= 0:
-            take = end + 4 - len(buf)
-            buf += sock.recv(take)
-            return buf
-        if len(buf) + len(peek) > MAX_CONNECT_HEADER:
+        if end + 4 > MAX_CONNECT_HEADER or (end < 0 and len(buf) + len(peek) > MAX_CONNECT_HEADER):
             raise ValueError("oversized proxy response")
+        if end >= 0:
+            want = end + 4
+            while len(buf) < want:
+                b = sock.recv(want - len(buf))
+                if not b:
+                    raise ConnectionError("the proxy closed the connection")
+                buf += b
+            return buf
         buf += sock.recv(len(peek))
 
 
