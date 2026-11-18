@@ -1,5 +1,5 @@
-"""Action handlers: model.endpoints, model.chat (design §9.9, WP3a). model.pull and model.forward (gateway relay
-path) arrive with WP3b (``PENDING_ACTIONS``).
+"""Action handlers: model.endpoints, model.chat (WP3a), model.forward (gateway relay path) and model.pull (WP3b)
+(design §9.9).
 
 Every HTTP request goes through ``netutil.guarded_request`` with ``guard=ctx.policy`` (NetGuard + rule 5a/5c for
 ``purpose="model"``); ``api_key_env`` credentials come only from a service definition or the owner's
@@ -8,17 +8,22 @@ and never import other action modules (§22.3 rule 2).
 """
 from __future__ import annotations
 
+import fnmatch
 import json
+import os
+import re
+import shutil
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
-from .. import fsops, netutil, util
-from ..errors import HiveError, bad_request, not_found, unavailable
+from .. import fsops, hfhub, netutil, util
+from ..errors import (HiveError, bad_request, conflict, denied, forbidden, internal, not_found, rate_limited,
+                      timeout, too_large, unavailable, unsupported)
 from . import ActionContext, handler
 
-PENDING_ACTIONS = ("model.pull", "model.forward")      # WP3b (§22.1); the handlers gate test skips them until then
 PROBE_PORTS = (11434, 8000, 8080, 30000, 1234, 5000, 7860)
 PROBE_TIMEOUT = 0.5
 KNOWN_TIMEOUT = 2.0
@@ -474,4 +479,470 @@ def model_chat(ctx: ActionContext, p: dict) -> dict:
             "base_url": base}
 
 
-__all__ = ["model_endpoints", "model_chat", "list_endpoints", "parse_base_url", "PENDING_ACTIONS"]
+# ---------------------------------------------------------------------------------------------------------------
+# model.forward (gateway relay path, §8.7 / §9.9)
+
+FORWARD_PATHS = ("models", "chat/completions", "completions", "embeddings")
+
+
+@handler("model.forward")
+def model_forward(ctx: ActionContext, p: dict) -> dict:
+    """Forward one OpenAI-compatible call to a model service on this node (never streams)."""
+    service, path = str(p["service"]), str(p["path"])
+    if path not in FORWARD_PATHS:
+        raise bad_request(f"path must be one of {', '.join(FORWARD_PATHS)}")
+    lim = ctx.policy.limits
+    payload: Optional[bytes] = None
+    obj: Optional[Dict[str, Any]] = None
+    wanted_stream = False
+    raw = p.get("body")
+    if path != "models":
+        if raw is None or not str(raw).strip():
+            raise bad_request(f"body is required for {path}", hint="send the request object as JSON text")
+        data = str(raw).encode("utf-8")
+        cap = int(getattr(lim, "gateway_max_body_bytes", 8388608))
+        if len(data) > cap:
+            raise too_large(f"request body is {len(data)} bytes; the limit is {cap}",
+                            hint="shorten the request (gateway.max_body_bytes)", limit=cap)
+        try:
+            obj = json.loads(data.decode("utf-8"))
+        except ValueError as e:
+            raise bad_request(f"body is not valid JSON: {e}")
+        if not isinstance(obj, dict):
+            raise bad_request("body must be a JSON object")
+        if not fsops.json_depth_ok(obj, 64):
+            raise bad_request("body nests deeper than 64 levels")
+        wanted_stream = bool(obj.get("stream"))
+        if wanted_stream:
+            obj["stream"] = False            # SSE synthesis is the gateway's job (§8.7)
+        obj.pop("stream_options", None)      # vLLM/SGLang reject it without streaming (v5)
+        payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    try:
+        base, api, auth = _endpoint_for(ctx, service)
+    except HiveError as e:
+        if e.code == "not_found":
+            raise not_found(e.message, hint="define the service with a preset or set endpoint",
+                            **{k: v for k, v in e.details.items() if k != "hint"})
+        raise
+    if api == "ollama" and not urlsplit(base).path.rstrip("/").endswith("/v1"):
+        base = _join(base, "v1")
+    base = base.rstrip("/")
+    url = _join(base, path)
+    max_bytes = max(1024, min(int(getattr(lim, "gateway_max_response_bytes", 67108864)),
+                              int(getattr(lim, "max_result_bytes", 33554432)) - 65536))
+    budget = max(1.0, min(float(p.get("timeout", 300)), ctx.remaining() - 1.0))
+    method = "GET" if path == "models" else "POST"
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    try:
+        r = netutil.guarded_request(method, url, guard=ctx.policy, purpose="model", headers=headers, body=payload,
+                                    timeout=budget, max_bytes=max_bytes, follow_redirects=False, auth=auth,
+                                    cancel=ctx.cancel)
+    except HiveError as e:
+        if e.code == "unavailable" and e.details.get("reason") == "connect" and e.details.get("maybe_executed") \
+                is False:
+            raise unavailable(f"cannot connect to the model server at {base}", reason="connect",
+                              maybe_executed=False, hint=f"nothing listening on {base}; check service_status")
+        raise
+    _audit_route(ctx, r)
+    ctx.audit_extra.update(service=service, path=path, status=r.status, bytes_out=len(r.body))
+    if obj is not None:
+        if obj.get("model") is not None:
+            ctx.audit_extra["model"] = str(obj.get("model"))[:200]
+        ctx.audit_extra["stream"] = wanted_stream
+    if not r.truncated and 200 <= r.status < 300 and path != "models":
+        reply = _json(r.body)
+        if isinstance(reply, dict) and isinstance(reply.get("usage"), dict):
+            u = reply["usage"]
+            ctx.audit_extra["usage"] = {k: u.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                                        if k in u}
+    ct = None
+    for k, v in r.headers.items():
+        if k.lower() == "content-type":
+            ct = str(v)
+    return {"status": r.status, "content_type": ct, "body": r.body.decode("utf-8", "replace"),
+            "truncated": bool(r.truncated), "elapsed_s": r.elapsed_s}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# model.pull (D36, §9.9 / §11.3 pull mode / §11.5)
+
+_PULL_LOCK = threading.Lock()        # v5: busy check + start_job in one step
+REVISION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+PICKLE_EXT = (".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle")
+GIB = 1 << 30
+AUTO_TOKENS = {"huggingface": ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"), "modelscope": ("MODELSCOPE_API_TOKEN",)}
+INCLUDE_HINT = "use include, e.g. ['*.safetensors','*.json','tokenizer*']"
+MANIFEST = ".hive-pull.json"
+LOCK_NAME = ".hive-pull.lock"
+PART_SUFFIX = ".hive-part"
+LISTING_HINT = "listing still in progress; call again (cached) or narrow include"
+
+
+def _node_name(ctx: ActionContext) -> str:
+    return str(getattr(ctx.rt, "name", None) or "the node")
+
+
+def _models_cfg(ctx: ActionContext) -> Any:
+    cfg = getattr(getattr(ctx.rt, "config", None), "models", None)
+    if cfg is not None:
+        return cfg
+    return {"hf_endpoint": getattr(getattr(ctx.policy, "p", None), "hf_endpoint", None)}
+
+
+def _unbound_hint(ctx: ActionContext, name: str, host: str) -> str:
+    return (f"{name} exists on {_node_name(ctx)} but is not bound to {host}: hive node secret set {name} --hosts "
+            f"+{host} (pods: HIVE_SECRET_HOSTS_{name}=+{host})")
+
+
+def _pull_auth(ctx: ActionContext, source: str, endpoint: str, auth_env: str
+               ) -> Tuple[Optional[netutil.AuthSpec], Optional[str]]:
+    """(token AuthSpec or None, unbound note) per the ``auth_env`` rules of §9.9."""
+    u = urlsplit(endpoint)
+    host, scheme = (u.hostname or "").lower(), (u.scheme or "https").lower()
+    if auth_env == "none":
+        return None, None
+    if auth_env == "auto":
+        note = None
+        for name in AUTO_TOKENS[source]:
+            try:
+                spec = ctx.policy.auth_spec(name)
+            except HiveError:
+                continue
+            if netutil.auth_host_allowed(spec.hosts, host, scheme):
+                return spec, None
+            note = note or _unbound_hint(ctx, name, host)
+        return None, note
+    spec = ctx.policy.auth_spec(auth_env)
+    if not netutil.auth_host_allowed(spec.hosts, host, scheme):
+        raise denied(f"secret '{auth_env}' is not bound to {host}", rule="secret_host",
+                     hint=f"hive node secret set {auth_env} --hosts +{host}")
+    return spec, None
+
+
+def _pkey(ctx: ActionContext, path: Any) -> str:
+    try:
+        return ctx.policy.path_key(str(path))
+    except Exception:  # noqa: BLE001
+        return util.path_key(os.path.realpath(str(path)), casefold=os.name == "nt")
+
+
+def _under(key: str, base: str) -> bool:
+    return key == base or key.startswith(base.rstrip("/") + "/")
+
+
+def _refuse_target(ctx: ActionContext, target: Path) -> None:
+    """Target folder refused when it is a filesystem root, home, the workdir, an fs root, the data dir, or an
+    ancestor of any of these (§9.9 step 1)."""
+    real = os.path.realpath(str(target))
+    if os.path.dirname(real) == real:
+        raise denied("cannot pull into a filesystem or drive root", rule="protected_path",
+                     hint="pick a folder below the root, e.g. ~/models/<name>")
+    key = _pkey(ctx, real)
+    prot: List[Tuple[str, str]] = [(os.path.expanduser("~"), "the home folder")]
+    if getattr(ctx.policy, "workdir", None) is not None:
+        prot.append((str(ctx.policy.workdir), "the node workdir"))
+    if getattr(ctx.rt, "data_dir", None) is not None:
+        prot.append((str(ctx.rt.data_dir), "the node data folder"))
+    try:
+        for r in ctx.policy.roots():
+            if r.get("path") not in (None, "*"):
+                prot.append((os.path.expanduser(str(r["path"])), "an fs root"))
+    except Exception:  # noqa: BLE001
+        pass
+    for path, label in prot:
+        if _under(_pkey(ctx, path), key):
+            raise denied(f"cannot pull into '{real}': it is (or contains) {label}", rule="protected_path",
+                         hint="pick a dedicated folder, e.g. ~/models/<Org>--<Name>")
+
+
+def _busy(ctx: ActionContext, target: Path, key: str) -> Optional[str]:
+    """Job id of a running pull into ``target`` (folder lock holder or job tag), else None."""
+    h = util.FileLock(str(target / LOCK_NAME)).holder()
+    if h is not None:
+        return str(h.get("note") or "") or "unknown"
+    jm = getattr(ctx.rt, "jobs", None)
+    if jm is not None and hasattr(jm, "list"):
+        try:
+            rows = jm.list(state="running", limit=10000).get("jobs") or []
+        except Exception:  # noqa: BLE001
+            rows = []
+        for row in rows:
+            if row.get("kind") != "pull":
+                continue
+            try:
+                tags = jm.record(row["job_id"]).get("tags") or []
+            except Exception:  # noqa: BLE001
+                tags = []
+            if f"target:{key}" in tags:
+                return str(row["job_id"])
+    return None
+
+
+def _check_busy(ctx: ActionContext, target: Path, key: str) -> None:
+    jid = _busy(ctx, target, key)
+    if jid:
+        raise conflict("another pull into this folder is running", job_id=jid,
+                       hint=f"follow it with job_status({jid!r}) or stop it with job_stop")
+
+
+def _check_cap(ctx: ActionContext) -> None:
+    jm = getattr(ctx.rt, "jobs", None)
+    cap = int(getattr(ctx.policy.limits, "max_concurrent_pulls", 2) or 2)
+    if jm is not None and hasattr(jm, "running_count") and jm.running_count("pull") >= cap:
+        raise rate_limited(f"{cap} model pulls are already running on this node", retry_after=30.0,
+                           reason="pulls_running", hint="wait for a running pull to finish (job_list)")
+
+
+def _glob(path: str, pats: List[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, g) for g in pats)
+
+
+def _free(path: Path) -> Tuple[int, str]:
+    p = Path(path)
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    try:
+        return int(shutil.disk_usage(str(p)).free), str(p)
+    except OSError:
+        return 0, str(p)
+
+
+def _is_wsl() -> bool:
+    from .. import netproxy
+    return netproxy._is_wsl()
+
+
+def _plan_files(ctx: ActionContext, p: dict, files: List[hfhub.RepoFile]
+                ) -> Tuple[List[hfhub.RepoFile], List[str], List[str]]:
+    """Name check, include/exclude, prefer_safetensors (§9.9 step 4)."""
+    include = [str(g) for g in p.get("include") or []]
+    exclude = [str(g) for g in p.get("exclude") or []]
+    invalid: List[str] = []
+    kept: List[hfhub.RepoFile] = []
+    for f in files:
+        if util.safe_remote_name(f.path) != f.path:
+            invalid.append(f.path[:300])
+            continue
+        if include and not _glob(f.path, include):
+            continue
+        if exclude and _glob(f.path, exclude):
+            continue
+        kept.append(f)
+    pickle: List[str] = []
+    if p.get("prefer_safetensors", True) and any(f.path.lower().endswith(".safetensors") for f in kept):
+        out = []
+        for f in kept:
+            if f.path.lower().endswith(PICKLE_EXT) and not (include and _glob(f.path, include)
+                                                             and any(g != "*" for g in include)):
+                pickle.append(f.path)
+                continue
+            out.append(f)
+        kept = out
+    return kept, invalid[:1000], pickle[:1000]
+
+
+def _expected(f: hfhub.RepoFile) -> Optional[str]:
+    if f.sha256:
+        return "sha256:" + f.sha256
+    if f.git_sha1:
+        return "sha1:" + f.git_sha1
+    return None
+
+
+def _start_pull_job(ctx: ActionContext, spec: dict, name: str, tags: List[str]) -> dict:
+    jm = getattr(ctx.rt, "jobs", None)
+    if jm is None or not hasattr(jm, "start_job"):
+        raise internal("the job manager is not available on this node")
+    argv = util.self_command() + ["_download", "--spec", "{run_dir}/download.json"]
+    try:
+        env = ctx.policy.child_env({})
+    except HiveError:
+        env = dict(os.environ)
+    for k in [k for k in env if k.upper().startswith("HIVE_")]:
+        env.pop(k, None)
+    info = jm.start_job(ctx, kind="pull", argv_or_cmdline=argv, shell="none", cwd=Path(str(ctx.policy.workdir)),
+                        env=env, stdin=None, name=name[:64], timeout=0, merge_stderr=True, log_max_bytes=4 << 20,
+                        log_keep=1, tags=tags, command_display="hive _download (pull)",
+                        extra_files={"download.json": util.canonical_json(spec).encode("utf-8")})
+    if info.get("state") == "failed":
+        raise internal(f"the downloader could not start: {info.get('error') or 'unknown error'}",
+                       job_id=info.get("job_id"))
+    return info
+
+
+@handler("model.pull")
+def model_pull(ctx: ActionContext, p: dict) -> dict:
+    """Plan (and unless dry_run, start) a commit-pinned repository snapshot download."""
+    source = str(p.get("source") or "huggingface")
+    repo_type = str(p.get("repo_type") or "model")
+    if source == "modelscope" and repo_type == "dataset":
+        raise unsupported("datasets cannot be pulled from ModelScope", hint="use source='huggingface'")
+    repo, url_rev = hfhub.normalize_repo(str(p["repo"]), source)
+    revision = p.get("revision") or url_rev or ("master" if source == "modelscope" else "main")
+    revision = str(revision)
+    if not REVISION_RE.match(revision) or ".." in revision or "//" in revision:
+        raise bad_request(f"invalid revision {revision[:100]!r}", hint="a branch, tag or commit, e.g. main")
+    dry_run = bool(p.get("dry_run"))
+    endpoint = hfhub.endpoint_for(source, _models_cfg(ctx), os.environ)
+    ep_host = (urlsplit(endpoint).hostname or "").lower()
+    auth, note = _pull_auth(ctx, source, endpoint, str(p.get("auth_env") or "auto"))
+    if not dry_run:
+        _check_cap(ctx)
+    # target folder
+    if p.get("path"):
+        raw_target = str(p["path"])
+    else:
+        mdir = getattr(_models_cfg(ctx), "dir", None) if not isinstance(_models_cfg(ctx), dict) else None
+        raw_target = os.path.join(os.path.expanduser(str(mdir or "~/models")), repo.replace("/", "--"))
+    try:
+        target = ctx.policy.resolve_path(raw_target, write=True)
+    except HiveError as e:
+        if not p.get("path") and e.code == "policy_denied":
+            raise denied(f"the default models folder is not writable here: {e.message}", rule=e.details.get("rule"),
+                         hint="give path=… inside a writable root (models.dir must lie inside an rw root)")
+        raise
+    if target.exists() and not target.is_dir():
+        raise conflict(f"'{target}' exists and is not a folder", hint="pick another path")
+    _refuse_target(ctx, target)
+    tkey = _pkey(ctx, target)
+    _check_busy(ctx, target, tkey)
+    # 2. listing (bounded by the call deadline; cached 10 min)
+    deadline = time.monotonic() + max(0.5, ctx.remaining() - 3.0)
+    try:
+        commit, listed = hfhub.list_repo(source, endpoint, repo, repo_type, revision, guard=ctx.policy, auth=auth,
+                                         deadline=deadline)
+    except HiveError as e:
+        if e.code == "timeout":
+            raise timeout(f"listing {repo} did not finish in time", maybe_executed=False, hint=LISTING_HINT)
+        details = {k: v for k, v in e.details.items() if k != "hint"}
+        if e.code == "forbidden" and e.details.get("gated"):
+            raise forbidden(e.message, hint=note or (
+                f"gated model: accept the license at https://huggingface.co/{repo} with the account whose token is "
+                f"on the node, then ask the owner to run `hive node secret set HF_TOKEN` on {_node_name(ctx)}"),
+                **details)
+        if e.code in ("forbidden", "not_found") and note and auth is None:
+            raise HiveError(e.code, e.message, details, hint=note)
+        raise
+    ctx.audit_extra.update(repo=repo, source=source, commit=commit, endpoint_host=ep_host)
+    # 4. names and filters
+    planned, invalid, pickle = _plan_files(ctx, p, listed)
+    if len(planned) > int(p.get("max_files", 1000)):
+        raise too_large(f"{len(planned)} files match (max_files {int(p.get('max_files', 1000))})", hint=INCLUDE_HINT,
+                        files=len(planned))
+    # 5. existing target
+    manifest: Dict[str, Any] = {}
+    mpath = target / MANIFEST
+    if mpath.is_file():
+        try:
+            m = util.read_json(mpath, None)
+            manifest = m if isinstance(m, dict) else {}
+        except HiveError:
+            manifest = {}
+    same = manifest.get("source") == source and manifest.get("repo") == repo
+    mfiles = manifest.get("files") if same and isinstance(manifest.get("files"), dict) else {}
+    overwrite = bool(p.get("overwrite"))
+    if target.is_dir() and not same and not overwrite:
+        try:
+            entries = [e for e in os.listdir(str(target)) if e not in (LOCK_NAME,)]
+        except OSError:
+            entries = []
+        if entries:
+            raise conflict(f"'{target}' is not empty and holds no pull of {repo}",
+                           hint="pick an empty folder, or pass overwrite=true", entries=sorted(entries)[:10])
+    real_target = os.path.realpath(str(target))
+    unsafe: List[str] = []
+    differ: List[str] = []
+    rows: List[Dict[str, Any]] = []
+    total = 0
+    to_download = 0
+    plan: List[hfhub.RepoFile] = []
+    for f in planned:
+        total += f.size
+        dest = Path(real_target).joinpath(*f.path.split("/"))
+        try:
+            parent_real = os.path.realpath(str(dest.parent))
+            inside = os.path.commonpath([os.path.normcase(parent_real), os.path.normcase(real_target)]) \
+                == os.path.normcase(real_target)
+        except ValueError:
+            inside = False
+        unsafe_why = not inside or dest.is_symlink()
+        if not unsafe_why:
+            try:
+                ctx.policy.resolve_path(str(dest), write=True)
+            except HiveError:
+                unsafe_why = True
+        if unsafe_why:
+            unsafe.append(f.path)
+            continue
+        done = False
+        part = Path(str(dest) + PART_SUFFIX)
+        if dest.exists():
+            size = dest.stat().st_size
+            rec = mfiles.get(f.path) if isinstance(mfiles, dict) else None
+            if size == f.size and isinstance(rec, dict) and rec.get("hash") == _expected(f) \
+                    and int(rec.get("size", -1)) == size:
+                done = True
+            elif size != f.size and not isinstance(rec, dict) and not overwrite:
+                differ.append(f.path)
+        if not done:
+            have = part.stat().st_size if part.is_file() and not part.is_symlink() else 0
+            to_download += max(0, f.size - min(have, f.size))
+        plan.append(f)
+        rows.append({"path": f.path, "size": f.size, "done": done})
+    if differ:
+        raise conflict(f"{len(differ)} existing file(s) in '{target}' differ from the repository",
+                       hint="pass overwrite=true to replace them, or pick another path", paths=differ[:10])
+    free, free_at = _free(target)
+    need = int(to_download * 1.02) + GIB
+    fits = free >= need
+    if dry_run:
+        rows.sort(key=lambda r: -int(r["size"]))
+        out: Dict[str, Any] = {"repo": repo, "source": source, "endpoint": endpoint, "revision": revision,
+                               "commit": commit, "path": str(target), "file_count": len(plan), "total_bytes": total,
+                               "to_download_bytes": to_download, "disk_free": free, "fits": fits,
+                               "files": rows[:200], "skipped_invalid": invalid, "skipped_pickle": pickle}
+        notes = []
+        if note:
+            notes.append(note)
+        if unsafe:
+            notes.append(f"{len(unsafe)} file(s) would be skipped (unsafe destination): {', '.join(unsafe[:5])}")
+        if notes:
+            out["note"] = "; ".join(notes)
+        return out
+    if not fits:
+        details: Dict[str, Any] = {"need": need, "free": free, "path": free_at}
+        if _is_wsl():
+            details["note"] = "free space is the WSL virtual disk; check the Windows drive too"
+        raise too_large(f"not enough disk space: need {util.human_bytes(need)}, {util.human_bytes(free)} free",
+                        hint="exclude files (e.g. include=['*.json','*.safetensors','tokenizer*']) or pick a path on "
+                             "a bigger disk", **details)
+    spec = {"v": 1, "mode": "pull", "net": _pull_guard_dict(ctx),
+            "auth": ({"name": auth.name, "header": auth.header, "value": auth.value, "hosts": list(auth.hosts)}
+                     if auth is not None else None),
+            "source": source, "endpoint": endpoint, "repo": repo, "repo_type": repo_type, "revision": revision,
+            "commit": commit, "target": str(target),
+            "files": [{"path": f.path, "size": f.size, "sha256": f.sha256, "git_sha1": f.git_sha1} for f in plan],
+            "max_parallel": int(p.get("max_parallel", 4)), "verify": str(p.get("verify") or "fast"),
+            "overwrite": overwrite, "lock_file": str(target / LOCK_NAME),
+            "skipped_invalid": invalid, "skipped_pickle": pickle, "skipped_unsafe": unsafe}
+    with _PULL_LOCK:
+        _check_cap(ctx)
+        _check_busy(ctx, target, tkey)
+        target.mkdir(parents=True, exist_ok=True)
+        info = _start_pull_job(ctx, spec, f"pull {repo}", [f"target:{tkey}"])
+    ctx.audit_extra.update(job_id=info.get("job_id"), path=str(target))
+    return {"job_id": info["job_id"], "path": str(target), "commit": commit, "file_count": len(plan),
+            "total_bytes": total, "to_download_bytes": to_download, "state": "running"}
+
+
+def _pull_guard_dict(ctx: ActionContext) -> dict:
+    ng = getattr(ctx.policy, "net_guard", None)
+    to_dict = getattr(ng, "to_dict", None)
+    if not callable(to_dict):
+        raise internal("the node's network guard cannot be handed to the downloader")
+    return to_dict()
+
+
+__all__ = ["model_endpoints", "model_chat", "model_forward", "model_pull", "list_endpoints", "parse_base_url"]

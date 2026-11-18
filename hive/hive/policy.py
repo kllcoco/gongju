@@ -907,6 +907,12 @@ class EffectivePolicy:
                 pats += self._service_code_patterns()
         return pats
 
+    def deny_patterns(self, *, write: bool = True) -> List[str]:
+        """The identity's normalized deny patterns (hard denies, fs.deny; for writes also the hard deny_write and,
+        when gated, fs.deny_write, PATH dirs and service code dirs). WP3b CONTRACT-REQUEST: net.download hands them
+        to the ``_download`` child for server-chosen names (§9.8, §11.3)."""
+        return list(self._active_patterns(write))
+
     def denied_under(self, path: Path, *, write: bool = False, rebase: Optional[Path] = None) -> List[str]:
         """Denied entries in the tree at ``path`` (§5.4 step 8); with ``rebase`` each entry is tested at
         ``rebase/<relative path>`` (fs.move/fs.copy destinations)."""
