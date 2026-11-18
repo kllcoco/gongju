@@ -543,10 +543,11 @@ class TestComposite(unittest.TestCase):
         self.assertIn('Next: fs_transfer(transfer_id="tx_abcdef12")', r.text)
         r = tk.call("fs_transfer", {"transfer_id": "tx_abcdef12", "cancel": True})
         self.assertIn("cancelled", r.text)
-        # the WP5b stub: the tool reports unsupported, never raises
-        r = tools.Toolkit(fake_client()).call("fs_transfer", {"src": "desk:/a", "dst": "pod-a:/b"})
-        self.assertTrue(r.is_error)
-        self.assertIn("unsupported", r.text)
+        # WP5b CONTRACT-REQUEST: the real TransferManager runs the copy in the tool-host process (the fake target
+        # cannot serve fs.read_chunk, so the transfer ends failed); the tool renders its status, never raises
+        r = tools.Toolkit(fake_client(), wait_budget=5).call("fs_transfer", {"src": "desk:/a", "dst": "pod-a:/b"})
+        self.assertIn("transfer tx_", r.text)
+        self.assertNotIn("unsupported", r.text)
 
     def test_dispatch_and_cancel(self):
         t = FakeTarget(kind="node")

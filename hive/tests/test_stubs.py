@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from hive import (auth, dist, fsops, gateway, install, netproxy, netutil, presets, procinfo, proctree, services,
@@ -356,10 +357,11 @@ class TestWp4Wp5Wp6Stubs(unittest.TestCase):
                          ("unsupported", "service install not available yet"))
 
     def test_build_pyz(self):
-        with self.assertRaises(HiveError) as cm:
-            dist.build_pyz()
-        self.assertEqual((cm.exception.code, cm.exception.message), ("unsupported", "pyz build not available yet"))
-        self.assertFalse(dist.self_update(None))
+        # WP5b CONTRACT-REQUEST: build_pyz is real (tests/test_dist.py); self_update without a node config or with
+        # relay.auto_update false makes no request and returns False
+        self.assertTrue(dist.build_pyz().startswith(b"#!"))
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HIVE_HOME": d}):
+            self.assertFalse(dist.self_update(None))
 
     def test_join_codes(self):
         d = {"u": "https://home-hub.tail1.ts.net", "t": "hv_abc123", "p": None, "n": "pod-a"}
@@ -393,8 +395,11 @@ class TestWp4Wp5Wp6Stubs(unittest.TestCase):
         self.assertEqual(srv.routes, [("GET", "/v1/tools")])
         with self.assertRaises(ValueError):
             tools.register_agent_routes(object(), lambda i, r: None, role="node", mcp=True)
-        with self.assertLogs("hive.gateway", level="WARNING"):
-            gateway.register_gateway_routes(object(), role="node", backend=None, cfg=None)
+        # WP5b CONTRACT-REQUEST: register_gateway_routes is real (GET/POST + OPTIONS /openai/{node}/{service}/{rest*})
+        srv2 = _Srv()
+        gateway.register_gateway_routes(srv2, role="node", backend=None, cfg=None)
+        self.assertEqual(sorted(srv2.routes), [("GET", gateway.ROUTE), ("OPTIONS", gateway.ROUTE),
+                                               ("POST", gateway.ROUTE)])
         with self.assertRaises(HiveError):
             tools.RuntimeTarget(None, None, "")
 
