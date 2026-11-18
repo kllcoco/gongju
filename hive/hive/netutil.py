@@ -758,7 +758,14 @@ def _hop_headers(user_headers: List[Tuple[str, str]], auth: Optional[AuthSpec], 
 
 def _stream_body(conn: "_Conn", resp: http.client.HTTPResponse, host: str, port: int, idle_timeout: float,
                  cancel: Optional[threading.Event] = None) -> Iterator[bytes]:
-    """Yield the body as it arrives (idle timeout per read); closes the connection at the end or on close()."""
+    """Yield the body as it arrives (idle timeout per read); closes the connection at the end or on close() (also
+    when close() comes before the first chunk: ``util.ClosingIterator``)."""
+    from .util import ClosingIterator
+    return ClosingIterator(_stream_chunks(conn, resp, host, port, idle_timeout, cancel), conn.close)
+
+
+def _stream_chunks(conn: "_Conn", resp: http.client.HTTPResponse, host: str, port: int, idle_timeout: float,
+                   cancel: Optional[threading.Event] = None) -> Iterator[bytes]:
     try:
         if conn.sock is not None:
             conn.sock.settimeout(max(0.1, idle_timeout))

@@ -207,6 +207,23 @@ class TestNodeGateway(_GwCase):
         url, _agent, rt, _m = self.start_node(self.stub, extra_tokens=[hub_token_entry(tok, role="files")])
         st, _h, body = req(url, "GET", "/openai/self/stub/v1/models", token=tok)
         self.assertEqual(st, 403)
+        # review fix: the §8.7 hint reaches the app inside the OpenAI-shaped message
+        self.assertIn("the hub token on this node needs the net class for the gateway",
+                      json.loads(body)["error"]["message"])
+
+    def test_ollama_model_endpoint(self):
+        """§21.2: the gateway name ``ollama`` resolves to the node's ``model_endpoints`` entry."""
+        tok = util.new_token()
+        url, _agent, rt = helpers.start_node_server(
+            start_managers=False, gateway={"enabled": True},
+            auth={"tokens": [{"name": "ollamaapp", "sha256": util.hash_token(tok), "kind": "models",
+                              "models": ["ollama"]}]},
+            model_endpoints=[{"name": "ollama", "base_url": self.stub.url + "/v1", "api_key_env": None}])
+        self.addCleanup(rt.test_stop)
+        st, _h, body = req(url, "GET", "/openai/self/ollama/v1/models", token=tok)
+        self.assertEqual(st, 200, body)
+        self.assertEqual(json.loads(body)["data"][0]["id"], "qwen-7b")
+        self.assertEqual(self.stub.requests[-1]["path"], "/v1/models")
 
 
 class TestHubGateway(_GwCase):
@@ -220,7 +237,8 @@ class TestHubGateway(_GwCase):
         self.url, self.toks, self.hub = helpers.start_hub(
             nodes, relay=dict(FAST_RELAY),
             extra_tokens=[("models", {"name": "chatbox", "kind": "models", "models": ["desk/stub", "pod-a/*"]}),
-                          ("aliasonly", {"name": "pcapp", "kind": "models", "models": ["pc/*"]})])
+                          ("aliasonly", {"name": "pcapp", "kind": "models", "models": ["pc/*"]}),
+                          ("deskall", {"name": "deskapp", "kind": "models", "models": ["desk/*"]})])
         self.addCleanup(self.hub.test_stop)
         self.mtok = self.toks["models"]
 
@@ -252,6 +270,23 @@ class TestHubGateway(_GwCase):
         # agent/owner tokens -> 403
         st, _h, _b = req(self.url, "GET", "/openai/desk/stub/v1/models", token=self.toks["agent"])
         self.assertEqual(st, 403)
+
+    def test_direct_upstream_404_passed_through(self):
+        """Review fix: only the node's own unknown-service 404 is replaced; an upstream 404 body is passed on."""
+        self.stub.add("POST", "/v1/embeddings", 404,
+                      {"error": {"message": "The model `foo` does not exist.", "type": "invalid_request_error",
+                                 "code": "model_not_found"}})
+        st, _h, body = req(self.url, "POST", "/openai/desk/stub/v1/embeddings", token=self.mtok,
+                           body={"model": "foo", "input": "x"})
+        self.assertEqual(st, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "model_not_found")
+        self.assertIn("does not exist", json.loads(body)["error"]["message"])
+        # the node's own unknown-service 404 is still replaced by the hub's (globs of the app only)
+        st, _h, body = req(self.url, "GET", "/openai/desk/nosuch/v1/models", token=self.toks["deskall"])
+        self.assertEqual(st, 404)
+        msg = json.loads(body)["error"]["message"]
+        self.assertEqual(msg, "service nosuch not found on desk (services: desk/*)")
+        self.assertNotIn("stubhidden", msg)
 
     def test_relay_offline_503(self):
         st, _h, body = req(self.url, "GET", "/openai/pod-a/qwen/v1/models", token=self.mtok)
@@ -309,6 +344,92 @@ class TestHubGateway(_GwCase):
             _t, (st, _h, body) = self._relay_roundtrip({"stream": stream}, {}, truncated=True)
             self.assertEqual(st, 502)
             self.assertEqual(json.loads(body)["error"]["code"], "relay_truncated")
+
+
+class _FakeServer:
+    def __init__(self):
+        self.routes = {}
+
+    def route(self, method, pattern, fn, **kw):
+        self.routes[method] = fn
+
+
+class _FakeAudit:
+    def __init__(self):
+        self.records = []
+
+    def record(self, **kw):
+        self.records.append(kw)
+
+
+class _Upstream:
+    def __init__(self):
+        self.closed = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.closed:
+            raise StopIteration
+        return b"data: x\n\n"
+
+    def close(self):
+        self.closed = True
+
+
+class TestStreamCleanup(unittest.TestCase):
+    """Review fix: a stream closed before its first chunk (client gone before the head was sent) still releases the
+    inflight slot, closes the upstream and writes the audit record."""
+
+    def test_close_without_iteration_releases(self):
+        from types import SimpleNamespace
+        ups = []
+
+        class Backend:
+            audit = _FakeAudit()
+
+            def authorize(self, identity, node, service):
+                pass
+
+            def forward(self, identity, node, service, method, path, body, *, stream, request_id, cancel):
+                u = _Upstream()
+                ups.append(u)
+                return gateway.GatewayResponse(status=200, headers={"Content-Type": "text/event-stream"},
+                                               body=None, chunks=u)
+
+        srv = _FakeServer()
+        be = Backend()
+        gateway.register_gateway_routes(srv, role="node", backend=be,
+                                        cfg=SimpleNamespace(max_inflight_per_token=4, max_body_bytes=1024,
+                                                            cors=False))
+        ident = SimpleNamespace(display_name="app", via="http")
+        for i in range(6):
+            r = SimpleNamespace(identity=ident, query={"node": "self", "service": "s", "rest": "v1/chat/completions"},
+                                method="POST", path="/openai/self/s/v1/chat/completions",
+                                body=b'{"stream": true}', request_id=f"r_{i}", cancel=threading.Event(),
+                                client_ip="127.0.0.1")
+            st, _h, chunks = srv.routes["POST"](r)
+            self.assertEqual(st, 200)
+            chunks.close()          # what ApiServer._write_stream does when conn.send(head) fails
+            chunks.close()          # idempotent
+        self.assertTrue(all(u.closed for u in ups))
+        self.assertEqual(len(be.audit.records), 6)
+        self.assertEqual(be.audit.records[0]["extra"]["bytes_out"], 0)
+
+    def test_closing_iterator_unstarted_generator(self):
+        closed = []
+
+        def gen():
+            try:
+                yield b"a"
+            finally:
+                closed.append("gen")
+        it = util.ClosingIterator(gen(), lambda: closed.append("cb"))
+        it.close()
+        it.close()
+        self.assertEqual(closed, ["cb"])
+        self.assertEqual(list(it), [])
 
 
 class TestSse(unittest.TestCase):

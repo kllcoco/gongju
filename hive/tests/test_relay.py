@@ -1,6 +1,7 @@
 """WP5b RelayAgent tests (§7.5, §7.1 instance key, §5.9 hub URL rules, D3 relay identity)."""
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import tempfile
@@ -107,7 +108,8 @@ class TestTlsAndProxy(_Env):
 
 class TestRelayNode(_Env):
     def test_role_files_and_gateway_hint(self):
-        url, toks, hub, tok = self.hub()
+        url, toks, hub, tok = self.hub(
+            extra_tokens=[("models", {"name": "chatbox", "kind": "models", "models": ["pod-a/*"]})])
         rt = start_relay_node(url, tok, start_managers=True, relay={"role": "files"})
         self.addCleanup(rt.test_stop)
         helpers.wait_until(lambda: hub.links["pod-a"].online(), 15)
@@ -121,6 +123,12 @@ class TestRelayNode(_Env):
                 c.call("model.forward", {"service": "qwen", "path": "models"}, node="pod-a")
             self.assertEqual(cm.exception.code, "forbidden")
             self.assertIn("relay role on this pod needs the net class", cm.exception.hint)
+            # review fix: the hint reaches the app in the hub's OpenAI-shaped 403 (§7.5 v8, §8.7)
+            from tests.test_gateway import req
+            st, _h, body = req(url, "GET", "/openai/pod-a/qwen/v1/models", token=toks["models"])
+            self.assertEqual(st, 403, body)
+            self.assertIn("the relay role on this pod needs the net class for the gateway",
+                          json.loads(body)["error"]["message"])
 
     def test_exec_gated_agent_and_bound_files(self):
         url, toks, hub, tok = self.hub(agent_entry={"role": "files"})

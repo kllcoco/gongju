@@ -405,7 +405,8 @@ class HttpTransport:
                     yield b
             finally:
                 conn.close()
-        return resp.status, rheaders, chunks()
+        from .util import ClosingIterator
+        return resp.status, rheaders, ClosingIterator(chunks(), conn.close)
 
     def close(self) -> None:
         """Close every keep-alive connection (the transport stays usable; new requests reconnect)."""

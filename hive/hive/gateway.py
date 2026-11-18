@@ -24,7 +24,7 @@ from typing import Protocol, runtime_checkable
 
 from . import catalog
 from .errors import HiveError, bad_request, forbidden, not_found, rate_limited, unavailable
-from .util import glob_match
+from .util import ClosingIterator, glob_match
 
 if TYPE_CHECKING:  # pragma: no cover
     from .auth import Identity
@@ -69,6 +69,15 @@ class GatewayBackend(Protocol):
 def _openai_error(status: int, message: str, typ: str, code: str) -> GatewayResponse:
     body = json.dumps({"error": {"message": message, "type": typ, "code": code}}).encode("utf-8")
     return GatewayResponse(status=status, headers={"Content-Type": "application/json"}, body=body, chunks=None)
+
+
+def _fold_hint(e: HiveError) -> HiveError:
+    """OpenAI-shaped errors carry only ``{message,type,code}``: fold the hint into the message so that the §8.7 /
+    §7.5 hints ("the hub token on this node needs the net class for the gateway", "the relay role on this pod needs
+    the net class …") reach the app."""
+    if not e.hint or e.hint in e.message:
+        return e
+    return HiveError(e.code, f"{e.message} ({e.hint})", e.details or None, hint=e.hint, status=e.status)
 
 
 def normalize_path(rest: str) -> Optional[str]:
@@ -204,7 +213,10 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
                 raise bad_request("the request body must be a JSON object")
             model = obj.get("model")
             stream = obj.get("stream") is True and path != "embeddings"
-        backend.authorize(ident, node, service)
+        try:
+            backend.authorize(ident, node, service)
+        except HiveError as e:
+            raise _fold_hint(e)
         key = getattr(backend, "inflight_key", lambda i: i.display_name)(ident)
         with lock:
             if inflight.get(key, 0) >= cap:
@@ -214,10 +226,12 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
         try:
             resp = backend.forward(ident, node, service, req.method, path, body, stream=stream,
                                    request_id=req.request_id, cancel=req.cancel)
-        except BaseException:
+        except BaseException as e:
             release(key)
             record(ident, node, service, path, model, stream, 0, len(body), 0, None, req.request_id, req.client_ip,
                    int((time.monotonic() - t0) * 1000))
+            if isinstance(e, HiveError):
+                raise _fold_hint(e)
             raise
         headers = {k: v for k, v in (resp.headers or {}).items()}
         if resp.body is not None or resp.chunks is None:
@@ -228,27 +242,36 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
                    req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
             return resp.status, headers, data
 
-        def gen() -> Iterator[bytes]:
-            n = 0
-            tail = b""
+        # The cleanup lives in ClosingIterator.close(), which also runs when the server closes the stream before the
+        # first chunk (client gone while the upstream head was awaited): slot released, upstream closed, audited.
+        seen = {"n": 0, "tail": b""}
+
+        def count(src: Iterator[bytes]) -> Iterator[bytes]:
+            for chunk in src:
+                if not chunk:
+                    continue
+                seen["n"] += len(chunk)
+                seen["tail"] = (seen["tail"] + chunk)[-65536:]
+                yield chunk
+
+        def done() -> None:
+            release(key)
+            record(ident, node, service, path, model, stream, resp.status, len(body), seen["n"],
+                   _sse_usage(seen["tail"]), req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
+
+        upstream = resp.chunks
+
+        def finish() -> None:
             try:
-                for chunk in resp.chunks:  # type: ignore[union-attr]
-                    if not chunk:
-                        continue
-                    n += len(chunk)
-                    tail = (tail + chunk)[-65536:]
-                    yield chunk
-            finally:
-                close = getattr(resp.chunks, "close", None)
+                close = getattr(upstream, "close", None)
                 if callable(close):
                     try:
                         close()
                     except Exception:  # noqa: BLE001
                         pass
-                release(key)
-                record(ident, node, service, path, model, stream, resp.status, len(body), n, _sse_usage(tail),
-                       req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
-        return resp.status, headers, gen()
+            finally:
+                done()
+        return resp.status, headers, ClosingIterator(count(upstream), finish)
 
     max_body = int(getattr(cfg, "max_body_bytes", 8388608) or 8388608)
     cors = bool(getattr(cfg, "cors", True))
@@ -356,21 +379,21 @@ class NodeGatewayBackend(GatewayBackend):
 
         def bounded() -> Iterator[bytes]:
             n = 0
-            try:
-                for c in chunks:
-                    if cancel.is_set() or time.monotonic() > end:
-                        return
-                    n += len(c)
-                    if n > limit:
-                        return
-                    yield c
-            finally:
-                close = getattr(chunks, "close", None)
-                if callable(close):
-                    close()
+            for c in chunks:
+                if cancel.is_set() or time.monotonic() > end:
+                    return
+                n += len(c)
+                if n > limit:
+                    return
+                yield c
+        # ClosingIterator: the upstream stream is closed even when the stream is closed before its first chunk
+        stream_out = ClosingIterator(bounded(), getattr(chunks, "close", None))
         if 200 <= status < 300 and ctype.split(";", 1)[0].strip().lower() == SSE_TYPE:
-            return GatewayResponse(status=status, headers=out_headers, body=None, chunks=bounded())
-        data = b"".join(bounded())
+            return GatewayResponse(status=status, headers=out_headers, body=None, chunks=stream_out)
+        try:
+            data = b"".join(stream_out)
+        finally:
+            stream_out.close()
         mask = getattr(self.rt.secrets, "mask", None) if self.rt.secrets is not None else None
         if callable(mask) and getattr(self.rt.secrets, "has_values", False):
             text = data.decode("utf-8", "surrogateescape")
@@ -382,6 +405,30 @@ class NodeGatewayBackend(GatewayBackend):
 
 # ---------------------------------------------------------------------------------------------------------------
 # hub backend
+
+NODE_404_MAX = 65536   # bytes of a direct node's 404 body read to tell its own not-found from an upstream 404
+
+
+def _close(chunks: Any) -> None:
+    close = getattr(chunks, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _is_node_unknown_service(data: bytes) -> bool:
+    """True for the node gateway's own OpenAI-shaped "service X not found on N (services: …)" 404."""
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if not isinstance(err, dict) or err.get("code") != "not_found":
+        return False
+    msg = err.get("message")
+    return isinstance(msg, str) and msg.startswith("service ") and " not found on " in msg
 
 class HubGatewayBackend(GatewayBackend):
     """Gateway backend of the hub (§8.7 "Flow on the hub")."""
@@ -426,6 +473,50 @@ class HubGatewayBackend(GatewayBackend):
             msg += f" (services: {', '.join(sorted(pairs))})"
         return _openai_error(404, msg, "not_found_error", "not_found")
 
+    def _direct_404(self, identity: "Identity", link_name: str, service: str,
+                    resp: GatewayResponse) -> GatewayResponse:
+        """§8.7: only the node gateway's own unknown-service 404 (which lists services the app's globs may not cover)
+        is replaced by the hub's filtered 404; an upstream model server's 404 (wrong model id, unsupported path) is
+        passed through unchanged."""
+        if resp.chunks is None:
+            data = resp.body or b""
+            rest: Optional[Iterator[bytes]] = None
+        else:
+            buf: List[bytes] = []
+            size = 0
+            it = iter(resp.chunks)
+            ended = False
+            try:
+                while size <= NODE_404_MAX:
+                    try:
+                        c = next(it)
+                    except StopIteration:
+                        ended = True
+                        break
+                    buf.append(c)
+                    size += len(c)
+            except BaseException:
+                _close(resp.chunks)
+                raise
+            data = b"".join(buf)
+            if ended:
+                _close(resp.chunks)
+                rest = None
+            else:
+                rest = it
+        if rest is None and _is_node_unknown_service(data):
+            return self._not_found(identity, link_name, service)
+        if rest is None:
+            return GatewayResponse(status=resp.status, headers=resp.headers, body=data, chunks=None)
+        src = resp.chunks
+
+        def again() -> Iterator[bytes]:
+            yield data
+            for c in rest:  # type: ignore[union-attr]
+                yield c
+        return GatewayResponse(status=resp.status, headers=resp.headers, body=None,
+                               chunks=ClosingIterator(again(), getattr(src, "close", None)))
+
     def forward(self, identity: "Identity", node: str, service: str, method: str, path: str, body: bytes, *,
                 stream: bool, request_id: str, cancel: threading.Event) -> GatewayResponse:
         """Direct links: passthrough; relay links: ``model.forward`` (+ SSE synthesis)."""
@@ -441,13 +532,7 @@ class HubGatewayBackend(GatewayBackend):
             resp = link.open_gateway(service, method, path, body, agent=f"gw/{identity.name}",
                                      timeout=float(self.cfg.timeout), cancel=cancel)
             if resp.status == 404:
-                if resp.chunks is not None:
-                    try:
-                        for _c in resp.chunks:
-                            pass
-                    except HiveError:
-                        pass
-                return self._not_found(identity, link.name, service)
+                return self._direct_404(identity, link.name, service, resp)
             return resp
         assert isinstance(link, RelayLink)
         params: Dict[str, Any] = {"service": service, "path": path, "timeout": float(self.cfg.timeout)}

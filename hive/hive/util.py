@@ -1100,3 +1100,55 @@ class FileLock:
 
     def __exit__(self, *exc: Any) -> None:
         self.release()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# streams
+
+class ClosingIterator:
+    """Iterator over ``source`` whose ``close()`` closes the source and runs ``on_close`` exactly once, also when
+    iteration never started (WP5b review: ``close()`` on a generator that never ran skips its ``finally``, so a
+    client that disconnects before the first chunk would leak sockets, inflight slots and audit records).
+    Exhaustion or an error raised by the source also closes it."""
+
+    def __init__(self, source: Iterable[bytes], on_close: Optional[Any] = None):
+        import threading
+        self._source = source
+        self._it = iter(source)
+        self._on_close = on_close
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def __iter__(self) -> "ClosingIterator":
+        return self
+
+    def __next__(self) -> Any:
+        if self._closed:
+            raise StopIteration
+        try:
+            return next(self._it)
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def closed(self) -> bool:
+        """True once ``close()`` ran."""
+        return self._closed
+
+    def close(self) -> None:
+        """Close the source (errors ignored), then run ``on_close`` once."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            close = getattr(self._source, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+        finally:
+            if self._on_close is not None:
+                self._on_close()
