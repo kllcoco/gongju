@@ -1524,3 +1524,25 @@ P2-14. **Lead (`transport.py`, `hub.py`, tests):** `_Conn.__del__` and `HttpTran
     sockets (no unclosed-socket ResourceWarnings from thread-local connections of finished threads); `Hub.stop`
     joins its reaper/prober threads (≤ 5 s each) after the in-flight wait and closes the link transports again.
     `test_e2e_m2._shutdown` waits for both nodes online and retries `service.remove` that could not connect.
+
+## Phase 2 release (lead: build, README)
+
+R-1. **Release build verified:** `pip install ./hive` into fresh venvs (3.13 and 3.9) gives `hive --version`,
+    `hive version` and `python -m hive --version`; `hive dist build` from the source tree, from either Python and from
+    the installed wheel produces byte-identical `hive.pyz` (deterministic, 55 entries, `.py` only). The pyz ran a node
+    smoke from a folder without the checkout on both Pythons (`init node`, `node run`, `sh` with the remote exit
+    code, `call`, job + `logs`, 38 actions, MCP stdio `tools/list` = 28, `node stop` exit 0) plus a hub smoke
+    (`init hub --with-local-node`, `hub status`, `add-agent --cautious`, `gateway token add`/`url`, `sh` via
+    `hub-local`). Regression gate: `tests/integration/test_release_pyz.py`.
+R-2. **Lead (P0 `util.py`):** `atomic_write_bytes(private=True)` sets 0600 through the open fd on POSIX
+    (`os.fchmod`; `mkstemp` already creates 0600) and calls the path-based `secure_file` only on Windows. The
+    path chmod raced the removal of a job's run dir during `JobManager._save` (P2-11) and logged a spurious
+    "cannot restrict permissions … No such file" warning on every short `shell.run`.
+R-3. **README.md** rewritten for the owner (Chinese, beginner level): parts, install per OS (Windows, Linux/macOS
+    venv + `~/.local/bin` link, WSL2 §20.7, pods, pyz), the overview's "你需要做的" order as the default hub +
+    Tailscale walkthrough, MCP for Claude Desktop/Code/Cursor, gateway for Cherry Studio/Open WebUI, daily
+    commands, safety, proxy/mirror, doctor + troubleshooting, upgrade/uninstall, layout. `tests/test_readme.py`
+    parses every `hive …` command in it with the real argparse parsers (subcommands and flags; `mcp` and `sh`
+    with their own parsers) and checks file links and in-page anchors. Note for README authors: `call`/`sh`/
+    `logs`/`push`/`pull` default to `this-pc-owner` when it exists (not to client.json `default`), so hub examples
+    pass `--connection`.

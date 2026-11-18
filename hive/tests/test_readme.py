@@ -92,11 +92,15 @@ class TestReadmeCommands(unittest.TestCase):
     def test_every_command_parses(self):
         cmds = _commands()
         self.assertGreater(len(cmds), 80)
+        sub = next(a for a in cli.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+        top = set(sub.choices) | {"sh", "mcp"}
         bad = []
         for no, text in cmds:
             argv = _argv(text)
             if not argv:
                 continue
+            if len(argv) == 1 and argv[0] in top:
+                continue   # prose naming a command (`hive sh`, `hive call`), not an invocation
             err = io.StringIO()
             try:
                 with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):

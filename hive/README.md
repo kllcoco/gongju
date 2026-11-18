@@ -313,7 +313,7 @@ hive hub add-agent claude-desktop              # 会浏览网页、读陌生文�
 hive init client --name home --url http://100.101.1.7:7700 --token-file ~/.hive/tokens/home.token --default
 ```
 
-可以用 `--nodes 'desk,desk-wsl'` 限定它能管哪几台电脑，`--role readonly|files|operator` 限定权限。
+`home` 是连接名（默认取中枢的名字），以它实际打印的为准。可以用 `--nodes 'desk,desk-wsl'` 限定这个口令能管哪几台电脑，`--role readonly|files|operator` 限定权限。
 
 ### 4.8 接上 Claude Desktop
 
@@ -414,7 +414,7 @@ hive gateway url desk-wsl qwen                            # 打印各种情况�
 
 ## 7. 日常命令
 
-所有命令都可以加 `--help` 查看参数。`self` 表示本机节点；连中枢时用节点的名字，并加 `--connection home`（或把中枢设为默认连接）。
+所有命令都可以加 `--help` 查看参数。`self` 表示本机节点。在装了节点的电脑上，`hive sh` / `hive call` / `hive logs` / `hive push` / `hive pull` 默认连本机节点；要通过中枢操作别的电脑，加 `--connection home`（在中枢那台电脑上用 `--connection hub-local`），例如 `hive sh desk --connection hub-local -- nvidia-smi`。
 
 | 想做什么 | 命令 |
 | --- | --- |
