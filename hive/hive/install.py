@@ -780,11 +780,19 @@ def _manual(ctx: _Ctx, method: Optional[str], system: bool) -> str:
     return " ".join(_start_command(ctx, method, system))
 
 
-def _wait_new_holder(ctx: _Ctx, old_pid: Optional[int], timeout: float) -> Optional[dict]:
+def _same_holder(a: Optional[dict], b: Optional[dict]) -> bool:
+    """Same daemon start: pid, ctime and lock note (a per-start nonce) all equal. A foreground run that re-execs
+    itself after exit 75 keeps its pid and ctime, so the pid alone cannot tell the restart (v8.1)."""
+    if a is None or b is None:
+        return False
+    return (a.get("pid"), a.get("ctime"), a.get("note")) == (b.get("pid"), b.get("ctime"), b.get("note"))
+
+
+def _wait_new_holder(ctx: _Ctx, old: Optional[dict], timeout: float) -> Optional[dict]:
     end = _clock() + timeout
     while True:
         h = _holder(ctx)
-        if h is not None and h.get("pid") != old_pid:
+        if h is not None and not _same_holder(h, old):
             return h
         if _clock() >= end:
             return None
@@ -829,17 +837,18 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
             res.commands.append(_schtasks("/End", "/TN", TASK_NAMES[kind]))
             res.commands.append(_schtasks("/Run", "/TN", TASK_NAMES[kind]))
         return res
-    old_pid: Optional[int] = None
+    old: Optional[dict] = None
     if h is None:
         if method is None:
             raise unavailable(f"the {kind} is not running", hint=f"start it: hive {kind} run (or hive service "
                               f"install {kind})")
         _issue_start(ctx, method, system, res)
     else:
-        old_pid = h["pid"]
+        old = h
         _write_control(ctx, "restart")
         end = _clock() + EXIT_WAIT
-        while _pid_alive(h["pid"], h.get("ctime")):
+        # until the old start is gone: its pid exited, or the lock holder changed (a foreground re-exec, v8.1)
+        while _pid_alive(h["pid"], h.get("ctime")) and _same_holder(_holder(ctx), h):
             if _clock() >= end:
                 raise HiveError("timeout", f"the {kind} (pid {h['pid']}) is still running after {EXIT_WAIT:g} s",
                                 hint=f"check hive {kind} status; it restarts after in-flight calls finish")
@@ -847,22 +856,22 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
         if method is None:
             # no install record, but a launcher loop may still relaunch it (deploy/runpod/start-hive.sh relaunches
             # after exit 75 without writing run-<kind>.sh): wait for a new holder before calling it a foreground run
-            if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
+            if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
                 res.notes.append(f"its launcher restarted the {kind}")
                 return res
             raise unavailable(f"the {kind} stopped, but it ran in the foreground (no service installation restarts "
                               "it)", hint=f"start it again: hive {kind} run")
-        if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
+        if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
             res.notes.append(f"{method} restarted the {kind}")
             return res
         _issue_start(ctx, method, system, res)
-    if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
+    if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
         return res
     if method == "schtasks":
         for c in (_schtasks("/End", "/TN", TASK_NAMES[kind]), _schtasks("/Run", "/TN", TASK_NAMES[kind])):
             res.commands.append(c)
             _execute(c)
-        if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
+        if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
             return res
     raise unavailable(f"the {kind} did not start within {HOLDER_WAIT:g} s",
                       hint=f"start it by hand: {_manual(ctx, method, system)}; see the {kind} log in "

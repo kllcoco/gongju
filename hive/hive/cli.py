@@ -181,21 +181,29 @@ def _holder(data_dir: Path) -> Optional[dict]:
     return util.FileLock(data_dir / "node.lock").holder()
 
 
-def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> None:
-    """Config changes apply through a graceful daemon restart (§8.6); prints what happened."""
+def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> bool:
+    """Config changes apply through a graceful daemon restart (§8.6); prints what happened (v8.1 wording: "applied
+    (restarted)", or "will apply on next start" when nothing runs). True when a running daemon was restarted."""
     from .config import default_paths
     d = default_paths()["node_data" if kind == "node" else "hub_data"]
     if util.FileLock(d / f"{kind}.lock").holder() is None:
-        return
+        out.line(f"the {kind} is not running: will apply on next start")
+        return False
     if no_restart:
-        out.line(f"restart to apply: hive {kind} restart")
-        return
+        out.line(f"not applied yet (--no-restart): run hive {kind} restart")
+        return False
     try:
         from . import install
         install.restart(kind)
-        out.line(f"restarted the running {kind}")
+        out.line(f"applied (restarted the {kind})")
+        return True
     except HiveError as e:
-        out.line(f"restart to apply: hive {kind} restart ({e.message})")
+        if e.code == "unavailable" and "foreground" in e.message:
+            out.line(f"the {kind} stopped to apply the change (it ran in the foreground without a terminal); "
+                     f"start it again: hive {kind} run")
+        else:
+            out.line(f"not applied yet: {e.message}; run hive {kind} restart" + (f" ({e.hint})" if e.hint else ""))
+        return False
 
 
 def _console_command() -> List[str]:
@@ -374,13 +382,40 @@ def _redact_url(u: str) -> str:
         return u
 
 
+def _tailscale_check(out: Out, what: str) -> None:
+    """v8.1: ``--tailscale`` at init warns at once when Tailscale is not usable here (not a hard failure: it may be
+    installed or logged in before the first ``run``)."""
+    try:
+        from .httpserver import tailscale_info
+        tailscale_info()
+    except HiveError as e:
+        out.line(f"warning: {e.message}; the {what} will not start until Tailscale works here")
+        out.line("  install it from https://tailscale.com/download and log in (tailscale up); check with: "
+                 "tailscale ip -4")
+    except Exception:  # noqa: BLE001 - a check only
+        pass
+
+
+def _apply_local_node(cfg: Any, out: Out) -> None:
+    """After ``--with-local-node``: say which name the local node got and make a running node load the new hub token
+    (restart via control.json; a foreground terminal run re-execs itself, v8.1)."""
+    name = getattr(cfg, "_local_node", None)
+    if not name:
+        return
+    out.line(f"local node registered with the hub as '{name}' (http://127.0.0.1, hub token added to the node "
+             "config)")
+    if name == "hubhost":
+        out.line("  (named 'hubhost' because the node and the hub share this computer's name)")
+    _restart_daemon("node", out)
+
+
 def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
-    """``hive init hub``."""
+    """``hive init hub`` (an existing config: change only the given settings, v8.1)."""
     from . import config
-    if config.default_paths()["hub_config"].exists() and not args.force:
-        out.error("conflict", "hub config exists", "use --force to rewrite it (new tokens)")
-        return EXIT_USAGE
-    _ask_consent(args, "hub")
+    paths = config.default_paths()
+    exists = paths["hub_config"].exists() and not args.force
+    if args.tailscale:
+        _tailscale_check(out, "hub")
     public_url = args.public_url
     if args.funnel and not public_url:
         try:
@@ -390,6 +425,27 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
                 public_url = "https://" + names[0].rstrip(".")
         except HiveError:
             pass
+    if exists:
+        ignored = [f for f, v in (("--name", bool(args.name)), ("--tls-cert/--tls-key", bool(args.tls_cert or
+                                                                                          args.tls_key))) if v]
+        if ignored:
+            out.line(f"note: {', '.join(ignored)} applies only when creating a config; use --force to rewrite "
+                     "(new tokens)")
+        try:
+            cfg = config.edit_hub_init(listen=args.listen, tailscale=args.tailscale, public_url=public_url,
+                                       funnel=args.funnel, local_node=args.with_local_node)
+        except HiveError as e:
+            out.error(e.code, e.message, e.hint)
+            return EXIT_USAGE
+        changed = getattr(cfg, "_changed", [])
+        out.line(f"updated {paths['hub_config']}: " + (", ".join(changed) if changed else "no changes")
+                 + " (tokens unchanged)")
+        if args.funnel:
+            out.line("expose it to pods with: tailscale funnel --bg 7709")
+        _apply_local_node(cfg, out)
+        _restart_daemon("hub", out)
+        return EXIT_OK
+    _ask_consent(args, "hub")
     try:
         cfg, _toks = config.init_hub(name=args.name, listen=args.listen or "127.0.0.1:7700", public_url=public_url,
                                      tls_cert=args.tls_cert, tls_key=args.tls_key, tailscale=args.tailscale,
@@ -398,15 +454,18 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
     except HiveError as e:
         out.error(e.code, e.message, e.hint)
         return EXIT_USAGE
-    paths = config.default_paths()
     out.line(f"hub '{cfg.name}' configured at {paths['hub_config']}")
     out.line(f"owner token: {paths['tokens'] / 'hub-owner.token'} (client.json connection hub-local)")
     if args.funnel:
         out.line("expose it to pods with: tailscale funnel --bg 7709")
     if args.with_local_node:
+        _apply_local_node(cfg, out)
         out.line("warning: an exec-capable agent on this machine can act as the hub (all nodes, approvals, "
                  "auto-update pods); give agents here --cautious tokens")
-    out.line("next: hive hub run")
+    if args.force and util.FileLock(paths["hub_data"] / "hub.lock").holder() is not None:
+        _restart_daemon("hub", out)
+    else:
+        out.line("next: hive hub run   (foreground)   or   hive service install hub   (start at logon)")
     return EXIT_OK
 
 
@@ -432,10 +491,29 @@ def cmd_init_client(args: argparse.Namespace, out: Out) -> int:
 # ---------------------------------------------------------------------------------------------------------------
 # node
 
+_MAIN_ARGV: Optional[List[str]] = None   # the arguments main() was called with (a foreground re-exec repeats them)
+
+
+def _foreground_run(kind: str, args: argparse.Namespace, run: Any) -> int:
+    """v8.1: a hand-started ``hive node run`` / ``hive hub run`` in a terminal survives requested restarts (exit 75
+    after a config change, ``hive … restart``, an upgrade): it re-execs the same command instead of ending.
+    Supervised runs (service manager, watchdog, launcher) keep exit 75 for their supervisor."""
+    from . import node as nodemod
+    cwd = os.getcwd()
+    code = run(args.config, relaunched=args.relaunched, supervise=args.supervise)
+    if code != nodemod.EXIT_RESTART or not nodemod.foreground_restart_ok(relaunched=args.relaunched,
+                                                                         supervise=args.supervise):
+        return code
+    argv = list(_MAIN_ARGV) if _MAIN_ARGV is not None else list(sys.argv[1:])
+    if not argv:
+        argv = [kind, "run"]
+    return nodemod.reexec_foreground(util.self_command() + argv, cwd)
+
+
 def cmd_node_run(args: argparse.Namespace, out: Out) -> int:
     """``hive node run``."""
     from .node import run_node
-    return run_node(args.config, relaunched=args.relaunched, supervise=args.supervise)
+    return _foreground_run("node", args, run_node)
 
 
 def cmd_node_status(args: argparse.Namespace, out: Out) -> int:
@@ -1106,7 +1184,7 @@ def _restart_hub(args: argparse.Namespace, out: Out) -> None:
 def cmd_hub_run(args: argparse.Namespace, out: Out) -> int:
     """``hive hub run``."""
     from .hub import run_hub
-    return run_hub(args.config, relaunched=args.relaunched, supervise=args.supervise)
+    return _foreground_run("hub", args, run_hub)
 
 
 def cmd_hub_stop(args: argparse.Namespace, out: Out) -> int:
@@ -2924,6 +3002,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     util.prune_cwd_path()
     tolerant_streams()
     args_list = list(sys.argv[1:] if argv is None else argv)
+    global _MAIN_ARGV
+    _MAIN_ARGV = list(args_list)
     if args_list[:1] in (["--version"], ["-V"]):
         print(f"hive {__version__}")
         return 0

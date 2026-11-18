@@ -1526,7 +1526,9 @@ def init_hub(*, name: Optional[str] = None, listen: str = "127.0.0.1:7700", publ
     paths = default_paths()
     cfg_path = paths["hub_config"]
     if cfg_path.exists() and not force:
-        raise conflict(f"hub config exists at {cfg_path}", hint="use --force to rewrite it (new tokens)")
+        raise conflict(f"hub config exists at {cfg_path}", hint="use --force to rewrite it (new tokens), or "
+                       "hive init hub --listen/--tailscale/--public-url/--funnel/--with-local-node to change one "
+                       "setting")
     host, port = _parse_listen(listen, HUB_PORT)
     raw: Dict[str, Any] = {"version": 1, "name": _sanitize_name(name or socket.gethostname()),
                            "consent": _consent(consent_by), "allow_root": False,
@@ -1544,24 +1546,13 @@ def init_hub(*, name: Optional[str] = None, listen: str = "127.0.0.1:7700", publ
     owner_tok = new_token()
     raw["tokens"] = [{"name": "owner", "sha256": hash_token(owner_tok), "kind": "owner", "note": "local CLI"}]
     out = {"owner": owner_tok}
+    local_name = None
     if local_node:
-        node_path = paths["node_config"]
-        if not node_path.exists():
-            raise not_found("no local node config to register", hint="run: hive init node first")
-        node_cfg = load_node_config(str(node_path))
-        hub_tok = new_token()
-        tok_name = _sanitize_name("hub-" + raw["name"])
-
-        def add_hub_token(r: dict) -> None:
-            toks = r.setdefault("auth", {}).setdefault("tokens", [])
-            toks[:] = [t for t in toks if t.get("name") != tok_name]
-            toks.append({"name": tok_name, "sha256": hash_token(hub_tok), "kind": "hub", "role": "operator",
-                         "note": "hub on this machine"})
-        edit_config(node_path, add_hub_token, kind="node")
-        scheme = "https" if node_cfg.listen.tls.cert else "http"
-        raw["nodes"] = [{"name": "hubhost" if node_cfg.name == raw["name"] else node_cfg.name, "mode": "direct",
-                         "url": f"{scheme}://127.0.0.1:{node_cfg.listen.port}", "token": hub_tok}]
+        entry = _local_node_entry(raw["name"])
+        local_name = entry["name"]
+        raw["nodes"] = [entry]
     cfg = _parse_hub(copy.deepcopy(raw), cfg_path)
+    cfg._local_node = local_name  # type: ignore[attr-defined]
     secure_mkdir(cfg_path.parent, required=True)
     write_json_atomic(cfg_path, raw, private=True)
     secure_file(cfg_path, required=True)
@@ -1577,6 +1568,93 @@ def init_hub(*, name: Optional[str] = None, listen: str = "127.0.0.1:7700", publ
             c["default"] = "hub-local"
     _client_update(upd)
     return cfg, out
+
+
+def _local_node_entry(hub_name: str) -> Dict[str, Any]:
+    """Register this machine's node with the hub on this machine (``--with-local-node``): a fresh hub token goes into
+    the node config (its hash) and the returned hub ``nodes`` entry (plaintext). The entry is called ``hubhost`` when
+    the node has the hub's name (both default to the computer name), else the node's own name."""
+    paths = default_paths()
+    node_path = paths["node_config"]
+    if not node_path.exists():
+        raise not_found("no local node config to register", hint="run: hive init node first")
+    node_cfg = load_node_config(str(node_path))
+    if not node_cfg.listen.enabled:
+        raise bad_request("the local node does not listen, so the hub cannot reach it",
+                          hint="give it a loopback listen first: hive init node --listen 127.0.0.1:7701")
+    hub_tok = new_token()
+    tok_name = _sanitize_name("hub-" + hub_name)
+
+    def add_hub_token(r: dict) -> None:
+        toks = r.setdefault("auth", {}).setdefault("tokens", [])
+        toks[:] = [t for t in toks if t.get("name") != tok_name]
+        toks.append({"name": tok_name, "sha256": hash_token(hub_tok), "kind": "hub", "role": "operator",
+                     "note": "hub on this machine"})
+    edit_config(node_path, add_hub_token, kind="node")
+    scheme = "https" if node_cfg.listen.tls.cert else "http"
+    return {"name": "hubhost" if node_cfg.name == hub_name else node_cfg.name, "mode": "direct",
+            "url": f"{scheme}://127.0.0.1:{node_cfg.listen.port}", "token": hub_tok}
+
+
+def edit_hub_init(*, listen: Optional[str] = None, tailscale: bool = False, public_url: Optional[str] = None,
+                  funnel: bool = False, local_node: bool = False) -> HubConfig:
+    """``hive init hub`` on an existing hub config (v8.1, like ``init node``): change only the given settings, keep
+    every token. ``cfg._changed`` lists them; ``cfg._local_node`` names the (re-)registered local node."""
+    paths = default_paths()
+    cfg_path = paths["hub_config"]
+    changed: List[str] = []
+    local: Dict[str, Any] = {}
+
+    def fn(raw: dict) -> None:
+        lst = raw.setdefault("listen", {})
+        if tailscale:
+            lst["host"] = "tailscale"
+            changed.append("listen")
+        elif listen:
+            h, p = _parse_listen(listen, lst.get("port", HUB_PORT))
+            lst["host"], lst["port"] = h, p
+            changed.append("listen")
+        if public_url:
+            raw["public_url"] = public_url.rstrip("/")
+            h = _host_of(public_url)
+            if h:
+                hosts = [x for x in lst.get("allowed_hosts") or [] if isinstance(x, str)]
+                if h not in hosts:
+                    lst["allowed_hosts"] = hosts + [h]
+            changed.append("public_url")
+        if funnel and not lst.get("proxy_port"):
+            lst["proxy_port"] = 7709
+            changed.append("funnel")
+        if local_node:
+            entry = local["entry"]
+            nodes = [n for n in raw.get("nodes") or [] if isinstance(n, dict)]
+            raw["nodes"] = [n for n in nodes if n.get("name") != entry["name"]] + [entry]
+            changed.append("local node")
+        if not changed:
+            raise bad_request("hub config exists; pass the settings to change, or --force to rewrite (new tokens)",
+                              path=str(cfg_path))
+
+    if local_node:
+        # refuse a name clash before a token is minted into the node config
+        raw0 = read_json(cfg_path, default=None) or {}
+        hub_name = str(raw0.get("name") or "") if isinstance(raw0, dict) else ""
+        node_path = paths["node_config"]
+        if not node_path.exists():
+            raise not_found("no local node config to register", hint="run: hive init node first")
+        ncfg = load_node_config(str(node_path))
+        want = "hubhost" if ncfg.name == hub_name else ncfg.name
+        url_tail = f"://127.0.0.1:{ncfg.listen.port}"
+        for n in (raw0.get("nodes") or []) if isinstance(raw0, dict) else []:
+            if isinstance(n, dict) and n.get("name") == want and not (n.get("mode") == "direct"
+                                                                     and str(n.get("url") or "").endswith(url_tail)):
+                raise conflict(f"the hub already has a different node named '{want}'",
+                               hint=f"remove it first: hive hub remove-node {want}")
+        local["entry"] = _local_node_entry(hub_name)
+    edit_config(cfg_path, fn, kind="hub")
+    cfg = load_hub_config(str(cfg_path))
+    cfg._changed = sorted(set(changed))  # type: ignore[attr-defined]
+    cfg._local_node = (local.get("entry") or {}).get("name")  # type: ignore[attr-defined]
+    return cfg
 
 
 def init_client(*, url: Optional[str] = None, token: Optional[str] = None, token_file: Optional[str] = None,
@@ -1611,6 +1689,6 @@ def init_client(*, url: Optional[str] = None, token: Optional[str] = None, token
 __all__ = ["TlsConfig", "ListenConfig", "RelayConfig", "TokenEntry", "AuthConfig", "PolicyConfig", "NodeConfig",
            "NetworkConfig", "ModelsConfig", "SecretsConfig", "WslConfig", "GatewayConfig", "HubNodeEntry",
            "HubConfig", "Connection", "ToolsConfig", "ClientConfig", "HubListenConfig", "HubRelayConfig",
-           "default_paths", "hive_home", "load_node_config", "load_hub_config", "load_client_config",
+           "default_paths", "hive_home", "load_node_config", "load_hub_config", "load_client_config", "edit_hub_init",
            "expand_placeholders", "edit_config", "protected_paths", "startup_safety_checks", "init_node", "init_hub",
            "init_client", "apply_preset", "standard_policy", "is_privileged", "PRESETS", "ROLES", "PLACEHOLDERS"]

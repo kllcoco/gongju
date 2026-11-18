@@ -979,7 +979,7 @@ class Hub:
         if self._started:
             return
         lock = FileLock(self.data_dir / "hub.lock")
-        if not lock.acquire(note="hub"):
+        if not lock.acquire(note=f"hub {os.urandom(4).hex()}"):   # per start: a re-exec keeps pid+ctime (v8.1)
             holder = lock.holder_pid()
             raise conflict(f"another hub is running (pid {holder})" if holder else "another hub is running",
                            hint="stop it first: hive hub stop")

@@ -139,7 +139,8 @@ class NodeRuntime:
                   self.data_dir / "run"):
             secure_mkdir(d, required=(d == self.data_dir))
         lock = FileLock(self.data_dir / "node.lock")
-        if not lock.acquire(note="node"):
+        # a per-start note: a foreground run that re-execs itself keeps its pid and ctime (v8.1, restart detection)
+        if not lock.acquire(note=f"node {os.urandom(4).hex()}"):
             holder = lock.holder_pid()
             raise conflict(f"another node is running (pid {holder})" if holder else "another node is running",
                            hint="stop it first: hive node stop")
@@ -1049,6 +1050,95 @@ def run_node(config_path: Optional[str] = None, *, foreground: bool = True, rela
     return rt.exit_code
 
 
+def foreground_restart_ok(*, relaunched: bool = False, supervise: bool = False) -> bool:
+    """v8.1: True when this daemon was started by hand in a terminal, so exit 75 (a requested restart) makes it
+    re-exec itself instead of ending. Never under a service manager, the watchdog / start-hive.sh loop, the Windows
+    launcher, or the Windows foreground loop's own child."""
+    if relaunched or supervise:
+        return False
+    env = os.environ
+    if env.get("HIVE_WATCHDOG") == "1" or env.get("INVOCATION_ID") or env.get("HIVE_FOREGROUND_CHILD") == "1":
+        return False
+    for stream in (sys.stdin, sys.stderr):
+        try:
+            if stream is not None and stream.isatty():
+                return True
+        except (AttributeError, ValueError, OSError):
+            pass
+    return False
+
+
+RESTARTING_LINE = "restarting to apply new settings\u2026"
+
+
+def _flush_logs() -> None:
+    for h in list(logging.getLogger("hive").handlers):
+        try:
+            h.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def reexec_foreground(argv: List[str], cwd: Optional[str] = None) -> int:
+    """v8.1: restart a hand-started foreground daemon after exit 75: POSIX ``execv`` of the same command (same
+    process, same env); Windows runs it as a child in a loop (``execv`` there would hand the console back). Returns
+    only when the restart could not happen (75) or, on Windows, with the child's final exit code."""
+    try:
+        sys.stderr.write(RESTARTING_LINE + "\n")
+    except (UnicodeEncodeError, ValueError, OSError):
+        try:
+            sys.stderr.write("restarting to apply new settings...\n")
+        except Exception:  # noqa: BLE001
+            pass
+    _flush_logs()
+    if cwd:
+        try:
+            os.chdir(cwd)
+        except OSError:
+            pass
+    if not IS_WINDOWS:
+        try:
+            os.execv(argv[0], list(argv))
+        except OSError as e:
+            log.error("could not restart (%s); start it again: hive node run / hive hub run", e)
+            return EXIT_RESTART
+    return _windows_foreground_loop(argv)  # pragma: no cover - Windows only
+
+
+def _windows_foreground_loop(argv: List[str]) -> int:  # pragma: no cover - Windows only
+    env = dict(os.environ)
+    env["HIVE_FOREGROUND_CHILD"] = "1"
+    old = {}
+    for name in ("SIGINT", "SIGBREAK"):           # the child (same console) handles Ctrl-C and exits 0
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                old[sig] = signal.signal(sig, signal.SIG_IGN)
+            except (OSError, ValueError):
+                pass
+    try:
+        while True:
+            try:
+                code = subprocess.call(list(argv), env=env)
+            except OSError as e:
+                log.error("could not restart (%s)", e)
+                return EXIT_RESTART
+            if code != EXIT_RESTART:
+                return code
+            sys.stderr.write(RESTARTING_LINE + "\n")
+    finally:
+        for sig, h in old.items():
+            try:
+                signal.signal(sig, h)
+            except (OSError, ValueError):
+                pass
+
+
 def _install_signals(rt: NodeRuntime) -> None:
     if threading.current_thread() is not threading.main_thread():
         return
@@ -1235,4 +1325,4 @@ def supervise(kind: str, argv: List[str], data_dir: Path) -> int:
 
 
 __all__ = ["EXIT_STOP", "EXIT_RESTART", "NodeRuntime", "build_server", "run_node", "supervise", "pause", "resume",
-           "panic", "banner", "setup_logging"]
+           "panic", "banner", "setup_logging", "foreground_restart_ok", "reexec_foreground"]
