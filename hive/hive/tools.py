@@ -1382,7 +1382,7 @@ class RuntimeTarget(Target):
 
 def register_agent_routes(server: "ApiServer", target_factory: Callable[["Identity", "Request"], "Target"], *,
                           role: str, profile: str = "standard", mcp: bool = False) -> None:
-    """Register ``GET /v1/tools`` (and ``/mcp`` on the hub when ``mcp``; WP6b)."""
+    """Register ``GET /v1/tools`` (and the Streamable HTTP ``/mcp`` on the hub when ``mcp``, §18.5)."""
     if mcp and role == "node":
         raise ValueError("/mcp is served by the hub only")
     if profile not in PROFILES:
@@ -1410,13 +1410,34 @@ def register_agent_routes(server: "ApiServer", target_factory: Callable[["Identi
 
     server.route("GET", "/v1/tools", tools_route)
     if mcp:
+        from . import mcp as mcp_mod
+
+        def core_factory(ident: "Identity", req: "Request", *, profile: str = profile,
+                         wait_budget: Optional[float] = None) -> "mcp_mod.McpCore":
+            target = target_factory(ident, req)
+            client = Client(target)
+            # §18.5: server-hosted Toolkit (local: refused; fs_transfer runs a hub-process TransferManager)
+            tk = Toolkit(client, profile=profile, wait_budget=wait_budget, server_hosted=True)
+            core = mcp_mod.McpCore(tk, max_workers=mcp_mod.HTTP_WORKERS)
+            core.watch = False
+
+            def rebind(new_ident: "Identity", new_req: "Request") -> None:
+                t = client.target
+                if hasattr(t, "identity") and hasattr(t, "ip"):
+                    t.identity = new_ident          # the freshly authenticated identity of this request (§18.5)
+                    t.ip = getattr(new_req, "client_ip", "") or ""
+                else:
+                    client.target = target_factory(new_ident, new_req)
+            core.rebind = rebind  # type: ignore[attr-defined]
+            return core
+
+        handler = mcp_mod.http_handler(core_factory, default_profile=profile)
+        for method in ("POST", "DELETE"):           # GET /mcp -> 405 from the router (no SSE stream, §18.5)
+            server.route(method, "/mcp", handler, mode="raw")
         try:
-            from . import mcp as mcp_mod
-            handler = mcp_mod.http_handler(lambda ident, req: None)
-            for method in ("POST", "GET", "DELETE"):
-                server.route(method, "/mcp", handler, mode="raw")
-        except HiveError as e:
-            log.warning("/mcp not registered: %s", e.message)
+            server.mcp_sessions = handler.sessions  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
 
 def dispatch_tool_call(client: "Client", name: str, arguments: Union[str, dict], **toolkit_kw: Any) -> ToolResult:

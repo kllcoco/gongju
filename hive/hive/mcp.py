@@ -6,7 +6,7 @@ delivered through ``send``), ``notifications/cancelled`` (the ``POST /v1/cancel`
 ``logging/setLevel``, empty ``resources/list``/``prompts/list``; batches → -32600, unknown methods → -32601.
 ``run_stdio`` is ``hive mcp …`` (§18.3): stdout is reserved for the protocol (``sys.stdout`` is pointed at stderr), a
 watcher refreshes the Toolkit every 30 s and emits ``notifications/tools/list_changed``.
-``http_handler`` (hub ``/mcp``, §18.5) arrives with WP6b.
+``http_handler`` is the hub's Streamable HTTP ``/mcp`` route (§18.5, JSON-response mode, session-bound to the token).
 """
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Dict, List, Optional, Tuple, Union
 
 from . import __version__
-from .errors import HiveError, unsupported
+from .errors import HiveError
 
 if TYPE_CHECKING:  # pragma: no cover
     from .tools import Toolkit
@@ -36,10 +36,6 @@ WATCH_INTERVAL = 30.0
 WATCH_INTERVAL_ENV = "HIVE_MCP_WATCH_INTERVAL"   # tests only: a shorter watcher interval for `hive mcp`
 EOF_WAIT = 2.0
 LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
-
-
-def _na(what: str) -> HiveError:
-    return unsupported(f"mcp.{what} not available yet (WP6b)")
 
 
 @dataclass
@@ -502,10 +498,249 @@ def _tolerant(stream: Any) -> None:
         pass
 
 
-def http_handler(core_factory: Callable[..., McpCore]) -> Callable[..., Any]:
-    """Raw route for /mcp (hub only; WP6b)."""
-    raise _na("http_handler")
+# ---------------------------------------------------------------------------------------------------------------
+# Streamable HTTP (§18.5; hub only, JSON-response mode)
+
+SESSION_IDLE = 3600.0           # 1 h idle expiry
+SESSIONS_PER_TOKEN = 16
+SESSIONS_TOTAL = 256
+HTTP_WORKERS = 4                # pool size per HTTP session (each POST also holds one server thread)
+SESSION_NOT_FOUND = -32001
+
+
+class HttpSession:
+    """One ``Mcp-Session-Id``: ``{id, token_name, created, last_used}`` plus its McpCore and McpSession (§18.5)."""
+
+    def __init__(self, sid: str, token_name: str, core: McpCore, session: McpSession, now: float):
+        self.id = sid
+        self.token_name = token_name
+        self.core = core
+        self.session = session
+        self.created = now
+        self.last_used = now
+        self.active = 0                    # requests currently using it
+
+
+class HttpSessions:
+    """Session table for ``/mcp``: 1 h idle expiry, ≤ 16 sessions per token (the least recently used is evicted) and
+    ≤ 256 in total (likewise)."""
+
+    def __init__(self, *, idle: float = SESSION_IDLE, per_token: int = SESSIONS_PER_TOKEN,
+                 total: int = SESSIONS_TOTAL, clock: Callable[[], float] = time.monotonic):
+        self.idle = float(idle)
+        self.per_token = int(per_token)
+        self.total = int(total)
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._s: Dict[str, HttpSession] = {}
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._s)
+
+    def _close(self, rec: HttpSession) -> None:
+        try:
+            rec.core.close(rec.session, wait=0)
+        except Exception as e:  # noqa: BLE001
+            log.debug("closing mcp session failed: %s", e)
+
+    def _prune_locked(self, now: float) -> List[HttpSession]:
+        gone = [r for r in self._s.values() if r.active == 0 and now - r.last_used > self.idle]
+        for r in gone:
+            self._s.pop(r.id, None)
+        return gone
+
+    def create(self, token_name: str, core: McpCore, session: McpSession) -> HttpSession:
+        """Register a new session (evicting the least recently used ones over the limits)."""
+        import secrets as _secrets
+        now = self.clock()
+        with self._lock:
+            closed = self._prune_locked(now)
+            mine = sorted((r for r in self._s.values() if r.token_name == token_name), key=lambda r: r.last_used)
+            while len(mine) >= self.per_token:
+                r = mine.pop(0)
+                self._s.pop(r.id, None)
+                closed.append(r)
+            if len(self._s) >= self.total:
+                for r in sorted(self._s.values(), key=lambda r: r.last_used)[:len(self._s) - self.total + 1]:
+                    self._s.pop(r.id, None)
+                    closed.append(r)
+            sid = _secrets.token_urlsafe(32)
+            rec = HttpSession(sid, token_name, core, session, now)
+            self._s[sid] = rec
+        for r in closed:
+            log.info("mcp session of %s closed (idle or over the limit)", r.token_name)
+            self._close(r)
+        return rec
+
+    def acquire(self, sid: str, token_name: str) -> Optional[HttpSession]:
+        """The live session ``sid`` bound to ``token_name`` (marked in use), else None."""
+        now = self.clock()
+        with self._lock:
+            closed = self._prune_locked(now)
+            rec = self._s.get(sid)
+            if rec is not None and rec.token_name != token_name:
+                rec = None
+            if rec is not None:
+                rec.active += 1
+                rec.last_used = now
+        for r in closed:
+            self._close(r)
+        return rec
+
+    def release(self, rec: HttpSession) -> None:
+        """End one request's use of ``rec``."""
+        with self._lock:
+            rec.active = max(0, rec.active - 1)
+            rec.last_used = self.clock()
+
+    def drop(self, sid: str, token_name: str) -> bool:
+        """Remove a session of ``token_name``; False when unknown."""
+        with self._lock:
+            rec = self._s.get(sid)
+            if rec is None or rec.token_name != token_name:
+                return False
+            self._s.pop(sid, None)
+        self._close(rec)
+        return True
+
+    def close_all(self) -> None:
+        """Drop every session."""
+        with self._lock:
+            recs = list(self._s.values())
+            self._s.clear()
+        for r in recs:
+            self._close(r)
+
+
+def _http_json(status: int, obj: Any, headers: Optional[Dict[str, str]] = None) -> Tuple[int, Dict[str, str], bytes]:
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
+    return status, h, json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _query_wait_budget(v: Optional[str]) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        raise HiveError("bad_request", f"invalid wait_budget {v[:40]!r}", hint="seconds, 10..280")
+    if f != f or f in (float("inf"), float("-inf")):
+        raise HiveError("bad_request", "invalid wait_budget", hint="seconds, 10..280")
+    return max(10.0, min(280.0, f))
+
+
+def _rebind(core: McpCore, identity: Any, req: Any) -> None:
+    fn = getattr(core, "rebind", None)
+    if callable(fn):
+        fn(identity, req)
+
+
+def http_handler(core_factory: Callable[..., McpCore], *, sessions: Optional[HttpSessions] = None,
+                 default_profile: str = "standard", call_wait: Optional[float] = None) -> Callable[..., Any]:
+    """Raw route function for ``POST``/``DELETE /mcp`` (§18.5; registered by ``register_agent_routes`` on the hub).
+
+    ``core_factory(identity, request, *, profile, wait_budget) -> McpCore`` builds a session's core (a server-hosted
+    Toolkit over a ``HubTarget``); a core may carry ``rebind(identity, request)``, called on every request so the
+    session's target uses the freshly authenticated identity. The returned function has a ``sessions`` attribute."""
+    table = sessions if sessions is not None else HttpSessions()
+
+    def handler(req: Any) -> Tuple[int, Dict[str, str], bytes]:
+        ident = req.identity
+        token_name = getattr(ident, "name", None) or ""
+        hdr = req.headers
+        sid = (hdr.get("mcp-session-id") or "").strip()
+        pv = (hdr.get("mcp-protocol-version") or "").strip()
+        if req.method == "DELETE":
+            if not sid:
+                return _http_json(400, _err(None, INVALID_REQUEST, "missing Mcp-Session-Id"))
+            if not table.drop(sid, token_name):
+                return _http_json(404, _err(None, SESSION_NOT_FOUND, "unknown session"))
+            return 200, {"Content-Type": "application/json"}, b""
+        if req.method != "POST":
+            return _http_json(405, _err(None, INVALID_REQUEST, "method not allowed"), {"Allow": "POST, DELETE"})
+        if pv and pv not in SUPPORTED_VERSIONS:
+            return _http_json(400, _err(None, INVALID_REQUEST, f"unsupported MCP-Protocol-Version {pv[:40]!r}; "
+                                                               f"supported: {', '.join(SUPPORTED_VERSIONS)}"))
+        try:
+            msg = json.loads((req.body or b"").decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return _http_json(400, _err(None, PARSE_ERROR, "Parse error"))
+        if isinstance(msg, list):
+            return _http_json(400, _err(None, INVALID_REQUEST, "batches not supported"))
+        if not isinstance(msg, dict):
+            return _http_json(400, _err(None, INVALID_REQUEST, "invalid request: expected a JSON object"))
+        method = msg.get("method")
+        has_id = "id" in msg
+        mid = msg.get("id")
+        if method == "initialize" and has_id:
+            q = req.query or {}
+            prof = (q.get("profile") or default_profile).strip().lower()
+            if prof not in ("minimal", "standard", "full"):
+                return _http_json(400, _err(mid, INVALID_PARAMS, f"unknown profile {prof[:40]!r}; use minimal, "
+                                                                   f"standard or full"))
+            try:
+                wb = _query_wait_budget(q.get("wait_budget"))
+            except HiveError as e:
+                return _http_json(400, _err(mid, INVALID_PARAMS, e.message))
+            core = core_factory(ident, req, profile=prof, wait_budget=wb)
+            core.watch = False                      # no list_changed / progress over HTTP (§18.5)
+            sess = McpSession()
+            resp = core.handle(msg, sess, lambda m: None)
+            if not isinstance(resp, dict) or "result" not in resp:
+                core.close(sess, wait=0)
+                return _http_json(200, resp if resp is not None else _err(mid, INTERNAL_ERROR, "no response"))
+            sess.initialized = True                 # notifications/initialized follows; tools work either way
+            rec = table.create(token_name, core, sess)
+            return _http_json(200, resp, {"Mcp-Session-Id": rec.id})
+        if not sid:
+            return _http_json(400, _err(mid if has_id else None, INVALID_REQUEST,
+                                        "missing Mcp-Session-Id (send initialize first)"))
+        rec = table.acquire(sid, token_name)
+        if rec is None:
+            return _http_json(404, _err(mid if has_id else None, SESSION_NOT_FOUND, "unknown session"))
+        try:
+            _rebind(rec.core, ident, req)
+            if method is None or not has_id:            # notification or a response from the client
+                rec.core.handle(msg, rec.session, lambda m: None)
+                return 202, {"Content-Type": "application/json"}, b""
+            if method == "tools/list":
+                try:
+                    rec.core.toolkit.refresh()          # no list_changed over HTTP: list what is current
+                except Exception as e:  # noqa: BLE001
+                    log.debug("refresh failed: %s", e)
+            got: List[dict] = []
+            done = threading.Event()
+
+            def send(m: dict) -> None:
+                if isinstance(m, dict) and m.get("id") == mid and ("result" in m or "error" in m) and not got:
+                    got.append(m)
+                    done.set()
+            resp = rec.core.handle(msg, rec.session, send)
+            if resp is not None:
+                return _http_json(200, resp)
+            limit = call_wait if call_wait is not None else \
+                max(300.0, 3 * float(getattr(rec.core.toolkit, "wait_budget", 45) or 45) + 60)
+            end = time.monotonic() + limit
+            with rec.core._lock:
+                h = rec.session.inflight.get(mid)
+            while not done.wait(0.2):
+                if h is not None and h.cancelled:
+                    return _http_json(200, _err(mid, -32800, "request cancelled"))
+                if time.monotonic() > end:
+                    if h is not None:
+                        h.cancelled = True
+                        h.cancel.set()
+                        _bg(lambda: rec.core.toolkit.cancel(h.request_id), "mcp-cancel")
+                    return _http_json(200, _err(mid, INTERNAL_ERROR, "the tool call did not finish in time"))
+            return _http_json(200, got[0])
+        finally:
+            table.release(rec)
+
+    handler.sessions = table  # type: ignore[attr-defined]
+    return handler
 
 
 __all__ = ["SUPPORTED_VERSIONS", "McpSession", "McpCore", "CallHandle", "run_stdio", "serve_stdio", "http_handler",
-           "build_parser"]
+           "build_parser", "HttpSessions", "HttpSession"]
