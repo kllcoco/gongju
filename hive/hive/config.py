@@ -76,6 +76,7 @@ class ListenConfig:
     trusted_proxies: List[str] = field(default_factory=list)
     max_connections: int = 64
     max_body_bytes: int = 50331648
+    max_buffered_bytes: int = 134217728
 
 
 @dataclass
@@ -91,6 +92,7 @@ class HubListenConfig:
     trusted_proxies: List[str] = field(default_factory=list)
     max_connections: int = 256
     max_body_bytes: int = 50331648
+    max_buffered_bytes: int = 268435456
     mcp_http: bool = True
     mcp_profile: str = "standard"
 
@@ -363,7 +365,7 @@ _TLS = _o({"cert": _s(), "key": _s()})
 _LISTEN_COMMON = {
     "host": _s(minLength=1, maxLength=255), "port": _i(0, 65535), "proxy_port": _i(1, 65535), "tls": _TLS,
     "allow_insecure_remote": _B, "allowed_hosts": _STRS, "allowed_origins": _STRS, "trusted_proxies": _STRS,
-    "max_connections": _i(1, 4096), "max_body_bytes": _i(1024, 1 << 31),
+    "max_connections": _i(1, 4096), "max_body_bytes": _i(1024, 1 << 31), "max_buffered_bytes": _i(1 << 20, 1 << 34),
 }
 NODE_LISTEN_SCHEMA = _o(dict(_LISTEN_COMMON, enabled=_B))
 HUB_LISTEN_SCHEMA = _o(dict(_LISTEN_COMMON, mcp_http=_B,
@@ -414,7 +416,8 @@ POLICY_SCHEMA = _o({
                "allow_metadata_ip": _B, "max_response_bytes": _i(1, 1 << 31)}),
     "proc": _o({"kill_protect": _STRS, "kill_own_user_only": _B}),
     "limits": _o({"max_concurrent_calls": _i(1, 1024), "max_call_seconds": _n(1, 86400),
-                  "max_result_bytes": _i(65536, 1 << 31)}),
+                  "max_result_bytes": _i(65536, 1 << 31), "max_calls_per_identity": _i(1, 1024),
+                  "owner_reserved_calls": _i(0, 64)}),
     "approvals": _o({"ttl": _i(10, 86400), "max_pending": _i(1, 1000),
                      "decide_from": _arr(_s(enum=["loopback", "private", "any"])),
                      "max_grant_minutes": _i(1, 1440)}),
@@ -554,7 +557,8 @@ def _node_defaults() -> dict:
         "allow_root": False, "workdir": "~", "data_dir": None,
         "listen": {"enabled": True, "host": "127.0.0.1", "port": NODE_PORT, "proxy_port": None,
                    "tls": {"cert": None, "key": None}, "allow_insecure_remote": False, "allowed_hosts": [],
-                   "allowed_origins": [], "trusted_proxies": [], "max_connections": 64, "max_body_bytes": 50331648},
+                   "allowed_origins": [], "trusted_proxies": [], "max_connections": 64, "max_body_bytes": 50331648,
+                   "max_buffered_bytes": 134217728},
         "relay": {"enabled": False, "hub_url": None, "token": None, "token_file": None, "tls_pin": None,
                   "ca_file": None, "allow_insecure": False, "max_parallel": 8, "proxy": "auto", "role": "operator",
                   "deny_actions": [], "auto_update": False},
@@ -579,7 +583,8 @@ def _hub_defaults() -> dict:
         "version": 1, "name": "", "public_url": None, "consent": None, "allow_root": False, "data_dir": None,
         "listen": {"host": "127.0.0.1", "port": HUB_PORT, "proxy_port": None, "tls": {"cert": None, "key": None},
                    "allow_insecure_remote": False, "allowed_hosts": [], "allowed_origins": [], "trusted_proxies": [],
-                   "max_connections": 256, "max_body_bytes": 50331648, "mcp_http": True, "mcp_profile": "standard"},
+                   "max_connections": 256, "max_body_bytes": 50331648, "max_buffered_bytes": 268435456,
+                   "mcp_http": True, "mcp_profile": "standard"},
         "network": {"proxy": None, "no_proxy": [], "use_system_proxy": True, "proxy_children": True,
                     "strict_dns": False, "ca_file": None},
         "tokens": [], "throttle": {"max_failures": 10, "window": 60, "block": 300}, "nodes": [], "default_node": None,

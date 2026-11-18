@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from . import __version__, catalog, schema
 from .auth import Identity, TokenStore
-from .errors import (HiveError, bad_request, conflict, internal, not_found, timeout as timeout_error, unavailable,
-                     unsupported, too_large)
+from .errors import (HiveError, bad_request, conflict, internal, not_found, rate_limited, timeout as timeout_error,
+                     unavailable, unsupported, too_large)
 from .util import (FileLock, IS_WINDOWS, glob_match, iso_utc, new_id, pid_alive, process_create_time, read_json,
                    secure_mkdir, write_json_atomic)
 
@@ -43,6 +43,7 @@ EXIT_STOP = 0       # D55: graceful stop
 EXIT_RESTART = 75   # D55: requested restart
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,80}\Z")
 GATE_WAIT = 5.0
+OWNER_RESERVED_CALLS = 4
 GPU_CACHE_S = 60.0
 
 
@@ -193,7 +194,12 @@ class NodeRuntime:
                 self.approvals.revoke(None)
                 self._was_paused = True
             self.holds = FileHolds()
-            self.gate = ConcurrencyGate(self.policy.limits.max_concurrent_calls)
+            # audit round 4 (finding 7): owner_reserved_calls slots only owner tokens may take, and one non-owner
+            # identity holds at most max_calls_per_identity slots (default: every non-reserved slot)
+            lim = cfg.policy.limits if isinstance(cfg.policy.limits, dict) else {}
+            self.gate = ConcurrencyGate(self.policy.limits.max_concurrent_calls,
+                                        owner_reserve=int(lim.get("owner_reserved_calls", OWNER_RESERVED_CALLS)),
+                                        per_identity=lim.get("max_calls_per_identity"))
             actions.load_all()
             if self.start_managers:
                 self._start_managers()
@@ -419,6 +425,8 @@ class NodeRuntime:
         hold: Optional[str] = None
         ctx = None
         gate_held = False
+        gate_owner = identity.kind == "owner"
+        gate_key = None if gate_owner else (identity.kind, identity.name, identity.token_sha256, identity.agent)
         ok = False
         err: Optional[HiveError] = None
         result: Any = None
@@ -461,7 +469,11 @@ class NodeRuntime:
             elif eff.grant_id:
                 extra["grant"] = eff.grant_id
             # 8. concurrency gate
-            if not self.gate.acquire(GATE_WAIT):
+            if not self.gate.acquire(GATE_WAIT, key=gate_key, owner=gate_owner):
+                if gate_key is not None and self.gate.per_identity < self.gate.shared and \
+                        self.gate.held_by(gate_key) >= self.gate.per_identity:
+                    raise rate_limited(f"too many concurrent calls for {identity.name} on node '{self.name}' (max "
+                                       f"{self.gate.per_identity})", retry_after=2, reason="inflight")
                 raise unavailable("node is busy (too many concurrent calls)", reason="busy", maybe_executed=False,
                                   hint="retry in a few seconds")
             gate_held = True
@@ -521,7 +533,7 @@ class NodeRuntime:
             elif ctx is None and hold:
                 self.holds.release(hold)
             if gate_held:
-                self.gate.release()
+                self.gate.release(key=gate_key, owner=gate_owner)
         if err is not None and self.secrets is not None and self.secrets.has_values:
             err, err_masked = self._mask_error(err)
             if err_masked:
@@ -759,6 +771,11 @@ def build_server(rt: NodeRuntime) -> "ApiServer":
                        logger=logging.getLogger("hive.httpserver"), audit=rt.audit,
                        owner_check=rt.approvals.may_decide)
     server.node_name = rt.name
+    if rt.gate is not None:
+        # audit round 4: the transport's per-identity cap on requests with a body never undercuts the call slots
+        from .httpserver import INFLIGHT_PER_IDENTITY
+        from .limits import KeyedLimit
+        server.inflight = KeyedLimit(max(INFLIGHT_PER_IDENTITY, rt.gate.per_identity))
 
     def own_node(node: Any) -> None:
         if node in (None, "", "self") or (isinstance(node, str) and node.lower() in (rt.name, rt.node_id.lower())):

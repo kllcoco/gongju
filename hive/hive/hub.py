@@ -625,6 +625,13 @@ class RelayLink(NodeLink):
         self.refresh = None
         return {"tasks": tasks, "cancel": cancels, "refresh": refresh or False}
 
+    def expects_result(self, task_id: Any, session_id: Any) -> bool:
+        """Audit round 4: True when a result for ``task_id`` in ``session_id`` would be accepted now (checked from
+        the X-Hive-Task / X-Hive-Session headers before the body is read)."""
+        with self.lock:
+            t = self.delivered.get(task_id) if isinstance(task_id, str) else None
+            return t is not None and t.session == session_id and t.envelope is None
+
     def result(self, body: dict) -> dict:
         """Accept a task envelope (§7.3)."""
         sid, tid, env = body.get("session_id"), body.get("task_id"), body.get("envelope")
@@ -1481,8 +1488,14 @@ class Hub:
             return review
         files, lines, not_bound = self._bind_files(identity, link, words, cwd, rid, end, gated, quiet)
         if moved:   # v8.1: relative words after cd / -C are not bound; named in the header (presets.moved_items)
-            not_bound += presets.moved_items(moved, lambda w: self._is_file(identity, link, self._join(cwd, w), rid,
-                                                                             end, gated))
+            kinds: Dict[str, Optional[str]] = {}
+
+            def kind(w: str) -> Optional[str]:
+                if w not in kinds:
+                    kinds[w] = self._stat_type(identity, link, self._join(cwd, w), rid, end, gated)
+                return kinds[w]
+            not_bound += presets.moved_items(moved, lambda w: kind(w) == "file", quiet,
+                                             lambda w: kind(w) is not None)
         not_bound += unbound
         from .util import escape_terminal
         review = dict(review)
@@ -1526,11 +1539,16 @@ class Hub:
         return [w for w in out if w not in moved], moved, unbound, frozenset(quiet)
 
     def _is_file(self, identity: Identity, link: NodeLink, path: str, rid: str, end: float, gated: bool) -> bool:
+        return self._stat_type(identity, link, path, rid, end, gated) == "file"
+
+    def _stat_type(self, identity: Identity, link: NodeLink, path: str, rid: str, end: float, gated: bool
+                   ) -> Optional[str]:
+        """"file"/"dir"/… of an existing path on the node, None when missing or not checkable."""
         try:
             st = self._sub(identity, link, "fs.stat", {"path": path}, rid, 900, end, gated)
         except HiveError:
-            return False
-        return bool(st.get("exists")) and st.get("type") == "file"
+            return None
+        return str(st.get("type") or "other") if st.get("exists") else None
 
     def _bind_words(self, identity: Identity, link: NodeLink, action: str, params: dict, rid: str, end: float,
                     gated: bool) -> Tuple[List[str], Optional[str], List[str], List[str], AbstractSet[str]]:
@@ -1601,7 +1619,8 @@ class Hub:
         """``presets.bind_files`` over the link (fs.stat/fs.read on the node). Audit round 2: a missing non-path word
         is listed as "no file here, not bound" unless quiet; a second path to an already bound file adds an entry
         for that path."""
-        from .presets import MISSING_UNBOUND, NOT_SHOWN, _pathlike, _strip_dot_segments, listable_missing
+        from .presets import (BIND_MAX_ABSENT, FOLDER_OPERAND, MISSING_UNBOUND, NOT_SHOWN, OP_MARK, _pathlike,
+                              _strip_dot_segments, listable_missing)
 
         def entry(**kw: Any) -> dict:
             # v8.1 (external review): the node re-resolves the bound path at consume (FileHolds.acquire), so it is
@@ -1619,6 +1638,7 @@ class Hub:
         seen: Dict[str, dict] = {}
         named_seen: set = set()
         bound = 0
+        absent = 0
         shown_left = SHOW_MAX
         i = 1
         for w in words:
@@ -1644,6 +1664,8 @@ class Hub:
                 continue
             exists = bool(st.get("exists"))
             if exists and st.get("type") != "file":
+                if OP_MARK + w in quiet and st.get("type") == "dir":
+                    not_bound.append(f"{w.rstrip('/')}/ {FOLDER_OPERAND}")
                 continue
             if not exists and not _pathlike(w):
                 if listable_missing(w, quiet):
@@ -1652,17 +1674,18 @@ class Hub:
             seen[rp] = {"bind": "none"}
             named_seen.add(path)
             size = st.get("size") if isinstance(st.get("size"), int) else None
-            if bound >= BIND_MAX_FILES:
+            if (bound >= BIND_MAX_FILES) if exists else (absent >= BIND_MAX_ABSENT):
                 files.append(entry(path=rp, bind="none", sha256=None, size=size, shown=False))
                 if w not in quiet:
-                    not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
+                    not_bound.append(f"{w} (over the {BIND_MAX_FILES if exists else BIND_MAX_ABSENT}-file limit)")
                 continue
-            bound += 1
             if not exists:
+                absent += 1
                 files.append(entry(path=rp, bind="absent", sha256=None, size=None, shown=False))
                 if w not in quiet:
                     not_bound.append(f"{w} (missing here)")
                 continue
+            bound += 1
             size = int(size or 0)
             mtime = st.get("mtime")
             if size > HASH_MAX:
@@ -1752,6 +1775,10 @@ def build_server(hub: Hub) -> "ApiServer":
                        logger=logging.getLogger("hive.httpserver"), audit=hub.audit,
                        owner_check=hub.approvals.may_decide)
     server.node_name = hub.name
+    # audit round 4: the transport's per-identity cap on requests with a body (checked before the body is read)
+    # leaves room above the per-agent call cap (cancels, MCP requests) so that cap keeps answering first
+    from .limits import KeyedLimit
+    server.inflight = KeyedLimit(int(hub.limits.get("max_inflight_per_agent", 32)) + 8)
 
     def health(req: "Request") -> dict:
         return {"role": "hub", "api": 1}
@@ -1939,8 +1966,26 @@ def build_server(hub: Hub) -> "ApiServer":
                                                             "ip": req.client_ip})
             raise
 
+    def relay_result_pre(headers: Any, ident: Any, length: int) -> Optional[dict]:
+        # audit round 4 (finding 6): X-Hive-Task / X-Hive-Session name the task before the body is read; a result
+        # for a task this relay node does not owe (unknown, finished, other session) is refused unread
+        tid = headers.get("x-hive-task")
+        if tid is None:
+            return None                       # an older relay build: the body decides, as before
+        link = hub.links.get(ident.node_name)
+        if not isinstance(link, RelayLink):
+            raise forbidden("this relay token belongs to no relay node")
+        if not link.expects_result(tid, headers.get("x-hive-session")):
+            log.info("relay result for %s not accepted (refused before the body)", str(tid)[:40])
+            return {"accepted": False}
+        return None
+
     def relay_result(req: "Request") -> dict:
         link, body = _relay_body(req)
+        tid = req.headers.get("x-hive-task")
+        if tid is not None and (body.get("task_id") != tid or
+                                body.get("session_id") != req.headers.get("x-hive-session")):
+            raise bad_request("X-Hive-Task / X-Hive-Session do not match the body")
         return link.result(body)
 
     def dist_pyz(req: "Request") -> Tuple[int, Dict[str, str], Any]:
@@ -1984,7 +2029,7 @@ def build_server(hub: Hub) -> "ApiServer":
     server.route("POST", "/v1/relay/register", relay_register, auth="relay", max_body=(2 << 20) + 65536)
     server.route("POST", "/v1/relay/poll", relay_poll, auth="relay")
     server.route("POST", "/v1/relay/result", relay_result, auth="relay",
-                 max_body=int(cfg.relay.max_result_bytes) + 65536)
+                 max_body=int(cfg.relay.max_result_bytes) + 65536, pre_body=relay_result_pre)
     server.route("GET", "/v1/dist/hive.pyz", dist_pyz, auth="none", mode="raw")
     try:
         from . import tools

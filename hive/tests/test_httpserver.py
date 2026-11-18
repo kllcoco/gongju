@@ -277,6 +277,7 @@ class TestSlowClients(unittest.TestCase):
     def test_header_deadline_and_slow_body_and_preauth_cap(self):
         with mock.patch.object(httpserver, "HEADER_DEADLINE", 0.5), mock.patch.object(httpserver, "MIN_BODY_RATE",
                                                                                          10 ** 9), \
+                mock.patch.object(httpserver, "PREAUTH_DEADLINE", 0.5), \
                 mock.patch.object(httpserver, "PREAUTH_PER_IP", 3):
             s = Server()
             try:
@@ -284,7 +285,7 @@ class TestSlowClients(unittest.TestCase):
                 c = socket.create_connection(("127.0.0.1", p), timeout=5)
                 c.sendall(b"GET /v1/open HTTP/1.1\r\n")
                 t0 = time.monotonic()
-                self.assertEqual(c.recv(100), b"")                 # closed after the header deadline
+                self.assertEqual(c.recv(100), b"")                 # closed after the (pre-auth) header deadline
                 self.assertLess(time.monotonic() - t0, 3)
                 c.close()
                 c = socket.create_connection(("127.0.0.1", p), timeout=5)
@@ -292,22 +293,31 @@ class TestSlowClients(unittest.TestCase):
                            "Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{").encode())
                 self.assertEqual(c.recv(100), b"")                 # body too slow -> closed
                 c.close()
+                # audit round 4: a full pre-auth bucket no longer refuses the newcomer: the oldest idle socket goes
                 idle = [socket.create_connection(("127.0.0.1", p), timeout=5) for _ in range(3)]
                 time.sleep(0.2)
                 extra = socket.create_connection(("127.0.0.1", p), timeout=5)
-                self.assertIn(b"503", extra.recv(200))
+                self.assertEqual(idle[0].recv(200), b"")           # evicted
+                extra.sendall(f"GET /v1/open HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nConnection: close\r\n\r\n".encode())
+                self.assertIn(b"200 OK", extra.recv(200))
                 for c in idle + [extra]:
                     c.close()
             finally:
                 s.stop()
 
     def test_max_connections(self):
-        s = Server(max_connections=1)
+        # audit round 4: max_connections 2 = one pre-auth slot + one authenticated slot (no owner reserve at this
+        # size); an authenticated keep-alive connection fills the authenticated pool, the next agent gets 503
+        s = Server(max_connections=2)
         try:
             hold = socket.create_connection(("127.0.0.1", s.port), timeout=5)
-            time.sleep(0.2)
-            out = raw_request(s.port, b"GET /v1/open HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            hold.sendall(f"GET /v1/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {T['agent']}\r\n\r\n"
+                         .encode())
+            self.assertIn(b"200 OK", hold.recv(4096))
+            out = raw_request(s.port, f"GET /v1/echo HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer "
+                                      f"{T['agent']}\r\n\r\n".encode())
             self.assertIn(b" 503 ", out.split(b"\r\n")[0])
+            self.assertIn(b"Retry-After: 1", out)
             hold.close()
         finally:
             s.stop()

@@ -1,21 +1,26 @@
 """ApiServer: bounded ThreadingHTTPServer, TLS, transport checks, router, envelopes, multi-address bind
 (design §6.1, §5.7, §5.9, T7, WP1).
 
-Transport rules: ``max_connections`` semaphore (excess sockets get a static 503), TLS wrapped in the worker thread with
-a 10 s handshake timeout, headers complete within 10 s (absolute), request line <= 8 KiB, <= 64 headers / 16 KiB,
+Transport rules: ``max_connections`` split into a pre-auth pool (half) and an authenticated pool (audit round 4, see
+``_ConnTable``), TLS wrapped in the worker thread, the pre-auth phase (TLS handshake + request line + headers) limited
+to 5 s in total, later headers complete within 10 s (absolute), request line <= 8 KiB, <= 64 headers / 16 KiB,
 authentication from the headers BEFORE the body is read (an unauthenticated body is never read), POST needs
-Content-Length (chunked -> 411) and ``application/json`` (-> 415), body limit checked before reading (413), slow
-bodies (< 64 KiB/s after 10 s) closed, <= 16 pre-auth connections per client IP, Origin/Host checks (T7) decided per
-connection with ``getsockname()``, proxied-request detection (§5.7), ``X-Hive-Api``, route modes result/envelope/raw,
-``{rest*}`` patterns, per-route ``max_body``/``error_style``/``cors``.
+Content-Length (chunked -> 411) and ``application/json`` (-> 415), body limit checked before reading (413), a
+per-identity cap on requests with a body and a global byte budget for buffered bodies both checked before reading
+(audit round 4), slow bodies (< 64 KiB/s after 10 s) closed, <= 16 pre-auth connections per bucket (one client IP;
+all of loopback; everything on ``proxy_port``), the oldest idle one evicted for a newcomer, Origin/Host checks (T7)
+decided per connection with ``getsockname()``, proxied-request detection (§5.7), ``X-Hive-Api``, route modes
+result/envelope/raw, ``{rest*}`` patterns, per-route ``max_body``/``error_style``/``cors``/``pre_body``.
 """
 from __future__ import annotations
 
 import http.server
 import ipaddress
+import itertools
 import json
 import logging
 import math
+import operator
 import re
 import socket
 import socketserver
@@ -26,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .errors import CODES, HiveError, bad_request, forbidden, internal, rate_limited
+from .errors import CODES, HiveError, bad_request, forbidden, internal, rate_limited, unavailable
 from .util import IS_WINDOWS, ip_category, is_loopback_host, new_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -42,6 +47,10 @@ ROUTE_MODES = ("result", "envelope", "raw")
 API_VERSION = 1
 HEADER_DEADLINE = 10.0
 IDLE_TIMEOUT = 30.0
+PREAUTH_DEADLINE = 5.0       # audit round 4: TLS handshake + request line + headers of an unauthenticated connection
+OWNER_RESERVE = 4            # authenticated connection slots only owner tokens (from this machine) may take
+BODY_WAIT = 2.0              # a body waits this long for the byte budget, then 503 busy
+INFLIGHT_PER_IDENTITY = 32   # concurrent requests with a body per non-owner identity (node/hub raise it as needed)
 MAX_REQUEST_LINE = 8192
 MAX_HEADERS = 64
 MAX_HEADER_BYTES = 16384
@@ -85,29 +94,47 @@ class Headers(dict):
         return isinstance(key, str) and dict.__contains__(self, key.lower())
 
 
+# audit round 4: the depth pre-scan runs at C speed (it was a pure-Python byte loop, ~2 s per 48 MiB body).
+# Strings are cut out (an unterminated one runs to the end, so the scan stays linear), brackets mapped to ( and ).
+_JSON_STR_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)', re.S)
+_JSON_NON_BRACKETS = bytes(range(256)).translate(None, b"[]{}")
+_JSON_BRACKETS = bytes.maketrans(b"[{]}", b"(())")
+_JSON_RUN_RE = re.compile(rb"\(+|\)+")
+
+
 def json_depth_ok(data: bytes, limit: int = MAX_JSON_DEPTH) -> bool:
-    """Bracket-depth pre-scan (strings skipped); False when nesting exceeds ``limit``."""
-    depth = 0
-    in_str = False
-    esc = False
-    for b in data:
-        if in_str:
-            if esc:
-                esc = False
-            elif b == 0x5C:
-                esc = True
-            elif b == 0x22:
-                in_str = False
-            continue
-        if b == 0x22:
-            in_str = True
-        elif b in (0x5B, 0x7B):
-            depth += 1
-            if depth > limit:
-                return False
-        elif b in (0x5D, 0x7D):
-            depth -= 1
-    return True
+    """Bracket-depth pre-scan (strings skipped); False when nesting exceeds ``limit``.
+
+    Never True for a body whose parse would nest deeper than ``limit`` (unbalanced brackets, i.e. invalid JSON, may
+    give False where the parse fails anyway). Each ``()``-removal pass lowers the deepest point by exactly one; the
+    rest is the maximum prefix sum over bracket runs (itertools.accumulate)."""
+    data = bytes(data)
+    if data.count(b"[") + data.count(b"{") <= limit:
+        return True
+    s = _JSON_STR_RE.sub(b"", data) if b'"' in data else data
+    s = s.translate(_JSON_BRACKETS, _JSON_NON_BRACKETS)
+    passes = 0
+    while True:
+        if s.count(b"(") <= limit - passes:
+            return True
+        if passes >= limit:
+            return False
+        shorter = s.replace(b"()", b"")
+        removed = len(s) - len(shorter)
+        if removed == 0:
+            return False                      # opening brackets with no matching pair
+        s = shorter
+        passes += 1
+        if removed * 3 < len(s):              # passes stopped paying off: sum the runs instead
+            break
+    if s.count(b"(") <= limit - passes:
+        return True
+    runs = list(map(len, _JSON_RUN_RE.findall(s)))
+    if s[:1] == b"(":
+        runs[1::2] = map(operator.neg, runs[1::2])
+    else:
+        runs[0::2] = map(operator.neg, runs[0::2])
+    return max(itertools.accumulate(runs)) <= limit - passes
 
 
 @dataclass
@@ -151,6 +178,148 @@ class _Route:
     max_body: Optional[int]
     error_style: str
     cors: bool
+    pre_body: Optional[Callable[["Headers", Any, int], Any]] = None
+
+
+class _Slot:
+    """One accepted connection in the ``_ConnTable``."""
+    __slots__ = ("sock", "bucket", "since", "state", "waiting", "evicted")
+
+    def __init__(self, sock: Any, bucket: str):
+        self.sock = sock
+        self.bucket = bucket
+        self.since = time.monotonic()
+        self.state = "pre"        # pre | auth | owner | gone
+        self.waiting = True       # waiting for the TLS handshake / a request head (only then evictable)
+        self.evicted = False
+
+
+class _ConnTable:
+    """Audit round 4: connection admission (finding 3, slowloris).
+
+    ``max_connections`` is split into a pre-auth pool (``max(1, n // 2)``: connections that have not authenticated
+    yet) and an authenticated pool (the rest), of which ``OWNER_RESERVE`` slots (at most half) only owner tokens may
+    take, so idle unauthenticated sockets never hold a slot an authenticated request needs. Pre-auth connections are
+    counted per bucket (``PREAUTH_PER_IP``, at most the pool): one bucket per remote IP, ONE bucket for all of
+    loopback (127.0.0.0/8, ::1), one for everything arriving on ``proxy_port`` (and from trusted proxies), so internet
+    clients behind Funnel cannot crowd out the local owner. When a bucket (or the pool) is full, a newcomer evicts
+    the OLDEST connection of that bucket (or of the largest bucket) that is still waiting for its request head; a
+    real client sends its head within milliseconds, so a slowloris attacker only ever evicts its own sockets."""
+
+    def __init__(self, max_connections: int, owner_reserve: int = OWNER_RESERVE):
+        n = max(1, int(max_connections))
+        self.pre_cap = max(1, n // 2)
+        self.auth_cap = max(1, n - self.pre_cap)
+        self.owner_reserve = max(0, min(int(owner_reserve), self.auth_cap // 2))
+        self._lock = threading.Lock()
+        self._pre: Dict[str, List[_Slot]] = {}
+        self.n_pre = 0
+        self.n_auth = 0
+        self.n_owner = 0
+        self.evictions = 0
+
+    @staticmethod
+    def _oldest_waiting(slots: List[_Slot]) -> Optional[_Slot]:
+        for sl in slots:
+            if sl.waiting:
+                return sl
+        return None
+
+    def _drop_pre(self, slot: _Slot) -> None:
+        lst = self._pre.get(slot.bucket)
+        if lst is not None and slot in lst:
+            lst.remove(slot)
+            self.n_pre -= 1
+            if not lst:
+                del self._pre[slot.bucket]
+
+    def admit(self, sock: Any, bucket: str) -> Optional[_Slot]:
+        """A slot for a new connection (evicting an idle pre-auth one if needed), or None (503)."""
+        victim: Optional[_Slot] = None
+        with self._lock:
+            cap = max(1, min(int(PREAUTH_PER_IP), self.pre_cap))
+            mine = self._pre.get(bucket, [])
+            if len(mine) >= cap:
+                victim = self._oldest_waiting(mine)
+                if victim is None:
+                    return None
+            elif self.n_pre >= self.pre_cap:
+                best = -1
+                for lst in self._pre.values():
+                    cand = self._oldest_waiting(lst)
+                    if cand is not None and len(lst) > best:
+                        victim, best = cand, len(lst)
+                if victim is None:
+                    return None
+            if victim is not None:
+                self._drop_pre(victim)
+                victim.evicted = True
+                victim.waiting = False
+                self.evictions += 1
+            slot = _Slot(sock, bucket)
+            self._pre.setdefault(bucket, []).append(slot)
+            self.n_pre += 1
+        if victim is not None:
+            try:
+                # the socket-level shutdown (also for an SSLSocket): the victim's blocked recv returns at once
+                socket.socket.shutdown(victim.sock, socket.SHUT_RDWR)
+            except (OSError, ValueError, TypeError):
+                pass
+        return slot
+
+    def set_sock(self, slot: _Slot, sock: Any) -> None:
+        """The connection's socket changed (TLS wrap)."""
+        with self._lock:
+            slot.sock = sock
+
+    def waiting(self, slot: _Slot, flag: bool) -> bool:
+        """Mark the connection as waiting for a head (evictable) or busy; False once it was evicted."""
+        with self._lock:
+            if slot.evicted:
+                return False
+            slot.waiting = bool(flag) and slot.state == "pre"
+            if flag:
+                slot.since = time.monotonic()
+            return True
+
+    def authenticate(self, slot: _Slot, owner: bool) -> bool:
+        """Move a pre-auth connection into the authenticated pool; False when that pool has no room for it."""
+        with self._lock:
+            if slot.evicted:
+                return False
+            if slot.state != "pre":
+                return True
+            if self.n_auth >= self.auth_cap:
+                return False
+            if not owner and self.n_auth - self.n_owner >= self.auth_cap - self.owner_reserve:
+                return False
+            self._drop_pre(slot)
+            slot.state = "owner" if owner else "auth"
+            slot.waiting = False
+            self.n_auth += 1
+            if owner:
+                self.n_owner += 1
+            return True
+
+    def release(self, slot: _Slot) -> None:
+        """The connection ended."""
+        with self._lock:
+            if slot.state == "pre":
+                if not slot.evicted:
+                    self._drop_pre(slot)
+            elif slot.state in ("auth", "owner"):
+                self.n_auth -= 1
+                if slot.state == "owner":
+                    self.n_owner -= 1
+            slot.state = "gone"
+            slot.waiting = False
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Counters (diagnostics, tests)."""
+        with self._lock:
+            return {"pre": self.n_pre, "auth": self.n_auth, "owner": self.n_owner, "pre_cap": self.pre_cap,
+                    "auth_cap": self.auth_cap, "owner_reserve": self.owner_reserve, "evictions": self.evictions,
+                    "buckets": {k: len(v) for k, v in self._pre.items()}}
 
 
 class _Reject(Exception):
@@ -291,7 +460,7 @@ class _BoundedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.address_family = fam
         self.api = api
         self.kind = kind          # "main" | "tailnet" | "proxy"
-        super().__init__(addr, _ConnHandler, bind_and_activate=False)
+        super().__init__(addr, socketserver.BaseRequestHandler, bind_and_activate=False)
         if fam == socket.AF_INET6:
             try:
                 self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0 if addr[0] == "::" else 1)
@@ -311,36 +480,31 @@ class _BoundedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.server_port = int(port)
 
     def process_request(self, request: Any, client_address: Any) -> None:
-        if not self.api._conn_sem.acquire(blocking=False):
-            try:
-                body = json.dumps({"ok": False, "error": {"code": "unavailable", "message": "server busy",
-                                                          "details": {"reason": "busy", "maybe_executed": False}}})
-                request.sendall(("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
-                                 f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}").encode())
-            except OSError:
-                pass
-            self.shutdown_request(request)
+        api = self.api
+        slot = api._conns.admit(request, api._bucket(client_address, self.kind))
+        if slot is None:
+            api._static(request, 503, "server busy")
             return
         try:
-            super().process_request(request, client_address)
+            t = threading.Thread(target=self._run_connection, args=(request, client_address, slot),
+                                 name=f"http-conn-{self.kind}", daemon=True)
+            t.start()
         except BaseException:
-            self.api._conn_sem.release()
+            api._conns.release(slot)
+            self.shutdown_request(request)
             raise
 
-    def process_request_thread(self, request: Any, client_address: Any) -> None:
+    def _run_connection(self, request: Any, client_address: Any, slot: "_Slot") -> None:
         try:
-            super().process_request_thread(request, client_address)
+            self.api._serve_connection(request, client_address, self, slot)
+        except Exception:  # noqa: BLE001
+            self.handle_error(request, client_address)
         finally:
-            self.api._conn_sem.release()
+            self.api._conns.release(slot)
+            self.shutdown_request(request)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         log.debug("connection error from %s", client_address, exc_info=True)
-
-
-class _ConnHandler(socketserver.BaseRequestHandler):
-    def handle(self) -> None:
-        server: _BoundedServer = self.server  # type: ignore[assignment]
-        server.api._serve_connection(self.request, self.client_address, server)
 
 
 class ApiServer:
@@ -362,8 +526,7 @@ class ApiServer:
         self._routes: List[_Route] = []
         self._servers: List[_BoundedServer] = []
         self._threads: List[threading.Thread] = []
-        self._conn_sem = threading.BoundedSemaphore(max(1, int(getattr(listen, "max_connections", 64) or 64)))
-        self._preauth: Dict[str, int] = {}
+        self._conns = _ConnTable(int(getattr(listen, "max_connections", 64) or 64))
         self._lock = threading.Lock()
         self._warned: set = set()
         self._ssl: Optional[ssl.SSLContext] = None
@@ -375,12 +538,21 @@ class ApiServer:
         self.allowed_hosts = [_strip_port(h) for h in getattr(listen, "allowed_hosts", None) or []]
         self.allowed_origins = [str(o).rstrip("/").lower() for o in getattr(listen, "allowed_origins", None) or []]
         self.max_body = int(getattr(listen, "max_body_bytes", 50331648) or 50331648)
+        # audit round 4 (finding 6): bodies are charged to a global byte budget and counted per identity BEFORE they
+        # are read; the budget is at least two maximal bodies
+        from .limits import BodyBudget, KeyedLimit
+        budget = int(getattr(listen, "max_buffered_bytes", 0) or (256 << 20 if role == "hub" else 128 << 20))
+        self.body_budget = BodyBudget(max(budget, 2 * self.max_body))
+        self.inflight = KeyedLimit(INFLIGHT_PER_IDENTITY)
 
     # ------------------------------------------------------------------------------------------- routes
     def route(self, method: str, pattern: str, fn: Callable[[Request], Any], *, auth: str = "token",
               mode: str = "result", max_body: Optional[int] = None, error_style: str = "hive",
-              cors: bool = False) -> None:
-        """Register a route (``{name}`` path params, a final ``{name*}`` matches the rest)."""
+              cors: bool = False, pre_body: Optional[Callable[["Headers", Any, int], Any]] = None) -> None:
+        """Register a route (``{name}`` path params, a final ``{name*}`` matches the rest).
+
+        ``pre_body(headers, identity, length)`` runs after authentication and before the body is read: it may raise
+        a HiveError, or return a result that is sent (route mode ``result``) without reading the body at all."""
         if auth not in AUTH_MODES:
             raise ValueError(f"unknown auth mode {auth!r}")
         if mode not in ROUTE_MODES:
@@ -404,7 +576,7 @@ class ApiServer:
                 rx += "/" + re.escape(part)
         self._routes.append(_Route(method=method.upper(), pattern=pattern, regex=re.compile(rx + r"\Z"),
                                    params=params, fn=fn, auth=auth, mode=mode, max_body=max_body,
-                                   error_style=error_style, cors=bool(cors)))
+                                   error_style=error_style, cors=bool(cors), pre_body=pre_body))
 
     def _find(self, method: str, path: str) -> Tuple[Optional[_Route], Dict[str, str], bool]:
         path_match = False
@@ -521,21 +693,40 @@ class ApiServer:
         self._servers = []
 
     # ------------------------------------------------------------------------------------------- connection
-    def _preauth_add(self, ip: str, delta: int) -> int:
-        with self._lock:
-            n = self._preauth.get(ip, 0) + delta
-            if n <= 0:
-                self._preauth.pop(ip, None)
-            else:
-                self._preauth[ip] = n
-            if len(self._preauth) > 10000:
-                self._preauth.clear()
-            return max(0, n)
-
-    def _serve_connection(self, sock: socket.socket, addr: Any, server: _BoundedServer) -> None:
+    def _bucket(self, addr: Any, kind: str) -> str:
+        """Pre-auth bucket of a new connection: ``proxy`` (proxy_port, trusted proxies), ``loopback``, or the IP."""
+        if kind == "proxy":
+            return "proxy"
         peer = str(addr[0]) if isinstance(addr, tuple) else str(addr)
         if peer.startswith("::ffff:"):
             peer = peer[7:]
+        if self.trusted_proxies and self._trusted_peer(peer):
+            return "proxy"
+        if self._is_loopback_ip(peer):
+            return "loopback"
+        return peer
+
+    def _is_owner(self, ident: "Identity") -> bool:
+        """An owner token the owner check accepts (from this machine): it may use the owner reserves."""
+        if ident.kind != "owner":
+            return False
+        if self.owner_check is None:
+            return True
+        try:
+            return bool(self.owner_check(ident))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _serve_connection(self, sock: socket.socket, addr: Any, server: _BoundedServer,
+                          slot: Optional[_Slot] = None) -> None:
+        peer = str(addr[0]) if isinstance(addr, tuple) else str(addr)
+        if peer.startswith("::ffff:"):
+            peer = peer[7:]
+        if slot is None:
+            slot = self._conns.admit(sock, self._bucket(addr, server.kind))
+            if slot is None:
+                self._static(sock, 503, "server busy")
+                return
         try:
             local = sock.getsockname()
             local_ip = str(local[0])
@@ -543,21 +734,20 @@ class ApiServer:
                 local_ip = local_ip[7:]
         except OSError:
             local_ip = ""
-        if self._preauth_add(peer, 1) > PREAUTH_PER_IP:
-            self._preauth_add(peer, -1)
-            self._static(sock, 503, "too many connections from your address")
-            return
-        authed = [False]
         try:
             if self._ssl is not None:
-                sock.settimeout(10.0)
+                # the handshake is part of the 5 s pre-auth phase; the slot tracks the wrapped socket (eviction)
+                sock.settimeout(max(0.05, slot.since + PREAUTH_DEADLINE - time.monotonic()))
                 try:
-                    sock = self._ssl.wrap_socket(sock, server_side=True)
-                except (OSError, ssl.SSLError):
+                    tls = self._ssl.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+                    self._conns.set_sock(slot, tls)
+                    sock = tls
+                    tls.do_handshake()
+                except (OSError, ssl.SSLError, ValueError, AttributeError):
                     return
             conn = _Conn(sock)
             for i in range(MAX_REQUESTS_PER_CONN):
-                keep = self._one_request(conn, peer, local_ip, server, authed, last=(i == MAX_REQUESTS_PER_CONN - 1))
+                keep = self._one_request(conn, peer, local_ip, server, slot, last=(i == MAX_REQUESTS_PER_CONN - 1))
                 if not keep:
                     break
         except _Closed:
@@ -565,8 +755,6 @@ class ApiServer:
         except Exception:  # noqa: BLE001
             self.log.debug("connection handler failed", exc_info=True)
         finally:
-            if not authed[0]:
-                self._preauth_add(peer, -1)
             try:
                 sock.close()
             except OSError:
@@ -577,8 +765,10 @@ class ApiServer:
         body = json.dumps({"ok": False, "error": {"code": "unavailable", "message": msg,
                                                   "details": {"reason": "busy", "maybe_executed": False}}})
         try:
+            sock.settimeout(1.0)
             sock.sendall((f"HTTP/1.1 {status} Service Unavailable\r\nContent-Type: application/json\r\n"
-                          f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}").encode())
+                          f"Content-Length: {len(body)}\r\nRetry-After: 1\r\nConnection: close\r\n\r\n{body}"
+                          ).encode())
         except OSError:
             pass
         try:
@@ -597,16 +787,29 @@ class ApiServer:
         return True
 
     # ------------------------------------------------------------------------------------------- one request
-    def _one_request(self, conn: "_Conn", peer: str, local_ip: str, server: _BoundedServer, authed: List[bool],
+    def _one_request(self, conn: "_Conn", peer: str, local_ip: str, server: _BoundedServer, slot: _Slot,
                      last: bool) -> bool:
         t0 = time.monotonic()
         try:
-            head = conn.read_head(idle=IDLE_TIMEOUT, deadline=HEADER_DEADLINE)
+            if slot.state == "pre":
+                # audit round 4: an unauthenticated connection has 5 s in total for its head (from the accept, or
+                # from the end of its previous response) and may be evicted meanwhile
+                first = slot.since
+                if not self._conns.waiting(slot, True):
+                    raise _Closed()
+                until = (first if conn.served == 0 else time.monotonic()) + PREAUTH_DEADLINE
+                head = conn.read_head(idle=PREAUTH_DEADLINE, deadline=PREAUTH_DEADLINE, until=until)
+                if not self._conns.waiting(slot, False):
+                    raise _Closed()
+            else:
+                head = conn.read_head(idle=IDLE_TIMEOUT, deadline=HEADER_DEADLINE)
         except _Reject as rj:
             self._write_error(conn, rj.status, rj.err, None, "hive", close=True)
             return False
         if head is None:
             return False
+        conn.served += 1
+        t0 = time.monotonic()
         method, target, version, headers = head
         path, _, qs = target.partition("?")
         from urllib.parse import parse_qsl
@@ -621,6 +824,8 @@ class ApiServer:
         # a request whose body is never read must end the connection (the bytes would parse as the next request)
         unread_body = "transfer-encoding" in headers or headers.get("content-length", "0").strip() not in ("", "0")
         status = 500
+        held_key: Optional[str] = None
+        held_bytes = 0
         try:
             route, params, path_match = self._find(method, path)
             if route is not None:
@@ -663,9 +868,11 @@ class ApiServer:
                     raise _Reject(415, HiveError("bad_request", "Content-Type must be application/json",
                                                  status=415), close=length > 0)
             ident = self._authenticate(route, headers, client_ip, proxied, length)
-            if ident is not None and not authed[0]:
-                authed[0] = True
-                self._preauth_add(peer, -1)
+            owner = ident is not None and self._is_owner(ident)
+            if ident is not None and slot.state == "pre" and not self._conns.authenticate(slot, owner):
+                raise _Reject(503, unavailable("server busy (connection limit)", reason="busy",
+                                               hint="retry in a moment"),
+                              close=True, headers={"Retry-After": "1"})
             if ident is None and length > 0:
                 # §6.1: an unauthenticated body is never read (auth "none" routes take no body); close the connection
                 # so the unread bytes are not parsed as a next request
@@ -674,6 +881,31 @@ class ApiServer:
             if length > limit:
                 raise _Reject(413, HiveError("too_large", f"request body larger than {limit} bytes",
                                              hint="send smaller chunks"), close=True)
+            if route.pre_body is not None and ident is not None:
+                try:
+                    early = route.pre_body(headers, ident, length)
+                except HiveError as e:
+                    raise _Reject(e.http_status, e, close=length > 0, headers=self._retry_after(e, {}))
+                if early is not None:
+                    close = close or unread_body
+                    env = {"ok": True, "result": early, "meta": {"request_id": rid, "api": API_VERSION}}
+                    status = self._write_json(conn, 200, env, rid, close=close,
+                                              extra={"Access-Control-Allow-Origin": "*"} if route.cors else None)
+                    return not close
+            if length > 0 and ident is not None:
+                # audit round 4 (finding 6): per-identity cap and global byte budget BEFORE the body is read
+                if not owner:
+                    key = f"{ident.kind}\x00{ident.name}\x00{ident.token_sha256}\x00{ident.agent}"
+                    if not self.inflight.acquire(key):
+                        raise _Reject(429, rate_limited(f"too many requests in flight for {ident.name} (max "
+                                                        f"{self.inflight.cap})", retry_after=1, reason="inflight"),
+                                      close=True, headers={"Retry-After": "1"})
+                    held_key = key
+                if not self.body_budget.acquire(length, owner=owner, timeout=BODY_WAIT):
+                    raise _Reject(503, unavailable("server busy (request body memory budget)", reason="busy",
+                                                   hint="retry in a few seconds"),
+                                  close=True, headers={"Retry-After": "2"})
+                held_bytes = length
             body = conn.read_body(length, start=time.monotonic()) if length > 0 else b""
             unread_body = False
             req = Request(method=method, path=path, query=dict(query, **params), headers=headers,
@@ -690,6 +922,10 @@ class ApiServer:
         except _Closed:
             raise
         finally:
+            if held_bytes:
+                self.body_budget.release(held_bytes)
+            if held_key is not None:
+                self.inflight.release(held_key)
             ms = int((time.monotonic() - t0) * 1000)
             self.log.info("%s %s %s %dms ip=%s id=%s", method, path, status, ms, client_ip,
                           ident.display_name if ident is not None else "-")
@@ -1010,6 +1246,7 @@ class _Conn:
     def __init__(self, sock: socket.socket):
         self.sock = sock
         self.buf = b""
+        self.served = 0
 
     def _recv(self, timeout: float) -> bytes:
         if timeout <= 0:
@@ -1018,9 +1255,13 @@ class _Conn:
         data = self.sock.recv(65536)
         return data
 
-    def read_head(self, *, idle: float, deadline: float) -> Optional[Tuple[str, str, str, Headers]]:
-        """Request line + headers, or None when the client closed an idle connection."""
+    def read_head(self, *, idle: float, deadline: float,
+                  until: Optional[float] = None) -> Optional[Tuple[str, str, str, Headers]]:
+        """Request line + headers, or None when the client closed an idle connection. ``until`` (monotonic) caps
+        the idle wait and the header deadline (the pre-auth phase)."""
         if not self.buf:
+            if until is not None:
+                idle = min(idle, until - time.monotonic())
             try:
                 data = self._recv(idle)
             except (socket.timeout, OSError):
@@ -1029,6 +1270,8 @@ class _Conn:
                 return None
             self.buf += data
         end_at = time.monotonic() + deadline
+        if until is not None:
+            end_at = min(end_at, until)
         limit = MAX_REQUEST_LINE + MAX_HEADER_BYTES + 4
         while b"\r\n\r\n" not in self.buf:
             if b"\r\n" not in self.buf and len(self.buf) > MAX_REQUEST_LINE:

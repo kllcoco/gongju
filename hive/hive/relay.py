@@ -451,12 +451,17 @@ class RelayAgent:
                                                    "bytes)", hint="ask for less (paging, max_bytes, tail)").to_dict(),
                    "meta": meta}
         body = {"session_id": sid, "task_id": tid, "envelope": env}
+        # audit round 4: the hub refuses a result for a task it does not expect from these headers, before it reads
+        # (and buffers) the body; the body keeps both fields (they must match)
+        hdrs = {"X-Hive-Task": str(tid)}
+        if sid is not None:
+            hdrs["X-Hive-Session"] = str(sid)
         for i, delay in enumerate((0.0,) + RESULT_RETRIES):
             if delay:
                 if self._stop.wait(delay):
                     break
             try:
-                r = self.transport.request("POST", "/v1/relay/result", body, timeout=60.0)
+                r = self.transport.request("POST", "/v1/relay/result", body, timeout=60.0, headers=hdrs)
                 if isinstance(r, dict) and not r.get("accepted"):
                     log.info("relay result for %s not accepted (expired or superseded)", tid)
                 return
