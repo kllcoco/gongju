@@ -718,3 +718,45 @@ by the lead or a line in DESIGN.md.
     available yet (WP6b)" with exit 2), `pyproject.toml` (console script `hive = hive.cli:main`; `_console_command()`
     falls back to `python [-P] -m hive` without it), README, examples and the CI workflow. E2E-M1 runs here as
     `tests/test_e2e_m1.py` (POSIX; the Windows variant is for the lead's CI).
+
+## WP6a review fixes
+
+88. **CONTRACT-REQUEST (WP6a → WP1 `config.py`):** `config.init_node(relay_role=None)` is now the default, meaning
+    "not given" (a new config still gets `operator`; `--relay/--join` without a role still applies `operator`). On an
+    existing config any given role, **including `operator`**, replaces `relay.role` (§14.5 v8: `--relay-role` on an
+    existing config changes that key), so the owner can widen a narrowed pod back without `--force`. Widening does not
+    turn `relay.auto_update` back on (narrowing still turns it off). `hive init node` passes `None` when the flag is
+    absent (`--relay-role` and `--preset` have no argparse default any more; `--preset` is still "only when creating").
+89. **Interpretations (WP6a review fixes):**
+    - `list_actions` / `call_action` have `node_param="optional"` (§17.5 `{node?}`): `node` is offered but never
+      required. `list_actions` without `node` lists every node's actions (`GET /v1/actions`, the hub's union);
+      `call_action` without `node` uses the Toolkit's default node or the only node, else sends none and lets the hub
+      resolve it (§8.1); hub-scope actions (`hub.nodes`, §9.10) are always sent without `node`.
+    - On a direct node target the Toolkit sends the wire `node` as `"self"` (and `hive sh self|.|-|local` passes
+      `"self"`), so a connection's `default_node` (a hub-side name, e.g. from `HIVE_NODE`) never reaches the node's own
+      `/v1/call`, which would answer `not_found`.
+    - A `refresh()` whose `/v1/nodes` or `/v1/actions` read fails keeps the previous rows / action filter (note 86);
+      only complete reads replace them.
+    - `render.table` footers: `… N more (<hint>)` names a follow-up that exists for that tool (proc_list "narrow with
+      filter or user, or change sort", job_list "narrow with state", list_actions "narrow with node…", …); only
+      `fs_list` pages with `offset` and writes its own single footer. Without a hint the footer says "not shown".
+    - Node text never starts a line outside a fence: `head()` cleans every part; `generic` cleans keys and fences a
+      multi-line value only under a plain key (`^[a-z_][a-z0-9_]{0,40}$`; other keys get JSON); `proc_kill` prints
+      integer pids only; numeric progress fields that are not numbers are dropped instead of raising.
+    - `service_control` (start/restart) and `service_define` state the §17.4 clamping ("waited 40s (client time
+      limit); still starting") like `service_status`; `service_define` renders one `changed: <field>` line per changed
+      field (with `= value` for plain scalar fields; command/argv/env stay in the redacted definition lines).
+    - model_pull start renders `(0 already complete)` / `(<bytes> already complete)` from `total_bytes −
+      to_download_bytes`: the start result has no per-file "already complete" count, so the §17.6 example's
+      "(0 already complete)" is expressed in bytes.
+    - MCP: tool calls run on a small pool of **daemon** threads (not `ThreadPoolExecutor`, whose workers are joined
+      at interpreter exit), `notifications/cancelled` and the EOF cancels send `POST /v1/cancel` from daemon threads,
+      so stdin EOF exits within ≈ 2 s even while a hub call hangs (§18.3); `run_stdio` additionally `os._exit`s when a
+      non-daemon thread is still alive after the 2 s wait. A message with an `id` but no `method`/`result`/`error`
+      gets `-32600`. `HIVE_MCP_WATCH_INTERVAL` (seconds, below 30) shortens the watcher interval; tests only.
+    - CLI output: `cli.main` (and `run_stdio` for stderr) reconfigure stdout/stderr with `errors="backslashreplace"`,
+      and `Out.foreign` falls back to backslash escapes, so node text outside a pipe's ANSI code page (cp936/cp1252)
+      cannot turn `hive sh`'s remote exit code into a traceback.
+    - `_console_command()` looks for the console script next to `sys.executable`, in `sysconfig.get_path("scripts")`
+      and in `<python dir>/Scripts`, then searches PATH by hand without the current directory or relative entries
+      (D56; `shutil.which` searches the cwd first on Windows before Python 3.12).

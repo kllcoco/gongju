@@ -90,7 +90,7 @@ class TestGolden(unittest.TestCase):
                                            ctx("model_pull", node="desk-wsl", wait=40)),
                          "[desk-wsl] pulling Qwen/Qwen2.5-7B-Instruct @ a09a354 → "
                          "/home/me/models/Qwen--Qwen2.5-7B-Instruct as job j_18f3abcd\n"
-                         "12 files · 15.2 GiB to fetch\n"
+                         "12 files · 15.2 GiB to fetch (0 already complete)\n"
                          'Next: job_status(node="desk-wsl", job_id="j_18f3abcd", wait=40)')
         prog = {"job_id": "j_18f3abcd", "kind": "pull", "state": "running",
                 "progress": {"done": 6549825126, "total": 16320875724, "percent": 40, "rate_bps": 85e6, "eta_s": 115,

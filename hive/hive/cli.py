@@ -17,7 +17,6 @@ import argparse
 import getpass
 import json
 import os
-import shutil
 import socket
 import sys
 import time
@@ -61,9 +60,9 @@ class Out:
     def foreign(self, text: str, *, err: bool = False) -> None:
         """Print agent/node-supplied text through ``escape_terminal`` (CRLF folded)."""
         s = util.escape_terminal(str(text).replace("\r\n", "\n"))
-        (sys.stderr if err else sys.stdout).write(s)
         if s and not s.endswith("\n"):
-            (sys.stderr if err else sys.stdout).write("\n")
+            s += "\n"
+        _write(sys.stderr if err else sys.stdout, s)
 
     def data(self, obj: Any) -> None:
         """Machine output (JSON) or a pretty JSON dump through escape_terminal."""
@@ -85,6 +84,26 @@ class Out:
         sys.stderr.write(util.escape_terminal(f"{code}: {message}") + "\n")
         if hint:
             sys.stderr.write(util.escape_terminal(f"Hint: {hint}") + "\n")
+
+
+def _write(stream: Any, s: str) -> None:
+    """Write text that may hold characters the stream's encoding lacks (a pipe on Windows uses the ANSI code page,
+    e.g. cp936): they become backslash escapes instead of a UnicodeEncodeError after the remote command ran."""
+    try:
+        stream.write(s)
+    except UnicodeEncodeError:
+        enc = getattr(stream, "encoding", None) or "ascii"
+        stream.write(s.encode(enc, "backslashreplace").decode(enc, "replace"))
+
+
+def tolerant_streams() -> None:
+    """``errors='backslashreplace'`` on stdout/stderr (3.7+ ``reconfigure``), so ``print`` of node text never raises
+    UnicodeEncodeError when the output is a pipe or file in a legacy Windows code page (§19 exit codes)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def exit_code_for(err: HiveError) -> int:
@@ -183,13 +202,49 @@ def _console_command() -> List[str]:
     zp = util._zipapp_path()
     if zp is not None:
         return [sys.executable, str(zp)]
-    exe = shutil.which("hive")
-    cand = Path(sys.executable).parent / ("hive.exe" if os.name == "nt" else "hive")
-    if cand.exists():
-        return [str(cand)]
+    name = "hive.exe" if os.name == "nt" else "hive"
+    exe_dir = Path(sys.executable).parent
+    dirs: List[Path] = [exe_dir]
+    try:
+        import sysconfig
+        sp = sysconfig.get_path("scripts")
+        if sp:
+            dirs.append(Path(sp))
+    except (KeyError, ValueError, OSError):
+        pass
+    dirs.append(exe_dir / "Scripts")          # non-venv Windows install: <prefix>\Scripts\hive.exe
+    for d in dirs:
+        cand = d / name
+        if cand.is_file():
+            return [os.path.abspath(str(cand))]
+    exe = _which_not_cwd("hive")
     if exe:
-        return [os.path.abspath(exe)]
+        return [exe]
     return [sys.executable] + (["-P"] if sys.version_info >= (3, 11) else []) + ["-m", "hive"]
+
+
+def _which_not_cwd(cmd: str) -> Optional[str]:
+    """``which`` over PATH without the current directory (Windows Python ≤ 3.11 searches the cwd first, so a
+    ``hive.bat`` in the folder where init runs could end up in the MCP snippet; D56)."""
+    try:
+        cwd = os.path.normcase(os.path.abspath(os.getcwd()))
+    except OSError:
+        cwd = ""
+    keep = []
+    for d in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not d or not os.path.isabs(d) or os.path.normcase(os.path.abspath(d)) == cwd:  # relative = cwd-based
+            continue
+        keep.append(d)
+    # searched by hand: shutil.which itself puts the cwd first on Windows (Python < 3.12) even with path=
+    exts = [""]
+    if os.name == "nt":  # pragma: no cover - Windows only
+        exts = [e for e in (os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+    for d in keep:
+        for ext in exts:
+            cand = os.path.join(d, cmd + ext)
+            if os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return os.path.abspath(cand)
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -264,15 +319,17 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
     if not exists:
         _ask_consent(args, "node")
     else:
-        ignored = [f for f, v in (("--preset", args.preset != "standard"), ("--wsl", args.wsl), ("--pod", args.pod),
+        ignored = [f for f, v in (("--preset", args.preset is not None), ("--wsl", args.wsl), ("--pod", args.pod),
                                   ("--name", bool(args.name))) if v]
         if ignored:
             out.line(f"note: {', '.join(ignored)} applies only when creating a config; use --force to rewrite")
     try:
         cfg, toks = config.init_node(
-            name=args.name if not exists else None, preset=args.preset, topology=topology if not
+            name=args.name if not exists else None, preset=args.preset or "standard", topology=topology if not
             (exists and topology == "pod") else None, listen=listen, roots=args.root or (), relay_url=args.relay,
-            relay_token=relay_token, relay_role=args.relay_role, relay_proxy=args.relay_proxy, tls_pin=args.tls_pin,
+            # None = not given: on an existing config only an explicit --relay-role (even "operator") changes it
+            relay_token=relay_token, relay_role=args.relay_role if exists else (args.relay_role or "operator"),
+            relay_proxy=args.relay_proxy, tls_pin=args.tls_pin,
             join=args.join, tls_cert=args.tls_cert, tls_key=args.tls_key, proxy=args.proxy, mirror=args.mirror,
             models_dir=args.models_dir, wsl=bool(args.wsl) and not exists, wsl_keepalive=args.wsl_keepalive or (),
             consent_by=_consent_by(), force=args.force)
@@ -787,7 +844,8 @@ def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
         return SH_FAILURE
     if a.connection:
         gl.connection = a.connection
-    node = None if a.node in (".", "-", "local", "self") else a.node
+    # the direct node itself: an explicit "self", so a connection's default_node is not sent to it (note 86)
+    node = "self" if a.node in (".", "-", "local", "self") else a.node
     params: Dict[str, Any] = {"command": words[0] if len(words) == 1 else " ".join(words), "merge_stderr": False}
     if a.shell:
         params["shell"] = a.shell
@@ -915,7 +973,8 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="create configs").add_subparsers(dest="what")
     p = leaf(init, "node", cmd_init_node, help="configure this computer as a node")
     p.add_argument("--name")
-    p.add_argument("--preset", choices=["readonly", "standard", "cautious", "full"], default="standard")
+    p.add_argument("--preset", choices=["readonly", "standard", "cautious", "full"],
+                   help="policy preset for a new config (default standard)")
     p.add_argument("--root", action="append", help="extra fs root PATH[:ro] (repeatable)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--listen", help="HOST:PORT")
@@ -931,7 +990,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--token")
     p.add_argument("--tls-pin")
     p.add_argument("--join", help="join code")
-    p.add_argument("--relay-role", choices=["readonly", "files", "operator"], default="operator")
+    p.add_argument("--relay-role", choices=["readonly", "files", "operator"],
+                   help="what the hub may do here (default operator); on an existing config it changes relay.role")
     p.add_argument("--relay-proxy")
     p.add_argument("--pod", action="store_true")
     p.add_argument("--proxy", help="URL or off")
@@ -1037,6 +1097,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point (``hive = hive.cli:main``)."""
     util.prune_cwd_path()
+    tolerant_streams()
     args_list = list(sys.argv[1:] if argv is None else argv)
     if args_list[:1] in (["--version"], ["-V"]):
         print(f"hive {__version__}")

@@ -257,7 +257,7 @@ class ToolSpec:
     action: Optional[str] = None
     keep: Optional[Tuple[str, ...]] = None
     param_docs: Dict[str, str] = field(default_factory=dict)
-    node_param: str = "single"
+    node_param: str = "single"         # single (§17.3) | optional (never required; list_actions, call_action) | none
     to_action: Optional[Callable[[dict], Tuple[str, dict]]] = None
     run: Optional[Callable[["Toolkit", dict, CallCtx], ToolResult]] = None
     render: Callable[[dict, dict, RenderCtx], str] = render.generic
@@ -451,7 +451,7 @@ def _run_nodes_list(tk: "Toolkit", args: dict, cctx: CallCtx) -> ToolResult:
     rows = tk.client.nodes()
     info = None
     try:
-        info = tk.client.call("node.info", {}, request_id=cctx.request_id)
+        info = tk.client.call("node.info", {}, node=tk._wire_node(None), request_id=cctx.request_id)
     except HiveError:
         info = None
     res = {"nodes": rows, "info": info}
@@ -642,7 +642,7 @@ def _build_tools() -> List[ToolSpec]:
                   render.model_list))
     T.append(ToolSpec(
         name="list_actions", title="List actions", description=DESCRIPTIONS["list_actions"], params=_obj({}),
-        actions=(), profiles=_FULL, run=_run_list_actions, render=render.list_actions,
+        actions=(), profiles=_FULL, node_param="optional", run=_run_list_actions, render=render.list_actions,
         annotations=_ann(ro=True)))
     T.append(ToolSpec(
         name="call_action", title="Call any action", description=DESCRIPTIONS["call_action"],
@@ -651,7 +651,8 @@ def _build_tools() -> List[ToolSpec]:
                      "params_json": _prop("string", "The action's parameters as JSON object text.", default="{}")},
                     ("action",)),
         actions=tuple(n for n, s in catalog.SPECS.items() if s.scope == "node"), profiles=_FULL,
-        to_action=_call_action, render=render.generic, annotations=_ann(destr=True, open_=True)))
+        node_param="optional", to_action=_call_action, render=render.generic,
+        annotations=_ann(destr=True, open_=True)))
     for t in T:
         t.annotations = dict(t.annotations, title=t.title)
     return T
@@ -780,10 +781,13 @@ class Toolkit:
             return False
         server = who.get("server") if isinstance(who.get("server"), dict) else {}
         kind = server.get("role") if server.get("role") in ("hub", "node") else None
+        prev = self._st
+        same = prev.connected and prev.kind == kind
         try:
             nodes = [n for n in self.client.nodes() if isinstance(n, dict)]
-        except HiveError:
-            nodes = []
+        except HiveError as e:      # a partial failure keeps the previous rows (note 86), never an empty list
+            log.debug("refresh: nodes failed: %s", e)
+            nodes = list(prev.nodes) if same else []
         allowed: Optional[Dict[str, Set[str]]] = None
         approvals = bool(who.get("approvals"))
         try:
@@ -796,8 +800,10 @@ class Toolkit:
                 allowed[r["name"]] = set(str(n) for n in ns) if isinstance(ns, list) else {"self"}
                 if r.get("approval"):
                     approvals = True
-        except HiveError:
-            allowed = None
+        except HiveError as e:      # keep the previous filter (None only when never known)
+            log.debug("refresh: actions failed: %s", e)
+            allowed = prev.allowed if same else None
+            approvals = approvals or (prev.approvals if same else False)
         with self._lock:
             self._st = _State(connected=True, kind=kind, server_name=str(server.get("name") or "") or None,
                               whoami=who, nodes=nodes, allowed=allowed, approvals=approvals)
@@ -854,6 +860,24 @@ class Toolkit:
             bits.append(g)
         bits.append("online" if r.get("online") else "offline")
         return ", ".join(bits)
+
+    def _optional_node_desc(self, t: ToolSpec) -> str:
+        if t.name == "list_actions":
+            return "Only this node's actions (node name from nodes_list); omit for every node you can use."
+        d = self._implicit_node()
+        return ("Target machine for node actions" + (f" (default: {d})" if d else " (node name from nodes_list)") +
+                "; hub actions such as hub.nodes take none.")
+
+    def _implicit_node(self) -> Optional[str]:
+        """The node an omitted ``node`` means without the "required" rule: the default node or the only node."""
+        if self._kind() == "node":
+            return None
+        rows = self._node_rows()
+        if self.default_node:
+            return self.default_node
+        if len(rows) == 1:
+            return rows[0]["name"]
+        return None
 
     def _resolve_node(self, node: Any) -> Optional[str]:
         kind = self._kind()
@@ -982,7 +1006,10 @@ class Toolkit:
     def _input_schema(self, t: ToolSpec) -> dict:
         params = copy.deepcopy(t.params)
         props = params.setdefault("properties", {})
-        if t.node_param == "single" and self._node_mode() != "omit":
+        if t.node_param == "optional" and self._node_mode() != "omit":
+            node_prop = {"type": "string", "description": self._optional_node_desc(t)}
+            params["properties"] = dict([("node", node_prop)] + list(props.items()))
+        elif t.node_param == "single" and self._node_mode() != "omit":
             node_prop = {"type": "string", "description": self._node_desc()}
             params["properties"] = dict([("node", node_prop)] + list(props.items()))
             if self._node_mode() == "required":
@@ -1151,6 +1178,10 @@ class Toolkit:
             if spec.node_param == "none":
                 if raw_node is not None:
                     raise bad_request(f"{spec.name} takes no node parameter")
+            elif spec.node_param == "optional" and (raw_node is None or raw_node == ""):
+                # §17.5 {node?}: list_actions without node lists every node's actions; call_action falls back to
+                # the default/only node (else the server resolves it, §8.1) and is never "node is required"
+                node = self._implicit_node() if spec.name == "call_action" else None
             else:
                 node = self._resolve_node(raw_node)
             vargs = schema.validate(spec.params, args, coerce=True, path="arguments", defaults=False)
@@ -1174,8 +1205,10 @@ class Toolkit:
             call_timeout, extra = self._apply_budget(spec, action, params, node, w)
             if action not in catalog.SPECS and spec.name == "call_action":
                 catalog.get(action)  # not_found with did-you-mean / removed-name hint
-            res = self._wire(action, params, node=node, timeout=call_timeout, rid=rid, approval_id=approval_id,
-                             ev=ev)
+            if spec.name == "call_action" and catalog.SPECS[action].scope == "hub":
+                node = None              # hub-scope actions (§9.10) take no node
+            res = self._wire(action, params, node=self._wire_node(node), timeout=call_timeout, rid=rid,
+                             approval_id=approval_id, ev=ev)
             return self._ok(spec.name, res, dargs, node=node, action=action, extra=extra)
         except HiveError as e:
             if e.code == "approval_required":
@@ -1188,6 +1221,13 @@ class Toolkit:
             log.exception("tool %s failed", spec.name)
             return self._err(spec.name, internal(f"{type(e).__name__}: {e}"[:300]), dargs or args, node=node,
                              action=action, extra=extra)
+
+    def _wire_node(self, node: Optional[str]) -> Optional[str]:
+        """The wire ``node``: a direct node target gets ``"self"`` explicitly, so ``Client.default_node`` (a hub-side
+        name) is never sent to the node's own ``/v1/call`` (which would answer not_found)."""
+        if self._kind() == "node":
+            return "self"
+        return node
 
     def _apply_budget(self, spec: ToolSpec, action: Optional[str], params: dict, node: Optional[str],
                       w: float) -> Tuple[Optional[float], Dict[str, Any]]:

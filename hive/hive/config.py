@@ -1274,15 +1274,18 @@ def _apply_relay(raw: dict, *, url: str, token: Optional[str], pin: Optional[str
 
 def init_node(*, name: Optional[str] = None, preset: str = "standard", topology: Optional[str] = None,
               listen: Optional[str] = None, roots: Sequence[str] = (), relay_url: Optional[str] = None,
-              relay_token: Optional[str] = None, relay_role: str = "operator", relay_proxy: Optional[str] = None,
+              relay_token: Optional[str] = None, relay_role: Optional[str] = None, relay_proxy: Optional[str] = None,
               tls_pin: Optional[str] = None, join: Optional[str] = None, tls_cert: Optional[str] = None,
               tls_key: Optional[str] = None, proxy: Optional[str] = None, mirror: Optional[str] = None,
               models_dir: Optional[str] = None, wsl: bool = False, wsl_keepalive: Sequence[str] = (),
               consent_by: str, force: bool = False) -> Tuple[NodeConfig, Dict[str, str]]:
-    """Create (or edit in place, v7/v8) a node config; returns (config, plaintext tokens {"owner","agent"})."""
+    """Create (or edit in place, v7/v8) a node config; returns (config, plaintext tokens {"owner","agent"}).
+
+    ``relay_role`` None = not given (a new config gets ``operator``); on an existing config any given role, including
+    ``operator``, replaces ``relay.role`` (§14.5 v8; CONTRACT-REQUEST WP6a)."""
     paths = default_paths()
     cfg_path = paths["node_config"]
-    if relay_role not in ROLES:
+    if relay_role is not None and relay_role not in ROLES:
         raise bad_request(f"unknown relay role {relay_role!r}", hint="readonly | files | operator")
     jd = None
     if join:
@@ -1342,7 +1345,8 @@ def init_node(*, name: Optional[str] = None, preset: str = "standard", topology:
     if relay_url:
         if not relay_token:
             raise bad_request("relay mode needs a relay token (--join CODE, or --token-env/--token-file)")
-        _apply_relay(raw, url=relay_url, token=relay_token, pin=tls_pin, role=relay_role, proxy=relay_proxy, pod=pod)
+        _apply_relay(raw, url=relay_url, token=relay_token, pin=tls_pin, role=relay_role or "operator",
+                     proxy=relay_proxy, pod=pod)
     elif pod:
         raise bad_request("--pod needs --join CODE or --relay URL")
     net_proxy = proxy if proxy is not None else _env_proxy()
@@ -1419,7 +1423,7 @@ def _write_pod_wrapper(home: Path) -> None:
 
 def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optional[str], listen: Optional[str],
                         roots: Sequence[str], relay_url: Optional[str], relay_token: Optional[str],
-                        relay_role: str, relay_proxy: Optional[str], tls_pin: Optional[str],
+                        relay_role: Optional[str], relay_proxy: Optional[str], tls_pin: Optional[str],
                         tls_cert: Optional[str], tls_key: Optional[str], proxy: Optional[str], mirror: Optional[str],
                         models_dir: Optional[str], wsl_keepalive: Sequence[str]) -> Tuple[NodeConfig, Dict[str, str]]:
     changed: List[str] = []
@@ -1434,7 +1438,7 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
             pod = bool((raw.get("relay") or {}).get("auto_update"))
             rel = dict(raw.get("relay") or {})
             raw["relay"] = rel
-            _apply_relay(raw, url=url, token=tok, pin=pin, role=relay_role, proxy=relay_proxy, pod=pod)
+            _apply_relay(raw, url=url, token=tok, pin=pin, role=relay_role or "operator", proxy=relay_proxy, pod=pod)
             changed.append("relay")
             if jd is not None and jd.get("n"):
                 raw["name"] = jd["n"]
@@ -1492,11 +1496,12 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
             if not any(x.get("path") == entry["path"] for x in fs_roots):
                 fs_roots.append(entry)
             changed.append("roots")
-        if relay_role != "operator" or relay_proxy:
+        if relay_role is not None or relay_proxy:
             rel = raw.setdefault("relay", {})
-            if relay_role != "operator":
+            if relay_role is not None:
                 rel["role"] = relay_role
-                rel["auto_update"] = False
+                if relay_role != "operator":
+                    rel["auto_update"] = False
             if relay_proxy:
                 rel["proxy"] = relay_proxy
             changed.append("relay")

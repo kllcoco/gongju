@@ -142,8 +142,10 @@ Example: service_define(name='vllm-qwen', preset='docker', preset_args=['image=v
 - China: Docker Hub needs daemon-side registry-mirrors (/etc/docker/daemon.json or Docker Desktop settings) or a \
 daemon proxy (systemd drop-in Environment=HTTPS_PROXY=…). The proxy Hive gives child processes does NOT affect \
 image pulls; this is an owner task.
-- Compose: keep a compose file on the node and define a service with command='docker compose up' and \
-options=['stop_command=docker compose down'] in that folder (cwd).
+- Compose (no preset; use absolute paths so the stop command works without a cwd, e.g. after hive node panic): \
+service_define(name='stack', command='docker compose -p hive-stack -f <abs>/compose.yaml up --remove-orphans', \
+options=['stop_command=["docker","compose","-p","hive-stack","-f","<abs>/compose.yaml","down","--timeout","30"]'], \
+port=…).
 - RunPod/AutoDL pods have no Docker: install the stack in a venv instead.
 - Docker group membership equals root on the host; the preset's checks are convenience, not a sandbox.
 """

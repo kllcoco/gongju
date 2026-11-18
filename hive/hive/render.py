@@ -29,6 +29,7 @@ JOB_ID_RE = re.compile(r"^j_[A-Za-z0-9_-]{6,40}\Z")
 SERVICE_RE = re.compile(r"^(?!.*\.\.)[a-z0-9][a-z0-9._-]{0,63}\Z")
 TRANSFER_ID_RE = re.compile(r"^tx_[A-Za-z0-9_-]{6,40}\Z")
 NODE_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}\Z")
+GENERIC_KEY_RE = re.compile(r"^[a-z_][a-z0-9_]{0,40}\Z")     # result keys usable as a fence label (generic)
 IDEMPOTENT_MUTATING = ("job.stop", "service.stop", "model.pull")
 POLICY_SENTENCE = "Do not try to work around node policy; ask the user if access is needed."
 MAYBE_SENTENCE = ("The command may or may not have run (connection lost). Check state (job_list / fs_op stat) "
@@ -123,10 +124,11 @@ def local_time(ts: Any) -> str:
 
 
 def head(ctx: RenderCtx, outcome: str, *nums: Any) -> str:
-    """First line ``[node] outcome · n1 · n2``."""
-    parts = [p for p in (_s(x) for x in nums) if p]
-    node = f"[{ctx.node}] " if ctx.node else ""
-    return node + outcome + ("".join(" · " + p for p in parts))
+    """First line ``[node] outcome · n1 · n2``; every part goes through ``clean`` (idempotent), so node text can
+    never start a line of its own (e.g. a fake ``Next:``) even if a caller forgot to clean it."""
+    parts = [p for p in (clean(x) for x in nums) if p]
+    node = f"[{clean(ctx.node, 64)}] " if ctx.node else ""
+    return node + clean(outcome) + ("".join(" · " + p for p in parts))
 
 
 def fence(what: str, ctx: RenderCtx, text: Any, meta: str = "") -> str:
@@ -140,8 +142,13 @@ def fence(what: str, ctx: RenderCtx, text: Any, meta: str = "") -> str:
 
 
 def table(rows: Sequence[Sequence[Any]], cols: Sequence[str], *, total: Optional[int] = None, offset: int = 0,
-          more_hint: Optional[str] = None) -> str:
-    """Aligned plain table (≤ 50 rows) with a paging footer ``… N more (use offset=K)``."""
+          more_hint: Optional[str] = None, footer: bool = True) -> str:
+    """Aligned plain table (≤ 50 rows) with a footer ``… N more (<more_hint>)``.
+
+    ``rows`` are the rows of this page, which starts at ``offset``; ``total`` (default ``offset + len(rows)``) is
+    the whole count. ``more_hint`` names the exact follow-up: callers whose action pages with ``offset`` pass
+    ``use offset=K`` themselves (or ``footer=False`` and write their own); without a hint the footer only says the
+    rows were not shown (most actions have no ``offset`` parameter, §17.6)."""
     shown = list(rows)[:MAX_TABLE_ROWS]
     cells = [[clean(c, 120) if c is not None else "-" for c in r] for r in shown]
     widths = [len(c) for c in cols]
@@ -151,10 +158,10 @@ def table(rows: Sequence[Sequence[Any]], cols: Sequence[str], *, total: Optional
     lines = ["  ".join(c.ljust(widths[i]) for i, c in enumerate(cols)).rstrip()]
     for r in cells:
         lines.append("  ".join(c.ljust(widths[i]) for i, c in enumerate(r[:len(cols)])).rstrip())
-    count = total if isinstance(total, int) else len(rows)
+    count = total if isinstance(total, int) and not isinstance(total, bool) else offset + len(rows)
     rest = count - offset - len(shown)
-    if rest > 0:
-        lines.append(f"… {rest} more ({more_hint or f'use offset={offset + len(shown)}'})")
+    if footer and rest > 0:
+        lines.append(f"… {rest} more ({more_hint or 'not shown'})")
     return "\n".join(lines)
 
 
@@ -244,12 +251,13 @@ def generic(result: dict, args: dict, ctx: RenderCtx) -> str:
         for k, v in result.items():
             if k in ("masked", "warnings"):
                 continue
-            if isinstance(v, str) and "\n" in v:
+            key = clean(k, 64)
+            if isinstance(v, str) and "\n" in v and isinstance(k, str) and GENERIC_KEY_RE.match(k):
                 lines.append(fence(k, ctx, v))
-            elif isinstance(v, (dict, list)):
-                lines.append(f"{k}: {clean(json.dumps(v, ensure_ascii=False, default=str), 4000)}")
+            elif isinstance(v, (dict, list)) or (isinstance(v, str) and "\n" in v):
+                lines.append(f"{key}: {clean(json.dumps(v, ensure_ascii=False, default=str), 4000)}")
             else:
-                lines.append(f"{k}: {clean(v, 2000)}")
+                lines.append(f"{key}: {clean(v, 2000)}")
     else:
         lines.append(clean(json.dumps(result, ensure_ascii=False, default=str), 4000))
     lines += masked_line(result)
@@ -336,7 +344,8 @@ def nodes_list(result: dict, args: dict, ctx: RenderCtx) -> str:
             notes.append(f"{clean(name, 64)} secrets: {clean(', '.join(sec), 400)}")
         if desc:
             notes.append(f"{clean(name, 64)}: {clean(desc, 200)}")
-    lines.append(table(trows, ["NAME", "STATE", "MODE", "OS", "GPUS", "TAGS"]))
+    lines.append(table(trows, ["NAME", "STATE", "MODE", "OS", "GPUS", "TAGS"],
+                       more_hint="include_offline=false hides offline nodes"))
     lines += notes
     if info:
         lines.append(f"shell: {clean(info.get('default_shell'), 20)} (available: "
@@ -399,7 +408,7 @@ def sys_info(result: dict, args: dict, ctx: RenderCtx) -> str:
     if isinstance(result.get("disks"), list):
         rows = [[d.get("mount"), d.get("fs"), human_bytes(d.get("free")), human_bytes(d.get("total")),
                  d.get("used_pct")] for d in result["disks"] if isinstance(d, dict)]
-        lines.append(table(rows, ["MOUNT", "FS", "FREE", "TOTAL", "USED%"]))
+        lines.append(table(rows, ["MOUNT", "FS", "FREE", "TOTAL", "USED%"], more_hint="disks not shown"))
     if isinstance(result.get("gpus"), list):
         if not result["gpus"]:
             lines.append("gpus: none" + (f" ({clean(result.get('gpu_note'), 200)})" if result.get("gpu_note") else ""))
@@ -506,6 +515,17 @@ def job_start(result: dict, args: dict, ctx: RenderCtx) -> str:
     return join(lines)
 
 
+def _num(v: Any) -> Optional[float]:
+    """A finite number from node data, else None (renderers never raise on odd values)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
 def _progress(p: Any) -> List[str]:
     if not isinstance(p, dict):
         return []
@@ -516,11 +536,13 @@ def _progress(p: Any) -> List[str]:
         tot = p.get("total")
         txt = human_bytes(p.get("done")) if tot is None else \
             f"{human_bytes(p.get('done')).split(' ')[0]}/{human_bytes(tot)}"
-        if p.get("percent") is not None:
-            txt += f" ({int(float(p['percent']))}%)"
+        pct = _num(p.get("percent"))
+        if pct is not None:
+            txt += f" ({int(pct)}%)"
         out.append(txt)
-    if p.get("rate_bps"):
-        out.append(f"{float(p['rate_bps']) / 1e6:.0f} MB/s")
+    rate = _num(p.get("rate_bps"))
+    if rate:
+        out.append(f"{rate / 1e6:.0f} MB/s")
     if p.get("eta_s") is not None:
         out.append("ETA " + human_duration(p.get("eta_s")))
     cur = p.get("current")
@@ -532,6 +554,18 @@ def _progress(p: Any) -> List[str]:
 
 
 FINAL_STATES = ("exited", "failed", "killed", "timeout", "lost")
+
+
+def waited_lines(ctx: RenderCtx, state: Any) -> List[str]:
+    """§17.4 clamping text for a wait that ended before the condition: ``waited 40s (client time limit); still
+    running`` when the Toolkit cut the requested wait down to the budget, else ``waited 300s; still running``."""
+    req = _num(ctx.meta.get("requested_wait"))
+    used = _num(ctx.meta.get("used_wait"))
+    if not req:
+        return []
+    if used is not None and req > used:
+        return [f"waited {int(used)}s (client time limit); still {clean(state, 12)}"]
+    return [f"waited {int(req)}s; still {clean(state, 12)}"]
 
 
 def job_status(result: dict, args: dict, ctx: RenderCtx) -> str:
@@ -569,13 +603,7 @@ def job_status(result: dict, args: dict, ctx: RenderCtx) -> str:
     if tail:
         lines.append(fence("output", ctx, tail, "tail"))
     if state not in FINAL_STATES:
-        req = ctx.meta.get("requested_wait")
-        w = ctx.meta.get("used_wait")
-        if req:
-            if w is not None and float(req) > float(w):
-                lines.append(f"waited {int(float(w))}s (client time limit); still {clean(state, 12)}")
-            else:
-                lines.append(f"waited {int(float(req))}s; still {clean(state, 12)}")
+        lines += waited_lines(ctx, state)
         lines.append(_job_next(ctx, jid))
     if kind == "pull" and state == "exited" and result.get("exit_code") == 0 and isinstance(res, dict) and \
             isinstance(res.get("path"), str) and _safe_path(res["path"]):
@@ -646,7 +674,7 @@ def job_list(result: dict, args: dict, ctx: RenderCtx) -> str:
                   f"{result.get('total')} total" if result.get("total") is not None else "")]
     if rows:
         lines.append(table(rows, ["JOB_ID", "NAME", "KIND", "STATE", "EXIT", "STARTED", "DURATION", "COMMAND"],
-                           total=len(rows)))
+                           more_hint="narrow with state, e.g. state='running'"))
     lines += masked_line(result)
     return join(lines)
 
@@ -661,7 +689,7 @@ def fs_list(result: dict, args: dict, ctx: RenderCtx) -> str:
     rows = [[e.get("type"), human_bytes(e.get("size")) if e.get("type") != "dir" else "-",
              rel_time(e.get("mtime")), e.get("path")] for e in ents]
     if rows:
-        lines.append(table(rows, ["TYPE", "SIZE", "MODIFIED", "PATH"]))
+        lines.append(table(rows, ["TYPE", "SIZE", "MODIFIED", "PATH"], footer=False))  # own offset footer below
     nxt = result.get("next_offset")
     shown_end = off + min(len(rows), MAX_TABLE_ROWS)
     if isinstance(nxt, int) or shown_end < off + len(rows):
@@ -767,8 +795,9 @@ def fs_transfer(result: dict, args: dict, ctx: RenderCtx) -> str:
     tid = result.get("transfer_id")
     done, tot = result.get("bytes_done"), result.get("bytes_total")
     nums = [f"{human_bytes(done)} of {human_bytes(tot)}" if tot else human_bytes(done)]
-    if result.get("rate_bps"):
-        nums.append(f"{float(result['rate_bps']) / 1e6:.0f} MB/s")
+    rate = _num(result.get("rate_bps"))
+    if rate:
+        nums.append(f"{rate / 1e6:.0f} MB/s")
     if result.get("eta_s") is not None and st == "running":
         nums.append("ETA " + human_duration(result.get("eta_s")))
     lines = [head(ctx, f"transfer {clean(tid, 48)} {clean(st, 12)}: {clean(result.get('src'), 300)} → "
@@ -792,17 +821,23 @@ def proc_list(result: dict, args: dict, ctx: RenderCtx) -> str:
              rel_time(p.get("started")), p.get("managed") or "-", redact(clean(p.get("cmd") or p.get("name"), 100))]
             for p in ps]
     lines = [head(ctx, f"{len(ps)} of {clean(result.get('total'), 8)} processes", clean(result.get("method"), 12))]
-    lines.append(table(rows, ["PID", "PPID", "USER", "CPU%", "MEM", "STARTED", "HIVE", "COMMAND"]))
+    lines.append(table(rows, ["PID", "PPID", "USER", "CPU%", "MEM", "STARTED", "HIVE", "COMMAND"],
+                       more_hint="narrow with filter or user, or change sort"))
     lines += masked_line(result)
     return join(lines)
 
 
 def proc_kill(result: dict, args: dict, ctx: RenderCtx) -> str:
     """proc_kill."""
-    k = ", ".join(str(x) for x in result.get("killed") or [])
-    a = ", ".join(str(x) for x in result.get("still_alive") or [])
+    k = ", ".join(str(x) for x in _pids(result.get("killed")))
+    a = ", ".join(str(x) for x in _pids(result.get("still_alive")))
     lines = [head(ctx, f"killed {k or 'nothing'}", f"still alive: {a}" if a else "", clean(result.get("method"), 20))]
     return join(lines)
+
+
+def _pids(v: Any) -> List[int]:
+    """Only integer pids (node-supplied lists never reach the first line as text)."""
+    return [x for x in v if isinstance(x, int) and not isinstance(x, bool)] if isinstance(v, list) else []
 
 
 def _svc_row(s: dict) -> List[Any]:
@@ -817,7 +852,8 @@ def service_list(result: dict, args: dict, ctx: RenderCtx) -> str:
     lines = [head(ctx, f"{len(svcs)} service" + ("" if len(svcs) == 1 else "s"))]
     if svcs:
         lines.append(table([_svc_row(s) for s in svcs],
-                           ["NAME", "STATE", "HEALTH", "PID", "UPTIME", "RESTARTS", "PORT", "ENDPOINT"]))
+                           ["NAME", "STATE", "HEALTH", "PID", "UPTIME", "RESTARTS", "PORT", "ENDPOINT"],
+                           more_hint="service_status(name=…) shows one service"))
     for s in svcs:
         if s.get("state") in ("backoff", "failed"):
             nxt = next_call(ctx, "service_logs", name=s.get("name"))
@@ -856,6 +892,11 @@ def _status_lines(result: dict, ctx: RenderCtx) -> List[str]:
     if result.get("next_restart_at"):
         lines.append("next restart " + rel_time(result["next_restart_at"]))
     return lines
+
+
+def _still_starting(result: dict) -> bool:
+    return result.get("state") == "starting" or (result.get("state") == "running" and
+                                                 result.get("health") in ("starting", "unknown"))
 
 
 def _service_head(result: dict, ctx: RenderCtx, verb: str) -> str:
@@ -910,6 +951,27 @@ def _shq(a: str) -> str:
     return "'" + a.replace("'", "'\\''") + "'"
 
 
+_CHANGED_PLAIN = ("port", "endpoint", "cwd", "gpus", "autostart", "restart", "health", "health_url", "start_period",
+                  "shell", "login", "endpoint_kind", "keep_awake", "stop_timeout", "preset", "description")
+
+
+def _changed_lines(changed: list, definition: Any) -> List[str]:
+    """One ``changed: <field>`` line per changed field (§17.6), with the new value for plain scalar fields (command,
+    argv and env stay in the redacted definition lines below)."""
+    d = definition if isinstance(definition, dict) else {}
+    out: List[str] = []
+    for f in changed[:40]:
+        name = clean(f, 64)
+        v = d.get(f) if isinstance(f, str) and f in _CHANGED_PLAIN else None
+        if isinstance(v, (str, int, float, bool)) and not (isinstance(v, str) and not v):
+            out.append(f"changed: {name} = {redact(clean(v, 200))}")
+        else:
+            out.append(f"changed: {name}")
+    if len(changed) > 40:
+        out.append(f"… {len(changed) - 40} more changed fields")
+    return out
+
+
 def service_define(result: dict, args: dict, ctx: RenderCtx) -> str:
     """service_define: created/updated, changed fields, effective definition, warnings."""
     verb = "created" if result.get("created") else "updated"
@@ -919,9 +981,11 @@ def service_define(result: dict, args: dict, ctx: RenderCtx) -> str:
     lines += extras(result)
     ch = result.get("changed")
     if isinstance(ch, list) and ch and not result.get("created"):
-        lines.append("changed: " + clean(", ".join(str(c) for c in ch), 400))
+        lines += _changed_lines(ch, result.get("definition"))
     lines += _definition_lines(result.get("definition"))
     lines += _status_lines(result, ctx)
+    if _still_starting(result):
+        lines += waited_lines(ctx, result.get("state"))
     lines += _service_tail_and_next(result, ctx)
     if result.get("state") == "stopped" and not result.get("tail"):
         lines.append(next_call(ctx, "service_control", op="start", name=result.get("name"), wait=_wait(ctx)))
@@ -942,6 +1006,8 @@ def service_control(result: dict, args: dict, ctx: RenderCtx) -> str:
     lines = [_service_head(result, ctx, f"({verb})" if verb else "")]
     lines += extras(result)
     lines += _status_lines(result, ctx)
+    if op in ("start", "restart") and _still_starting(result):
+        lines += waited_lines(ctx, result.get("state"))
     lines += _service_tail_and_next(result, ctx)
     lines += _gateway_hint(result, ctx)
     lines += masked_line(result)
@@ -957,13 +1023,8 @@ def service_status(result: dict, args: dict, ctx: RenderCtx) -> str:
     if hd.get("last_error"):
         lines.append("health check: " + clean(hd["last_error"], 300))
     lines += _status_lines(result, ctx)
-    req = ctx.meta.get("requested_wait")
-    w = ctx.meta.get("used_wait")
-    if req and result.get("state") in ("starting",) or (req and result.get("health") == "starting"):
-        if w is not None and float(req) > float(w):
-            lines.append(f"waited {int(float(w))}s (client time limit); still {clean(result.get('state'), 12)}")
-        else:
-            lines.append(f"waited {int(float(req))}s; still {clean(result.get('state'), 12)}")
+    if _still_starting(result):
+        lines += waited_lines(ctx, result.get("state"))
     lines += _service_tail_and_next(result, ctx)
     if result.get("tail") and result.get("state") == "running" and result.get("health") in ("healthy", "none"):
         lines.append(fence("log tail", ctx, result["tail"]))
@@ -1000,6 +1061,16 @@ def model_chat(result: dict, args: dict, ctx: RenderCtx) -> str:
     return join(lines)
 
 
+def _already_complete(result: dict) -> str:
+    """`` (0 already complete)`` / `` (3.9 GiB already complete)``: bytes of the snapshot already on disk (the start
+    result has ``total_bytes`` and ``to_download_bytes``, no per-file count)."""
+    tot, todo = result.get("total_bytes"), result.get("to_download_bytes")
+    if not all(isinstance(x, int) and not isinstance(x, bool) for x in (tot, todo)):
+        return ""
+    done = max(0, tot - todo)
+    return " (0 already complete)" if done == 0 else f" ({human_bytes(done)} already complete)"
+
+
 def model_pull(result: dict, args: dict, ctx: RenderCtx) -> str:
     """model_pull: dry-run plan or started job."""
     repo = clean(result.get("repo") or args.get("repo"), 200)
@@ -1008,7 +1079,7 @@ def model_pull(result: dict, args: dict, ctx: RenderCtx) -> str:
         lines = [head(ctx, f"pulling {repo} @ {commit} → {clean(result.get('path'), 300)} as job "
                            f"{clean(result.get('job_id'), 48)}")]
         lines.append(f"{clean(result.get('file_count'), 8)} files · {human_bytes(result.get('to_download_bytes'))} "
-                     f"to fetch")
+                     f"to fetch{_already_complete(result)}")
         lines += extras(result)
         lines.append(_job_next(ctx, result.get("job_id")))
         return join(lines, masked_line(result))
@@ -1071,13 +1142,15 @@ def port_check(result: dict, args: dict, ctx: RenderCtx) -> str:
         rows = [[p.get("port"), "open" if p.get("open") else "closed", p.get("pid") or "-",
                  p.get("process") or "-"] for p in ps]
         lines = [head(ctx, f"{sum(1 for p in ps if p.get('open'))} of {len(ps)} ports open",
-                      clean(result.get("method"), 12)), table(rows, ["PORT", "STATE", "PID", "PROCESS"])]
+                      clean(result.get("method"), 12)),
+                 table(rows, ["PORT", "STATE", "PID", "PROCESS"], more_hint="check fewer ports per call")]
     else:
         ls = [p for p in result.get("listeners") or [] if isinstance(p, dict)]
         rows = [[p.get("proto"), p.get("address"), p.get("port"), p.get("pid") or "-", p.get("process") or "-"]
                 for p in ls]
         lines = [head(ctx, f"{len(ls)} listening ports", clean(result.get("method"), 12)),
-                 table(rows, ["PROTO", "ADDRESS", "PORT", "PID", "PROCESS"])]
+                 table(rows, ["PROTO", "ADDRESS", "PORT", "PID", "PROCESS"],
+                       more_hint="pass ports=[…] to check specific ports")]
     return join(lines)
 
 
@@ -1094,10 +1167,11 @@ def model_list(result: dict, args: dict, ctx: RenderCtx) -> str:
              ", ".join(str(m) for m in (e.get("models") or [])[:5]) or "-"] for e in eps]
     lines = [head(ctx, f"{len(eps)} model endpoint" + ("" if len(eps) == 1 else "s"))]
     if rows:
-        lines.append(table(rows, ["NAME", "SOURCE", "API", "SERVER", "BASE_URL", "HEALTHY", "MODELS"]))
+        lines.append(table(rows, ["NAME", "SOURCE", "API", "SERVER", "BASE_URL", "HEALTHY", "MODELS"],
+                           more_hint="pass service or port for one endpoint"))
     if isinstance(result.get("models"), list):
         mrows = [[m.get("id"), m.get("owned_by") or "-"] for m in result["models"] if isinstance(m, dict)]
-        lines.append(table(mrows, ["MODEL", "OWNED_BY"]))
+        lines.append(table(mrows, ["MODEL", "OWNED_BY"], more_hint="models not shown"))
     return join(lines)
 
 
@@ -1107,8 +1181,9 @@ def list_actions(result: dict, args: dict, ctx: RenderCtx) -> str:
     rows = [[a.get("name"), a.get("risk"), "yes" if a.get("approval") else "-",
              ",".join(str(n) for n in a.get("nodes") or []) if "nodes" in a else "-",
              _s(a.get("title"))] for a in acts]
-    lines = [head(ctx, f"{len(acts)} actions"), table(rows, ["ACTION", "RISK", "APPROVAL", "NODES", "TITLE"],
-                                                     total=len(rows))]
+    lines = [head(ctx, f"{len(acts)} actions"),
+             table(rows, ["ACTION", "RISK", "APPROVAL", "NODES", "TITLE"],
+                   more_hint="narrow with node, or call_action with a known name")]
     lines.append("Call any of them with call_action(action=…, params_json='{…}'); schemas: tools export or the "
                  "catalog")
     return join(lines)

@@ -1,7 +1,8 @@
 """MCP server: McpCore (stdlib JSON-RPC 2.0), stdio loop, Streamable HTTP handler for the hub (design §18, WP6).
 
 ``McpCore.handle`` serves one JSON-RPC message: ``initialize`` (3 protocol versions), ``ping``, ``tools/list``,
-``tools/call`` (on a thread pool; the response is delivered through ``send``), ``notifications/cancelled``,
+``tools/call`` (on a pool of daemon threads, so a hung call never keeps the process alive after EOF; the response is
+delivered through ``send``), ``notifications/cancelled`` (the ``POST /v1/cancel`` runs off the reader thread),
 ``logging/setLevel``, empty ``resources/list``/``prompts/list``; batches → -32600, unknown methods → -32601.
 ``run_stdio`` is ``hive mcp …`` (§18.3): stdout is reserved for the protocol (``sys.stdout`` is pointed at stderr), a
 watcher refreshes the Toolkit every 30 s and emits ``notifications/tools/list_changed``.
@@ -10,12 +11,13 @@ watcher refreshes the Toolkit every 30 s and emits ``notifications/tools/list_ch
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Dict, List, Optional, Union
 
@@ -31,6 +33,7 @@ SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26"]
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR = -32700, -32600, -32601, -32602, -32603
 STRUCTURED_MAX = 1 << 20
 WATCH_INTERVAL = 30.0
+WATCH_INTERVAL_ENV = "HIVE_MCP_WATCH_INTERVAL"   # tests only: a shorter watcher interval for `hive mcp`
 EOF_WAIT = 2.0
 LOG_LEVELS = ("debug", "info", "notice", "warning", "error", "critical", "alert", "emergency")
 
@@ -58,6 +61,80 @@ class CallHandle:
         self.cancelled = False
 
 
+class _DaemonPool:
+    """A small bounded pool of daemon worker threads (started on demand, at most ``max_workers``).
+
+    Unlike ``ThreadPoolExecutor`` (whose workers concurrent.futures joins at interpreter exit) a call stuck on a
+    stalled hub cannot keep ``hive mcp`` alive after stdin EOF (§18.3: wait ≤ 2 s, exit 0)."""
+
+    def __init__(self, max_workers: int, name: str):
+        self._max = max(1, int(max_workers))
+        self._name = name
+        self._q: "collections.deque[Callable[[], None]]" = collections.deque()
+        self._cv = threading.Condition()
+        self._workers = 0
+        self._idle = 0
+        self._busy = 0
+        self._closed = False
+
+    def submit(self, fn: Callable[[], None]) -> None:
+        """Queue ``fn``; RuntimeError after ``shutdown``."""
+        with self._cv:
+            if self._closed:
+                raise RuntimeError("pool is shut down")
+            self._q.append(fn)
+            if len(self._q) > self._idle and self._workers < self._max:
+                self._workers += 1
+                threading.Thread(target=self._run, name=f"{self._name}-{self._workers}", daemon=True).start()
+            else:
+                self._cv.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self._cv:
+                while not self._q and not self._closed:
+                    self._idle += 1
+                    self._cv.wait()
+                    self._idle -= 1
+                if not self._q:
+                    self._workers -= 1
+                    self._cv.notify_all()
+                    return
+                fn = self._q.popleft()
+                self._busy += 1
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - work() handles its own errors
+                log.exception("mcp worker failed")
+            finally:
+                with self._cv:
+                    self._busy -= 1
+                    self._cv.notify_all()
+
+    def shutdown(self, wait: float = 0.0) -> bool:
+        """Refuse new work and wait ≤ ``wait`` s for queued and running work; True when everything finished."""
+        end = time.monotonic() + max(0.0, wait)
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+            while self._q or self._busy:
+                left = end - time.monotonic()
+                if left <= 0:
+                    return False
+                self._cv.wait(left)
+        return True
+
+
+def _bg(fn: Callable[[], None], name: str) -> None:
+    """Run ``fn`` on a daemon thread (for calls that may block on the network)."""
+    def run() -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log.debug("%s failed: %s", name, e)
+    threading.Thread(target=run, name=name, daemon=True).start()
+
+
 def _resp(mid: Any, result: Any) -> dict:
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
@@ -78,7 +155,7 @@ class McpCore:
         self.structured_content = bool(structured_content)
         self.watch = True                       # stdio: refresh + list_changed (HTTP sets False, §18.5)
         self.watch_interval = WATCH_INTERVAL
-        self._pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)), thread_name_prefix="mcp-call")
+        self._pool = _DaemonPool(max_workers, "mcp-call")
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._watcher: Optional[threading.Thread] = None
@@ -96,7 +173,12 @@ class McpCore:
         has_id = "id" in msg
         mid = msg.get("id")
         if method is None:
-            return None                                 # a response from the client (we send no requests)
+            if "result" in msg or "error" in msg:
+                return None                             # a response from the client (we send no requests)
+            if not has_id:
+                return None                             # nothing to answer (no id)
+            ok_id = mid is None or (isinstance(mid, (str, int, float)) and not isinstance(mid, bool))
+            return _err(mid if ok_id else None, INVALID_REQUEST, "invalid request: missing method")
         if not isinstance(method, str) or (has_id and not isinstance(mid, (str, int, float)) and mid is not None):
             return _err(mid if has_id else None, INVALID_REQUEST, "invalid request")
         params = msg.get("params")
@@ -158,10 +240,8 @@ class McpCore:
             if h is not None:
                 h.cancelled = True
                 h.cancel.set()
-                try:
-                    self.toolkit.cancel(h.request_id)
-                except Exception as e:  # noqa: BLE001
-                    log.debug("cancel failed: %s", e)
+                # POST /v1/cancel can take as long as a connect timeout: never on the stdin reader thread
+                _bg(lambda: self.toolkit.cancel(h.request_id), "mcp-cancel")
 
     def _tools_call(self, mid: Any, params: dict, session: McpSession, send: Callable[[dict], None]) -> Optional[dict]:
         name = params.get("name")
@@ -259,8 +339,9 @@ class McpCore:
             self._watcher = threading.Thread(target=loop, name="mcp-watcher", daemon=True)
             self._watcher.start()
 
-    def close(self, session: Optional[McpSession] = None, wait: float = EOF_WAIT) -> None:
-        """Cancel in-flight calls, wait ≤ ``wait`` s, stop the watcher and the pool."""
+    def close(self, session: Optional[McpSession] = None, wait: float = EOF_WAIT) -> bool:
+        """Cancel in-flight calls (the cancel requests run on daemon threads), stop the watcher and wait ≤ ``wait`` s
+        for the pool; True when every call finished. Workers are daemon threads, so the caller can exit either way."""
         self._stop.set()
         if session is not None:
             with self._lock:
@@ -268,17 +349,8 @@ class McpCore:
             for h in handles:
                 h.cancelled = True
                 h.cancel.set()
-                try:
-                    self.toolkit.cancel(h.request_id)
-                except Exception:  # noqa: BLE001
-                    pass
-        done = threading.Event()
-
-        def shut() -> None:
-            self._pool.shutdown(wait=True)
-            done.set()
-        threading.Thread(target=shut, daemon=True).start()
-        done.wait(max(0.0, wait))
+                _bg(lambda rid=h.request_id: self.toolkit.cancel(rid), "mcp-cancel")
+        return self._pool.shutdown(wait)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -365,6 +437,7 @@ def run_stdio(argv: List[str]) -> int:
     """``hive mcp …``."""
     a = build_parser().parse_args(argv)
     proto_out = sys.stdout.buffer
+    _tolerant(sys.stderr)              # node text in log lines must not raise UnicodeEncodeError (cp936/cp1252)
     sys.stdout = sys.stderr            # stray prints cannot corrupt the protocol (§18.3)
     if os.name == "nt":  # pragma: no cover - Windows only
         try:
@@ -402,7 +475,31 @@ def run_stdio(argv: List[str]) -> int:
         sys.stderr.write(f"hive mcp: {e.code}: {e.message}\n")
         return 2
     core = McpCore(tk, structured_content=bool(a.structured or getattr(tcfg, "structured_content", False)))
-    return serve_stdio(core, sys.stdin.buffer, proto_out)
+    try:
+        iv = float(os.environ.get(WATCH_INTERVAL_ENV) or 0)
+        if 0 < iv < WATCH_INTERVAL:
+            core.watch_interval = iv
+    except ValueError:
+        pass
+    rc = serve_stdio(core, sys.stdin.buffer, proto_out)
+    # §18.3 EOF: exit after ≤ 2 s even if some non-daemon thread (e.g. a library's) still runs a stuck request
+    if any(t.is_alive() and not t.daemon for t in threading.enumerate() if t is not threading.main_thread()):
+        for stream in (proto_out, sys.stderr):
+            try:
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        logging.shutdown()
+        os._exit(rc)
+    return rc
+
+
+def _tolerant(stream: Any) -> None:
+    """``errors='backslashreplace'`` on a text stream when it supports ``reconfigure`` (3.7+)."""
+    try:
+        stream.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError, OSError):
+        pass
 
 
 def http_handler(core_factory: Callable[..., McpCore]) -> Callable[..., Any]:
