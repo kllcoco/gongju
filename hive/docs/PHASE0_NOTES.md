@@ -1755,3 +1755,32 @@ R2-20. **presets guide for CLI users (minor):** `hive guide presets` starts with
     (R2-3), `test_services` port preflight (R2-11), `test_walkthrough.TestForegroundRestart` (R2-14), updated
     `test_sec_audit` (whole-text cd), `test_shell` (exec path bound and labelled), init no-op and token fixtures in
     `test_cli`/`test_walkthrough`/`test_wp6a_review`.
+
+### QA report (independent QA session: flaky races, leaked processes and temp dirs)
+
+QA-F1. **Job hold released after the final state was published (race):** `JobManager._finalize` set the final state and
+    woke waiters before `_release_hold`/`_save`, so `wait_final` (and a yielded `shell.run`) could return while the
+    approved file was still held ("[conflict] … in use by an approved command"). Now the hold is released first, then
+    the final state is set and saved; `wait_final`/`wait` also wait while the job is in `_finalizing` (record saved by
+    then). The `start_job` spawn-failure path releases before publishing "failed" too. Regression test (a blocked
+    final-record write holds the window open): `test_jobs.TestJobManager.test_hold_released_before_final_state_is_published`.
+QA-F2. **Queued autostart reported as settled "stopped":** after a node start, services queued for the staggered
+    boot-time autostart stayed `state="stopped"` until spawned, and `ServiceManager._settled` treated that as final,
+    so `service.status wait=N` returned "stopped" at once. `_settled` now treats stopped + desired running (not a
+    manual stop) as pending while the manager runs (the autostart or the supervisor spawns it next). The e2e restart
+    test registers the service pids before asserting. Regression test (spawn gated by an Event):
+    `test_services.TestQAAutostartRaces.test_status_wait_covers_the_queued_autostart`.
+QA-L1. **Autostart spawning after shutdown (orphaned shim + child per run of test_stop_on_exit):** `shutdown()` ran
+    the stop-on-exit pass before setting `_stop` and joining the autostart thread. Now it sets `_stop`, joins the
+    autostart thread and waits for supervisor spawns already handed to the pool, then runs the stop-on-exit pass;
+    `_autostart` checks `_stop` before every spawn. Regression test (spawn gated until shutdown began):
+    `test_services.TestQAAutostartRaces.test_shutdown_stops_a_service_the_autostart_was_spawning`.
+QA-L2. **Temp dirs left per full run:** `helpers.make_runtime`/`start_node_server` and `wp5util.start_relay_node`
+    register the homes they create (`helpers.temp_home`/`new_temp_home`); `rt.stop()` / `rt.test_stop()` delete them
+    (`helpers.remove_on_stop`), an atexit hook removes any left. rmtree cleanups in `test_mcp_http` (class root),
+    `test_util` (hivelock, hiveprune), `test_stubs` (hivepreset); `test_presets.test_local_model_rules` keeps its
+    FakeRuntime referenced (a collected one removed its dir, then the test re-created it). Product: `NodeRuntime.stop()`
+    joins the scheduler thread (≤ 5 s), and `paused.ack` is written with `mkdir=False`, so a periodic task never
+    re-creates a deleted data dir after stop.
+QA-M. `# pragma: no cover - Python < 3.12` on the `rmtree(onerror=)` branches of `actions/files.py` removed (they run
+    on 3.9–3.11).
