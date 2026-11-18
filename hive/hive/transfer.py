@@ -302,6 +302,8 @@ def copy(src: FsEndpoint, sp: str, dst: FsEndpoint, dp: str, *, chunk: int = DEF
             data, _eof = src.read_chunk(sp, offset, length)
             if len(data) != length:
                 raise conflict("source changed size while copying; run again", hint="source changed; run again")
+            if cancel is not None and cancel.is_set():
+                raise HiveError("cancelled", "transfer cancelled", hint="run it again to resume")
         else:
             data = b""
         final = offset + length >= size
@@ -405,6 +407,9 @@ class TransferManager:
             raise bad_request(f"unknown transfer option(s): {', '.join(sorted(kw))}")
         s_ep, s_path = self._endpoint(src)
         d_ep, d_path = self._endpoint(dst)
+        for ep, path in ((s_ep, s_path), (d_ep, d_path)):
+            if isinstance(ep, LocalFS):
+                ep._resolve(path)           # refuse local paths outside the roots before starting
         with self._lock:
             self._prune()
             running = sum(1 for r in self._recs.values() if r.state == "running")
