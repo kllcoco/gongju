@@ -126,7 +126,7 @@ class NodeDaemon:
 
     def __init__(self, name: str = "m3", *, preset: str = "standard", init_args: Sequence[str] = (),
                  cfg_edit: Any = None, path_prepend: Sequence[str] = (), env_extra: Optional[Dict[str, str]] = None,
-                 pythonpath_extra: Sequence[str] = ()):
+                 pythonpath_extra: Sequence[str] = (), before_run: Any = None):
         self.name = name
         self.base = Path(tempfile.mkdtemp(prefix=f"hive{name}-")).resolve()
         self.home = self.base / "home"       # HIVE_HOME
@@ -137,6 +137,7 @@ class NodeDaemon:
         self.preset = preset
         self.init_args = list(init_args)
         self.cfg_edit = cfg_edit
+        self.before_run = before_run          # before_run(self) after init, before the first start (token adds …)
         pp = [str(ROOT)] + [str(x) for x in pythonpath_extra]
         if os.environ.get("PYTHONPATH"):
             pp.append(os.environ["PYTHONPATH"])
@@ -172,6 +173,8 @@ class NodeDaemon:
                 m2util.edit_json(self.cfg_path, self.cfg_edit)
             self.agent = (self.home / "tokens" / "this-pc.token").read_text(encoding="utf-8").strip()
             self.owner = (self.home / "tokens" / "this-pc-owner.token").read_text(encoding="utf-8").strip()
+            if self.before_run is not None:
+                self.before_run(self)
             self.run()
         except BaseException:
             self.stop()
@@ -260,6 +263,16 @@ class NodeDaemon:
 
     def secret_set(self, name: str, value: str, *hosts_args: str) -> None:
         self.ok(self.cli("node", "secret", "set", name, *hosts_args, stdin=value + "\n"), f"secret set {name}")
+
+    def add_token(self, name: str, *args: str) -> str:
+        """``hive node token add NAME ARGS…`` -> the printed token (restarts a running daemon, §8.6)."""
+        out = self.ok(self.cli("node", "token", "add", name, *args), f"token add {name}")
+        m = re.search(r"^(hv_[A-Za-z0-9_-]+)$", out, re.M)
+        if not m:
+            raise AssertionError(f"no token in: {out}")
+        if self.sup is not None and self.sup.running:
+            wait_for(self.healthy, 60, what="node back after token add")
+        return m.group(1)
 
     def restart_daemon(self) -> None:
         """Stop (owner ``hive node stop``) and start again: config edits take effect (§8.6)."""

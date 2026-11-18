@@ -661,11 +661,13 @@ def _send_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], bo
     except BaseException as e:  # noqa: BLE001 - mapped below; the connection is always closed
         conn.close()
         raise _map_send_error(e, host, port, sent_before or conn.sent)
-    if target.route == "proxy" and resp.status == 407 and proxy_auth is None and not credentialed \
-            and target.scheme == "http":
+    if target.route == "proxy" and resp.status == 407 and not credentialed and target.scheme == "http":
+        # absolute-form through the proxy: its 407 is the proxy's answer, mapped like open_tunnel's (M3: also when
+        # the configured user:pass was sent and refused, instead of passing a 407 "response" to the agent)
         conn.close()
-        raise unavailable("proxy requires credentials", reason="proxy_auth", maybe_executed=False,
-                          hint="put user:pass in network.proxy")
+        raise unavailable("proxy requires credentials" if proxy_auth is None else
+                          "the proxy refused the credentials in network.proxy", reason="proxy_auth",
+                          maybe_executed=False, hint="put the proxy's user:pass in network.proxy")
     return conn, resp
 
 
