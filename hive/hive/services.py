@@ -679,7 +679,9 @@ class ServiceManager:
                 try:
                     eff.check_url(str(u), purpose="health")
                 except HiveError as e:
-                    if e.code != "unsupported":
+                    # WP3a CONTRACT-REQUEST: a DNS failure (unavailable) is not a policy decision; the health check
+                    # reports it later, the definition/start is not refused for it
+                    if e.code not in ("unsupported", "unavailable"):
                         raise
         for v in d.get("volumes") or []:
             real, _c, _m = presets.docker_volume(v.get("spec", ""), eff)

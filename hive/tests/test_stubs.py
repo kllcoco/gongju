@@ -123,16 +123,20 @@ class TestNetStubs(unittest.TestCase):
         t = netutil.VettedTarget("https", "h", 443, "/", "1.2.3.4", "direct", None, "public")
         self.assertFalse(t.pin_ip)
 
-    def test_netguard_stub(self):
+    def test_netguard_real(self):
+        # WP3a CONTRACT-REQUEST: NetGuard, guarded_request and tcp_check are real now (tests in test_netutil.py);
+        # open_download stays a stub until WP3b
         g = netutil.NetGuard(http_allow=["loopback"], http_deny=[], download_allow=[], allow_metadata_ip=False,
                              proxies=netproxy.load_proxy_settings(None))
+        t = g.check_url("http://127.0.0.1/", purpose="http")
+        self.assertEqual((t.route, t.category, t.ip), ("direct", "loopback", "127.0.0.1"))
         with self.assertRaises(HiveError) as cm:
-            g.check_url("http://127.0.0.1/", purpose="http")
+            g.check_url("http://8.8.8.8/", purpose="http")
+        self.assertEqual(cm.exception.code, "policy_denied")
+        with self.assertRaises(HiveError) as cm:
+            netutil.open_download("http://127.0.0.1/", guard=g)
         self.assertEqual(cm.exception.code, "unsupported")
-        for fn in (lambda: netutil.guarded_request("GET", "http://x/", guard=g, purpose="http"),
-                   lambda: netutil.open_download("http://x/", guard=g), lambda: netutil.tcp_check("127.0.0.1", 1)):
-            with self.assertRaises(HiveError):
-                fn()
+        self.assertEqual(netutil.tcp_check("127.0.0.1", helpers.free_port(), 0.5)[0], False)
 
     def test_netproxy_no_proxy_stub(self):
         s = netproxy.load_proxy_settings({"proxy": "http://127.0.0.1:7890"}, {"HTTPS_PROXY": "http://x:1"})
@@ -305,11 +309,13 @@ class TestWp3Stubs(unittest.TestCase):
             self.assertEqual(cm.exception.code, "bad_request")
         fsops.check_regex("y" * 300, max_len=500)
 
-    def test_part_tracker_noop(self):
-        pt = fsops.PartTracker(Path("parts.json"))
-        pt.touch(Path("a.hive-part"))
-        pt.done(Path("a.hive-part"))
-        self.assertEqual(pt.prune(), 0)
+    def test_part_tracker_real(self):
+        # WP3a CONTRACT-REQUEST: PartTracker is real (it writes its JSON file); use a temp dir, never the cwd
+        with tempfile.TemporaryDirectory() as d:
+            pt = fsops.PartTracker(Path(d) / "parts.json")
+            pt.touch(Path(d) / "a.hive-part")
+            pt.done(Path(d) / "a.hive-part")
+            self.assertEqual(pt.prune(), 0)
 
 
 class TestWp4Wp5Wp6Stubs(unittest.TestCase):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import importlib
 import unittest
 
 from hive import catalog, schema
@@ -323,15 +324,23 @@ class TestHandlersGate(unittest.TestCase):
     def test_every_node_spec_has_handler(self):
         # WP1 CONTRACT-REQUEST (PHASE0_NOTES): an action module that registers no handler at all is an unmerged WP
         # (Phase 1 merge order) and is skipped; a module that registers some of its actions must register all of them.
+        # WP3a CONTRACT-REQUEST: a module merged in two parts (actions/model.py: WP3a now, WP3b later, §22.1) lists
+        # the actions of its later part in PENDING_ACTIONS; those count as unmerged.
         load_all()
         node_specs = [n for n, s in SPECS.items() if s.scope == "node"]
         by_mod = {}
         for n in node_specs:
             by_mod.setdefault(self.MODULE_OF[n.split(".", 1)[0]], []).append(n)
+        pending = set()
+        for m in by_mod:
+            pending |= set(getattr(importlib.import_module(f"hive.actions.{m}"), "PENDING_ACTIONS", ()))
+        for n in pending:
+            self.assertNotIn(n, HANDLERS, f"{n} is registered but still listed in PENDING_ACTIONS")
         merged = {m for m, names in by_mod.items() if any(n in HANDLERS for n in names)}
-        missing = [n for n in node_specs if n not in HANDLERS and self.MODULE_OF[n.split(".", 1)[0]] in merged]
+        missing = [n for n in node_specs if n not in HANDLERS and n not in pending
+                   and self.MODULE_OF[n.split(".", 1)[0]] in merged]
         self.assertEqual(missing, [])
-        unmerged = sorted(set(by_mod) - merged)
+        unmerged = sorted(set(by_mod) - merged) + sorted(pending)
         if unmerged:
             self.skipTest("integration gate: action modules not merged yet: " + ", ".join(unmerged))
 

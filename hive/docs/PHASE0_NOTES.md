@@ -526,26 +526,26 @@ by the lead or a line in DESIGN.md.
 
 ## WP3a hand-off (contract requests and interpretations)
 
-69. **CONTRACT-REQUEST (WP3a → P0 tests):** `test_catalog.TestHandlersGate` reads an optional module constant
+73. **CONTRACT-REQUEST (WP3a → P0 tests):** `test_catalog.TestHandlersGate` reads an optional module constant
     `PENDING_ACTIONS` from each action module: `actions/model.py` is merged in two parts (§22.1: model.endpoints /
     model.chat in WP3a, model.pull / model.forward in WP3b) and lists `("model.pull", "model.forward")` there. Pending
     actions count as unmerged (the test skips naming them) and must not be registered while listed. WP3b removes the
     constant. `test_stubs.test_netguard_stub` became `test_netguard_real` (NetGuard/guarded_request/tcp_check are real;
     `open_download` stays a stub until WP3b) and `test_part_tracker_noop` became `test_part_tracker_real` (the real
     PartTracker writes its JSON file, so the test uses a temp dir instead of the cwd).
-70. **CONTRACT-REQUEST (WP3a → WP2 `services.py`, one line):** the start plan's `eff.check_url(endpoint|health_url,
+74. **CONTRACT-REQUEST (WP3a → WP2 `services.py`, one line):** the start plan's `eff.check_url(endpoint|health_url,
     purpose="health")` now also tolerates `unavailable` (a DNS failure is not a policy decision; the health check
     reports it). With the real NetGuard an unresolvable endpoint host (e.g. `https://evil.example/v1` in
     `test_services.test_endpoint_for_auth`, no DNS in CI) made `service.define` fail. Policy denials still refuse.
     WP2's `_http_status`/`_tcp_check` now run on the real `guarded_request`/`tcp_check` (their P0 fallbacks stay).
-71. **CONTRACT-REQUEST (WP3a, additive signatures):** `fsops.read_lines(…, *, line_numbers=False)` (numbering inside
+75. **CONTRACT-REQUEST (WP3a, additive signatures):** `fsops.read_lines(…, *, line_numbers=False)` (numbering inside
     the byte budget); `fsops.walk(…, skip_dirs=())` (fs.search skips `.git node_modules …` without descending).
     Extra fsops helpers used by actions/files.py: `os_errors` (the §11.1 OS-error mapping as a context manager),
     `decode_bytes`/`encode_text` (lossless round trip: BOM kept, undecodable bytes kept with surrogateescape),
     `split_lines` (only `\r\n`/`\r`/`\n` break lines), `normalize_newlines`, `snippet`, `entry_allowed`,
     `display_text`, `binary_error`, `json_depth_ok`. `actions/model.py` exports `list_endpoints`/`parse_base_url`
     (WP3b's model.forward / gateway may reuse them).
-72. **NetGuard interpretations (WP3a):**
+76. **NetGuard interpretations (WP3a):**
     - Denial rules: `ssrf` (metadata/link-local IPs and names, reserved, literal fake-ip, mixed fake-ip answers),
       `net_allow` (category/IP/CIDR/host glob not in the allow list; hint lists it), `http_deny`, `own_port`.
       DNS failure without a usable proxy → `unavailable` reason `dns`, `maybe_executed:false`.
@@ -557,7 +557,7 @@ by the lead or a line in DESIGN.md.
       name. `pin_ip` is set by NetGuard only for `strict_dns` (never for a fake-ip answer); rule 5c is WP1's.
     - Name resolution is the module function `netutil._resolve(host, port, timeout)` (getaddrinfo in a daemon
       thread, ≤ 5 s); tests patch it to stub DNS.
-73. **guarded_request interpretations (WP3a):** besides §11.2 it rejects agent framing headers (`Host`,
+77. **guarded_request interpretations (WP3a):** besides §11.2 it rejects agent framing headers (`Host`,
     `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Keep-Alive`, `Trailer`, `Proxy-*`) and an
     `Authorization` header together with `auth` (`bad_request`), so net.http (WP3b) gets these rules for free. With
     `auth`, the **first** hop must be a host the secret is bound to (`policy_denied` rule `secret_host`, hint with
@@ -569,7 +569,7 @@ by the lead or a line in DESIGN.md.
     credentialed `http` through a proxy call `netproxy.open_tunnel` (still the P0 `unsupported` stub until WP3b;
     `tests/fixtures/connect_proxy.simple_open_tunnel` stands in for it in tests). TLS failures → `unavailable` reason
     `tls`.
-74. **fs.* interpretations (WP3a):**
+78. **fs.* interpretations (WP3a):**
     - Symbolic links: fs.stat reports a link (`type:"link"`, `link_target`, size/mtime of the target) and fs.delete /
       fs.move act on the link itself, located through a PathGuard-vetted parent; the target must still pass
       PathGuard (a link to a path outside the roots cannot be stat'ed, moved or deleted: conservative).
@@ -586,7 +586,7 @@ by the lead or a line in DESIGN.md.
       that are, or contain, a filesystem root, home, the workdir, an fs root or the data dir (rule
       `protected_path`).
     - New files get mode 0644 (POSIX), part files 0600; overwrite keeps the original mode bits.
-75. **model.* interpretations (WP3a):** probe rows have `name: null`; config `model_endpoints` rows on non-loopback
+79. **model.* interpretations (WP3a):** probe rows have `name: null`; config `model_endpoints` rows on non-loopback
     hosts are listed but not probed (`healthy: null`; read risk reaches only loopback and service endpoints);
     service/config/probe rows are deduplicated by normalized base URL in that order; an unanswered config row is
     `healthy:false, server:"unknown"`. model.chat: an `ollama`-kind endpoint without a `/v1` path gets `/v1`
