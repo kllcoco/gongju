@@ -68,14 +68,22 @@ class TestM3WslKeepalive(unittest.TestCase):
                 rt.stop()
             except Exception:  # noqa: BLE001
                 pass
+        pids = set()
         for f in (self.home / "node" / "state").glob("wsl-keepalive-*.json"):
             try:
                 rec = json.loads(f.read_text(encoding="utf-8"))
+                pids.add(rec["pid"])
                 if util.pid_alive(rec["pid"], rec.get("ctime")):
                     os.kill(rec["pid"], signal.SIGKILL)
             except (OSError, ValueError, KeyError):
                 pass
-        proctree.reap_detached()
+        # reap until the keepalives are gone from proctree's list: one poll right after SIGKILL can still see one
+        # running, and its Popen then stayed there until interpreter exit ("subprocess N is still running")
+        try:
+            helpers.wait_until(lambda: proctree.reap_detached() is None and
+                               not any(d.pid in pids for d in proctree._detached), 10)
+        except AssertionError:
+            pass
 
     def runtime(self, entries: list) -> Any:
         raw = helpers.make_node_config(data_dir=str(self.home / "node"), wsl={"keepalive": entries})

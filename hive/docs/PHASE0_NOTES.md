@@ -1787,3 +1787,13 @@ QA-R. **ResourceWarnings:** the test CONNECT proxy in `test_transport` now close
     client thread) did not reproduce alone and is left.
 QA-M. `# pragma: no cover - Python < 3.12` on the `rmtree(onerror=)` branches of `actions/files.py` removed (they run
     on 3.9–3.11).
+QA-S. **Stress verification after the QA fixes:** full suite 3x on python3 (3.13) and 3x on 3.9 (two runs in
+    parallel), `tests/integration` 6x on each (two in parallel): 18/18 green, no failure or flake, no process and no
+    /tmp entry left behind (21 orphaned "soe" shim pairs from runs before the QA-L1 fix remain from earlier sessions).
+    Warnings found under load and fixed (test-side): the sporadic `test_e2e_m2` ResourceWarning (QA-R) was the SSE
+    and status-only `http()` responses never closed: `m2util.sse_lines` closes its response, new `m2util.http_status`,
+    the pyz/initialize responses closed; `test_m3_wsl` cleanup polled `reap_detached` once right after SIGKILL, so a
+    keepalive Popen stayed in `proctree._detached` until exit ("subprocess N is still running"): it now waits until
+    the keepalive pids are reaped; `test_walkthrough.TestForegroundNodeSurvivesConfigChange` used `pty.fork()` in the
+    multi-threaded test process (DeprecationWarning on 3.12+, a possible child deadlock): `pty.openpty()` +
+    `subprocess.Popen` (fork+exec in C). The WSL module ran 20x clean with `-W always::ResourceWarning`.
