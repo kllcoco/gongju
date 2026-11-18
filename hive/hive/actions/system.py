@@ -12,7 +12,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .. import gpu, procinfo, proctree, sysinfo, util
-from ..errors import not_found
+from ..errors import HiveError, not_found
 from . import ActionContext, handler
 
 ALL_SECTIONS = ("os", "cpu", "memory", "disk", "gpu", "network", "software")
@@ -63,12 +63,19 @@ def system_info(ctx: ActionContext, p: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------------
 # proc.list
 
+def _redacted(cmd: Any) -> str:
+    """The whole command line joined with spaces and passed through ``audit.redact_text`` ("" for none)."""
+    if not cmd:
+        return ""
+    from ..audit import redact_text
+    text = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+    return redact_text(text)
+
+
 def _cmd_text(cmd: Any) -> Optional[str]:
     if not cmd:
         return None
-    from ..audit import redact_text
-    text = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
-    text = redact_text(text)
+    text = _redacted(cmd)
     if len(text) > CMD_MAX:
         text = text[:CMD_MAX - 1] + "…"
     return text
@@ -104,7 +111,9 @@ def proc_list(ctx: ActionContext, p: dict) -> dict:
         if user and _user_key(r.get("user")) != _user_key(user):
             continue
         if flt:
-            hay = (str(r.get("name") or "") + " " + " ".join(str(c) for c in (r.get("cmdline") or []))).casefold()
+            # matched against the same redacted text `cmd` shows (not cut to 300 chars): `total`/`shown` must not
+            # become an oracle for secrets on a command line (§5.8)
+            hay = (str(r.get("name") or "") + " " + _redacted(r.get("cmdline"))).casefold()
             if flt not in hay:
                 continue
         sel.append(r)
@@ -136,13 +145,32 @@ def proc_list(ctx: ActionContext, p: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------------
 # proc.kill
 
-def _ancestors(pid: int) -> List[int]:
-    """``pid`` and its ancestors (bounded walk)."""
+def _ppid_map() -> Optional[Dict[int, int]]:
+    """{pid: ppid} from one snapshot on Windows (psutil | Toolhelp32), where ``process_info`` without psutil starts a
+    PowerShell CIM query per pid; None elsewhere (``/proc`` and ``ps`` reads are cheap)."""
+    if not util.IS_WINDOWS:
+        return None
+    ps = procinfo._psutil()  # pragma: no cover - Windows only below
+    if ps is not None:
+        try:
+            return {int(p.info["pid"]): int(p.info["ppid"] or 0) for p in ps.process_iter(["pid", "ppid"])}
+        except Exception:  # noqa: BLE001
+            pass
+    from .. import winapi
+    rows = winapi.process_list()
+    return {int(pid): int(ppid) for pid, ppid, _n in rows} if rows else None
+
+
+def _ancestors(pid: int, pmap: Optional[Dict[int, int]] = None) -> List[int]:
+    """``pid`` and its ancestors (bounded walk over ``pmap`` when given, else ``procinfo.process_info``)."""
     out = [pid]
     cur = pid
     for _ in range(64):
-        info = procinfo.process_info(cur)
-        pp = info.get("ppid") if info else None
+        if pmap is not None:
+            pp = pmap.get(cur)
+        else:
+            info = procinfo.process_info(cur)
+            pp = info.get("ppid") if info else None
         if not isinstance(pp, int) or pp <= 0 or pp in out:
             break
         out.append(pp)
@@ -154,7 +182,7 @@ def protected_pids(ctx: ActionContext) -> Dict[int, str]:
     """{node pid and its ancestors: "hive node"} ∪ managed pids (jobs, services, WSL keepalive) (§5.4 kill guard)."""
     prot: Dict[int, str] = {}
     self_pid = int(getattr(ctx.rt, "self_pid", None) or os.getpid())
-    for a in _ancestors(self_pid):
+    for a in _ancestors(self_pid, _ppid_map()):
         prot[a] = "hive node"
     prot.update(_managed(ctx))
     try:
@@ -212,6 +240,52 @@ def _kill_one(pid: int, create_time: Optional[float], *, grace: float, force: bo
     return {"killed": [] if alive else [pid], "still_alive": [pid] if alive else [], "method": method}
 
 
+def _group_members(pid: int) -> List[int]:
+    """POSIX: the other members of ``pid``'s process group when ``pid`` leads one (``kill_tree`` signals the whole
+    group then); [] on Windows or when it does not lead a group."""
+    if util.IS_WINDOWS:
+        return []
+    try:
+        if os.getpgid(pid) != pid:
+            return []
+    except OSError:
+        return []
+    if os.path.isdir("/proc/self"):
+        pids = [int(n) for n in os.listdir("/proc") if n.isdigit()]
+    else:
+        pids = [r.get("pid") for r in procinfo.list_processes(cmdline=False)[0]]
+    out = []
+    for q in pids:
+        if not isinstance(q, int) or q == pid:
+            continue
+        try:
+            if os.getpgid(q) == pid:
+                out.append(q)
+        except OSError:
+            continue
+    return out
+
+
+def _check_tree(ctx: ActionContext, pid: int, prot: Dict[int, str]) -> None:
+    """The kill guard for every process a tree kill would signal (descendants + group members): the first refusal
+    refuses the whole call, so a protected process cannot be killed through an unprotected parent (§5.4)."""
+    targets = list(dict.fromkeys(list(proctree.descendants(pid)) + _group_members(pid)))
+    for d in targets:
+        if d == pid:
+            continue
+        ctx.check()
+        dinfo = procinfo.process_info(d)
+        if dinfo is None:        # exited meanwhile
+            continue
+        try:
+            ctx.policy.check_kill(d, dinfo, protected=prot)
+        except HiveError as e:
+            details = dict(e.details or {})
+            details.update(descendant=d)
+            raise HiveError(e.code, f"process {pid} has a descendant that may not be stopped: {e.message}", details,
+                            hint="use tree:false, or job_stop/service_control") from None
+
+
 @handler("proc.kill")
 def proc_kill(ctx: ActionContext, p: dict) -> dict:
     """Stop a process (and by default its descendants) after the kill guard (§5.4)."""
@@ -219,7 +293,8 @@ def proc_kill(ctx: ActionContext, p: dict) -> dict:
     info = procinfo.process_info(pid)
     if info is None:
         raise not_found(f"process {pid} not found (already exited?)", hint="list processes with proc_list")
-    extra = ctx.policy.check_kill(pid, info, protected=protected_pids(ctx))
+    prot = protected_pids(ctx)
+    extra = ctx.policy.check_kill(pid, info, protected=prot)
     if isinstance(extra, dict):
         ctx.audit_extra.update(extra)
     ctx.audit_extra.update(pid=pid, name=info.get("name"))
@@ -228,6 +303,7 @@ def proc_kill(ctx: ActionContext, p: dict) -> dict:
     force = bool(p.get("force"))
     ctime = info.get("create_time")
     if p.get("tree", True):
+        _check_tree(ctx, pid, prot)
         res = proctree.kill_tree(pid, grace=grace, force=force, create_time=ctime)
     else:
         res = _kill_one(pid, ctime, grace=grace, force=force)

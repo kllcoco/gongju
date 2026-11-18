@@ -236,6 +236,7 @@ def _safe_name(distro: str) -> str:
 
 
 def keepalive_state_path(state_dir: "Path | str", distro: str) -> Path:
+    """``<state>/wsl-keepalive-<distro>.json``, the keepalive's state file (pid + ctime + argv)."""
     return Path(state_dir) / f"wsl-keepalive-{_safe_name(distro)}.json"
 
 

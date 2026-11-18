@@ -29,8 +29,9 @@ umask 077
 mkdir -p "$HIVE_HOME" || exit 1
 chmod 700 "$HIVE_HOME" 2>/dev/null || true
 
+# -I: isolated mode, so a json.py/ssl.py in the start cwd (often /workspace, agent-writable) is never imported (D56)
 if [ ! -f "$HIVE_HOME/hive.pyz" ]; then
-  "$PY" - <<'HIVE_BOOTSTRAP_PY' || { echo "start-hive: could not fetch hive.pyz (nothing written)" >&2; exit 1; }
+  "$PY" -I - <<'HIVE_BOOTSTRAP_PY' || { echo "start-hive: could not fetch hive.pyz (nothing written)" >&2; exit 1; }
 import base64, hashlib, http.client, json, os, socket, ssl, sys, urllib.parse
 
 

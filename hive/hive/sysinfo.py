@@ -559,10 +559,18 @@ def _unescape_mount(s: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), s)
 
 
-def parse_mounts(text: str, *, wsl: bool = False) -> List[Tuple[str, str]]:
+def parse_mounts(text: str, *, wsl: bool = False,
+                 isdir: Optional[Callable[[str], bool]] = None) -> List[Tuple[str, str]]:
     """``/proc/mounts`` -> [(mount, fs)] without pseudo file systems (overlay kept for pods; WSL helper mounts
-    dropped)."""
-    out: List[Tuple[str, str]] = []
+    dropped). With ``isdir`` (e.g. ``os.path.isdir``), mount points that are not folders are dropped too: Docker
+    bind-mounts single files (``/etc/hosts``, ``/etc/hostname``, ``/etc/resolv.conf``) from the host disk."""
+    return [(m, f) for m, f, _d in _parse_mounts_dev(text, wsl=wsl, isdir=isdir)]
+
+
+def _parse_mounts_dev(text: str, *, wsl: bool = False,
+                      isdir: Optional[Callable[[str], bool]] = None) -> List[Tuple[str, str, str]]:
+    """``parse_mounts`` rows plus the device: [(mount, fs, device)]."""
+    out: List[Tuple[str, str, str]] = []
     seen = set()
     for line in (text or "").splitlines():
         parts = line.split()
@@ -579,17 +587,23 @@ def parse_mounts(text: str, *, wsl: bool = False) -> List[Tuple[str, str]]:
             continue
         if dev == "none" and fs not in ("overlay", "9p", "drvfs", "virtiofs"):
             continue
+        if isdir is not None and not isdir(mnt):
+            continue
         seen.add(mnt)
-        out.append((mnt, fs))
+        out.append((mnt, fs, dev))
     return out
 
 
-def _statvfs(path: str, timeout: float = 2.0) -> Optional[Tuple[int, int]]:
-    """(total, free) bytes; a hanging network mount gives up after ``timeout``."""
+def _statvfs(path: str, timeout: float = 2.0, *, dir_only: bool = False) -> Optional[Tuple[int, int]]:
+    """(total, free) bytes; a hanging network mount gives up after ``timeout``; ``dir_only``: None when ``path`` is
+    not a folder (checked in the same thread, so a hanging mount cannot block the caller)."""
     res: Dict[str, Any] = {}
 
     def run() -> None:
         try:
+            if dir_only and not os.path.isdir(path):
+                res["v"] = None
+                return
             st = os.statvfs(path)
             res["v"] = (st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize)
         except OSError:
@@ -626,14 +640,16 @@ def disks() -> List[dict]:
         return _mac_disks()
     from . import wsl
     in_wsl = wsl.is_wsl()
-    mounts = parse_mounts(_read(os.path.join(_PROC, "mounts")) or "", wsl=in_wsl)
+    mounts = _parse_mounts_dev(_read(os.path.join(_PROC, "mounts")) or "", wsl=in_wsl)
     out = []
     seen_dev = set()
-    for mnt, fs in mounts:
-        v = _statvfs(mnt)
+    for mnt, fs, dev in mounts:
+        v = _statvfs(mnt, dir_only=True)     # file bind mounts (/etc/hosts …) are not disks
         if not v or not v[0]:
             continue
-        key = (fs, v[0], v[1]) if fs in ("overlay",) else None
+        # one row per file system: overlays of one backing disk, and a block device bind-mounted at several places
+        # (pods bind sub-folders of the host volume) repeat the same totals
+        key = (fs, v[0], v[1]) if fs in ("overlay",) else (("dev", dev, v[0], v[1]) if dev.startswith("/") else None)
         if key and key in seen_dev:
             continue
         if key:

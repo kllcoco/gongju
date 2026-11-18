@@ -125,11 +125,50 @@ def _check_kind(kind: str) -> None:
         raise bad_request(f"unknown kind '{kind}'", hint="use node or hub")
 
 
-def _context(kind: str, config_path: Optional[Path] = None, *, strict: bool = True) -> _Ctx:
-    """Resolve config path, data dir and HIVE_HOME; ``strict`` loads (and validates) the config."""
+def _user_home(user: str) -> Optional[Path]:
+    """The home folder of the account ``user`` (POSIX passwd), None when unknown."""
+    try:
+        import pwd
+        return Path(pwd.getpwnam(user).pw_dir)
+    except (ImportError, KeyError):
+        return None
+
+
+def _chown_to(path: Path, user: str) -> None:
+    """Give ``path`` to the account ``user`` (best effort; POSIX)."""
+    try:
+        import pwd
+        pw = pwd.getpwnam(user)
+        os.chown(str(path), pw.pw_uid, pw.pw_gid)
+    except (ImportError, KeyError, OSError) as e:
+        log.warning("cannot give %s to %s: %s", path, user, e)
+
+
+def _sudo_hive_home(kind: str, user: str, config_path: Optional[Path]) -> Path:
+    """HIVE_HOME of the account a ``--system`` unit runs as (``User=$SUDO_USER``), not root's (§20.1): the config's
+    HIVE_HOME root (``<home>/<kind>/config.json``), else an explicit ``HIVE_HOME``, else ``~user/.hive``."""
+    if config_path:
+        cp = Path(config_path).expanduser().resolve()
+        if cp.parent.name == kind:
+            return cp.parent.parent
+    if os.environ.get("HIVE_HOME"):
+        return Path(os.path.expanduser(os.environ["HIVE_HOME"]))
+    uh = _user_home(user)
+    if uh is None:
+        raise bad_request(f"cannot find the home folder of {user} (SUDO_USER)",
+                          hint=f"pass --config <home of {user}>/.hive/{kind}/config.json")
+    return uh / ".hive"
+
+
+def _context(kind: str, config_path: Optional[Path] = None, *, strict: bool = True,
+             home: Optional[Path] = None) -> _Ctx:
+    """Resolve config path, data dir and HIVE_HOME; ``strict`` loads (and validates) the config; ``home`` overrides
+    HIVE_HOME (the ``--system`` install for ``SUDO_USER``)."""
     from . import config
     _check_kind(kind)
     paths = config.default_paths()
+    if home is not None:
+        paths = dict(paths, **{f"{kind}_config": home / kind / "config.json", f"{kind}_data": home / kind})
     cp = Path(config_path) if config_path else paths[f"{kind}_config"]
     cp = cp.expanduser().resolve()
     data = paths[f"{kind}_data"]
@@ -144,8 +183,8 @@ def _context(kind: str, config_path: Optional[Path] = None, *, strict: bool = Tr
         if strict:
             raise
         data = cp.parent if cp.parent.exists() else data
-    return _Ctx(kind=kind, config_path=cp, data_dir=Path(data).resolve(), home=config.hive_home(), allow_root=allow_root,
-                cfg=cfg)
+    return _Ctx(kind=kind, config_path=cp, data_dir=Path(data).resolve(),
+                home=home if home is not None else config.hive_home(), allow_root=allow_root, cfg=cfg)
 
 
 def detect_method() -> str:
@@ -384,10 +423,12 @@ def install(kind: str, config_path: Path, *, method: str = "auto", system: bool 
     """Install the node/hub as a service (``dry_run``: render and list, change nothing)."""
     if method not in METHODS:
         raise bad_request(f"unknown install method '{method}'", hint="use " + ", ".join(METHODS))
-    ctx = _context(kind, config_path)
     m = detect_method() if method == "auto" else method
     if system and m != "systemd":
         raise bad_request("--system is only available for systemd", hint="drop --system")
+    sudo_user = os.environ.get("SUDO_USER") or ""
+    home = _sudo_hive_home(kind, sudo_user, config_path) if system and sudo_user and sudo_user != "root" else None
+    ctx = _context(kind, config_path, home=home)
     check_launcher(ctx.data_dir)
     res = InstallResult(method=m)
     if m == "systemd":
@@ -419,7 +460,11 @@ def _install_systemd(ctx: _Ctx, res: InstallResult, *, system: bool, dry_run: bo
         unit.parent.mkdir(parents=True, exist_ok=True)
         util.atomic_write_bytes(unit, text.encode("utf-8"))
         os.chmod(unit, 0o644)
-        (ctx.data_dir / "logs").mkdir(parents=True, exist_ok=True)
+        logs = ctx.data_dir / "logs"
+        made = not logs.exists()
+        logs.mkdir(parents=True, exist_ok=True)
+        if made and system and user and user != "root":
+            _chown_to(logs, user)       # created by root for the unit's User= account
     _run_all(res, [_systemctl(system, "daemon-reload"), _systemctl(system, "enable", "--now", _unit_name(ctx.kind))],
              dry_run=dry_run)
     if not system:
@@ -800,6 +845,11 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
                                 hint=f"check hive {kind} status; it restarts after in-flight calls finish")
             _sleep(0.2)
         if method is None:
+            # no install record, but a launcher loop may still relaunch it (deploy/runpod/start-hive.sh relaunches
+            # after exit 75 without writing run-<kind>.sh): wait for a new holder before calling it a foreground run
+            if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
+                res.notes.append(f"its launcher restarted the {kind}")
+                return res
             raise unavailable(f"the {kind} stopped, but it ran in the foreground (no service installation restarts "
                               "it)", hint=f"start it again: hive {kind} run")
         if _wait_new_holder(ctx, old_pid, HOLDER_WAIT) is not None:
