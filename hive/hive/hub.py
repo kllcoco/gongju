@@ -337,7 +337,24 @@ class RelayLink(NodeLink):
         return [catalog.public_dict(catalog.SPECS[n]) for n in self.actions() if n in catalog.SPECS]
 
     def ensure_fresh(self) -> None:
-        """No-op: register info is current."""
+        """Register info is current; an offline or identity-changed node is refused here, before the hub checks
+        (§7.4: immediate ``unavailable``)."""
+        with self.lock:
+            if self.identity_changed:
+                raise self._identity_error()
+            if not self.online():
+                raise self._offline_error()
+
+    def _identity_error(self) -> HiveError:
+        return unavailable(f"node {self.name} registered from a different machine; nothing is routed to it",
+                           reason="identity_changed", maybe_executed=False,
+                           hint=f"a different machine registered as {self.name}; if you did not replace it, run "
+                                f"hive hub rotate-token {self.name}; if you did, hive hub ack-node {self.name}")
+
+    def _offline_error(self) -> HiveError:
+        last = iso_utc(self.last_seen_wall) if self.last_seen_wall else None
+        return unavailable(f"node {self.name} is offline", reason="offline", maybe_executed=False, last_seen=last,
+                           hint="the relay node is not polling the hub; check the pod")
 
     # ------------------------------------------------------------------------------------------- agent side
     def call(self, identity: Identity, action: str, params: dict, *, timeout: float, request_id: str,
@@ -348,16 +365,9 @@ class RelayLink(NodeLink):
         meta = {"request_id": request_id, "node": self.name, "action": action, "duration_ms": 0, "api": 1}
         with self.lock:
             if self.identity_changed:
-                return _err_env(unavailable(
-                    f"node {self.name} registered from a different machine; nothing is routed to it",
-                    reason="identity_changed", maybe_executed=False,
-                    hint=f"a different machine registered as {self.name}; if you did not replace it, run hive hub "
-                         f"rotate-token {self.name}; if you did, hive hub ack-node {self.name}"), meta)
+                return _err_env(self._identity_error(), meta)
             if not self.online():
-                last = iso_utc(self.last_seen_wall) if self.last_seen_wall else None
-                return _err_env(unavailable(f"node {self.name} is offline", reason="offline", maybe_executed=False,
-                                            last_seen=last,
-                                            hint="the relay node is not polling the hub; check the pod"), meta)
+                return _err_env(self._offline_error(), meta)
             if len(self.queue) >= int(self.cfg.max_queue_per_node):
                 return _err_env(rate_limited(f"the queue for node {self.name} is full", retry_after=5,
                                              reason="queue_full"), meta)
