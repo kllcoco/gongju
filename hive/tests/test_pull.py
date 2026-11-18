@@ -364,6 +364,37 @@ class TestPullJobs(PullCase):
         self.assertEqual(e["code"], "not_found")
 
 
+class TestHfhubUnits(unittest.TestCase):
+    def test_endpoint_for(self):
+        self.assertEqual(hfhub.endpoint_for("huggingface", None, {}), "https://huggingface.co")
+        self.assertEqual(hfhub.endpoint_for("huggingface", None, {"HF_ENDPOINT": "https://hf-mirror.com/"}),
+                         "https://hf-mirror.com")
+        self.assertEqual(hfhub.endpoint_for("huggingface", {"hf_endpoint": "https://a.example"},
+                                            {"HF_ENDPOINT": "https://b.example"}), "https://a.example")
+        self.assertEqual(hfhub.endpoint_for("modelscope", None, {}), "https://www.modelscope.cn")
+        with self.assertRaises(HiveError):
+            hfhub.endpoint_for("huggingface", {"hf_endpoint": "https://u:p@x.example"}, {})
+
+    def test_file_url(self):
+        self.assertEqual(hfhub.file_url("huggingface", "https://hf.co", "o/n", "model", "c" * 40, "a b/c#.json"),
+                         "https://hf.co/o/n/resolve/" + "c" * 40 + "/a%20b/c%23.json")
+        self.assertTrue(hfhub.file_url("huggingface", "https://hf.co", "o/n", "dataset", "c", "x")
+                        .startswith("https://hf.co/datasets/o/n/resolve/c/"))
+        self.assertEqual(hfhub.file_url("modelscope", "https://www.modelscope.cn", "o/n", "model", "abc", "d/e.bin"),
+                         "https://www.modelscope.cn/api/v1/models/o/n/repo?Revision=abc&FilePath=d%2Fe.bin")
+
+    def test_normalize(self):
+        n = hfhub.normalize_repo
+        self.assertEqual(n("https://huggingface.co/Qwen/Qwen2.5-7B/tree/v1.0", "huggingface"),
+                         ("Qwen/Qwen2.5-7B", "v1.0"))
+        self.assertEqual(n("huggingface.co/Qwen/Qwen2.5-7B", "huggingface"), ("Qwen/Qwen2.5-7B", None))
+        self.assertEqual(n("https://hf-mirror.com/gpt2", "huggingface"), ("gpt2", None))
+        for bad in ("", "a/b/c", "x/..", ".hidden/x", "a" * 97 + "/b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(HiveError):
+                    n(bad, "huggingface")
+
+
 class TestListingTimeout(unittest.TestCase):
     def test_slow_listing_then_cached_retry(self):
         hfhub.clear_cache()
@@ -477,3 +508,27 @@ class TestChildPull(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.environ.get("HIVE_LIVE_NET") == "1", "live network check (set HIVE_LIVE_NET=1)")
+class TestLiveListing(unittest.TestCase):
+    """Opt-in: the real HF / ModelScope listing APIs still have the shapes hfhub expects."""
+
+    def _guard(self) -> NetGuard:
+        return NetGuard(http_allow=["public"], http_deny=[], download_allow=["public"], allow_metadata_ip=False,
+                        proxies=netproxy.load_proxy_settings({"proxy": None, "use_system_proxy": True}))
+
+    def test_huggingface(self):
+        commit, files = hfhub.list_repo("huggingface", "https://huggingface.co", "openai-community/gpt2", "model",
+                                        "main", guard=self._guard(), auth=None, deadline=time.monotonic() + 60)
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        by = {f.path: f for f in files}
+        self.assertRegex(by["model.safetensors"].sha256 or "", r"^[0-9a-f]{64}$")
+        self.assertRegex(by["config.json"].git_sha1 or "", r"^[0-9a-f]{40}$")
+
+    def test_modelscope(self):
+        commit, files = hfhub.list_repo("modelscope", "https://www.modelscope.cn", "Qwen/Qwen2.5-0.5B-Instruct",
+                                        "model", "master", guard=self._guard(), auth=None,
+                                        deadline=time.monotonic() + 60)
+        self.assertRegex(commit, r"^[0-9a-f]{40}$")
+        self.assertTrue(any(f.path == "config.json" and f.sha256 for f in files))

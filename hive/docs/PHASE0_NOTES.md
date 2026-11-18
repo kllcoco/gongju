@@ -887,3 +887,92 @@ B9. **Open items (WP5b):** the CLI wiring (`hive hub …`, `hive join`, `hive ga
     `dist.add_node_instructions`. `/mcp` on the hub stays WP6b (`register_agent_routes(mcp=…)` is called). The relay
     and gateway paths were tested against the real WP3b `model.forward` handler and netproxy as merged at the time of
     this hand-off; E2E M2 (lead) still has to run them together with the CLI.
+
+## WP3b hand-off (netproxy real, open_stream/open_download, _download, hfhub, net.*, model.pull, model.forward)
+
+(Items numbered W1… so they cannot collide with the notes of WP5b/WP4, which merge in parallel.)
+
+W1. **CONTRACT-REQUEST (WP3b → P0 `tests/test_stubs.py`, `tests/helpers.py`):** `test_netguard_real` now checks the
+    real `open_download` (refused connect → `unavailable` `connect`), `test_netproxy_no_proxy_stub` became
+    `test_netproxy_real`, and the `open_stream` stub tests pass a `FakeNetGuard` (a guard is required now; the P0
+    `guard=None` loopback path is gone). `FakeEffectivePolicy.proxies` returns `load_proxy_settings({"proxy": "off"})`
+    (the real loader reads `HTTPS_PROXY`, which CI runners set; the fake stays proxy-free). `actions/model.py` no
+    longer has `PENDING_ACTIONS`; `test_files.test_write_read_masked` asserts the WP3b actions are implemented.
+W2. **CONTRACT-REQUEST (WP3b → WP1 `policy.py`, additive):** `EffectivePolicy.deny_patterns(*, write=True) ->
+    List[str]` (public wrapper of `_active_patterns`: hard denies, fs.deny, hard deny_write and, when gated,
+    fs.deny_write, PATH dirs and service code dirs). net.download hands these to the `_download` child for
+    server-chosen names (§9.8 "the identity's normalized deny patterns").
+W3. **Additive names (WP3b):** `netproxy.parse_registry(enable, server, override)`, `netproxy.clear_cache()`,
+    `netproxy.CHILD_NO_PROXY` (the §10.1 step 3 list), a redacting `ProxySettings.__repr__`; `hfhub.clear_cache()`,
+    `hfhub.REPO_RE`; `_download.run(spec, stop=None) -> exit code` (in-process runner used by tests),
+    `_download.choose_name(headers, url)`; `actions/net.py` helpers `auth_spec(ctx, name, method)`,
+    `first_hop_auth(auth, target)`, `start_download_job(ctx, kind=, spec=, name=, tags=)`. Download spec additive
+    keys: file mode `casefold` (from `EffectivePolicy.path_key`, so WSL `/mnt/<drive>` keys match the deny patterns);
+    pull mode `revision`, `skipped_invalid`, `skipped_pickle`, `skipped_unsafe` (copied into result.json).
+W4. **netproxy interpretations:**
+    - URLs: `http://[user:pass@]host[:port][/]`, normalised without the slash and with port 80 when absent; anything
+      else (socks*, https://, PAC, a path) is ignored with one WARNING per distinct value. An invalid `explicit` URL
+      (relay.proxy / connection.proxy) is `bad_request`; an explicit URL has source `config` and serves both schemes.
+    - Env: `X_PROXY` before `x_proxy`; `ALL_PROXY` fills a scheme only when that scheme's own variable is unset.
+      no_proxy = `network.no_proxy` + env `NO_PROXY` + the Windows `ProxyOverride` entries (system source) +
+      `ALWAYS_NO_PROXY`. macOS bypass lists are not read (getproxies has none).
+    - bypass(): `<local>` (names without a dot), IE-style globs (`10.*`, `*.corp.com`), and IP/CIDR entries are also
+      matched against the caller's resolved `ips`.
+    - `wsl-host` outside WSL → `bad_request` at load (the node refuses to start with that config error); inside WSL
+      without a default route → one warning and no proxy until the next refresh.
+    - open_tunnel peeks the proxy's answer (`MSG_PEEK`) so no tunnelled byte is consumed; a CONNECT that is not
+      answered in time → `unavailable` reason `proxy` (with the Clash hint); errors carry `details.proxy` redacted.
+    - child_proxy_env: `NO_PROXY` = the fixed §10.1 list + `network.no_proxy` (the node's env NO_PROXY is not
+      merged; it is inherited anyway unless the policy scrubs it).
+    - **Observation (lead):** `Policy` builds its ProxySettings once per config load (D34), so a running node does not
+      pick up system-proxy toggles or a new `wsl-host` address every 60 s; the 60 s cache only helps per-connection
+      users (transport, relay) and new loads. WSL NAT normally restarts the node with the VM, so this rarely bites.
+W5. **netutil (WP3b part):** `open_stream` attaches the secret only where C2/C4 allow it and otherwise drops it
+    silently (no `secret_host` error, unlike guarded_request's first hop: the gateway must not fail on a service whose
+    key is bound elsewhere); `connect_timeout` covers connect + TLS handshake, `idle_timeout` every read.
+    `open_download` keeps `Range` on every hop, drops user credential headers cross-host and returns the streaming
+    iterator of the final hop (closing it closes the connection). WP5a's proxy paths now run on the real netproxy
+    (`tests/test_net.py` re-checks an explicit proxy URL, note 72).
+W6. **`_download` interpretations:**
+    - The child `chdir`s into the folder of its `--spec` file (= the run dir), because `start_job(cwd=…)` is the
+      child's cwd and the run dir is unknown before `start_job`; handlers pass the workdir as `cwd`.
+    - Exit codes: 0 ok, 1 failed (HTTP/network/conflict), 2 bad spec, 3 hash/size mismatch, 4 disk space, 5 name
+      refused, 6 folder lock busy, 7 stopped. A failure's last stdout line is `error: …` (the JobManager's `error`).
+      A stop (SIGTERM / CTRL_BREAK / SIGINT) finishes the current writes, flushes the manifest and exits 7.
+    - File mode: transient errors (5xx, 408/429, connection) retried 3× with backoff (resume from the part);
+      `path` mode re-checks "exists and not overwrite" before replacing. Dir mode streams into a hidden
+      `.hive-download-<run>.hive-part` in the folder (deleted on failure); the name is chosen and checked when the
+      headers arrive, before the first byte is written; a server-sent name containing `/` or `\` (e.g. `../x`)
+      becomes `download.bin` (§21.2 row), a denied name fails with exit 5 even if a file of that name exists, symlinked
+      candidates are skipped (`-1`, `-2`… continue).
+    - Pull mode: files are fetched smallest first; an existing file that is not in the manifest and differs (same
+      size, other hash) fails that file "exists with other content (use overwrite=true)"; a body larger than the
+      listed size counts as a hash failure (part deleted, one retry, exit 3); a short body resumes and counts toward
+      the 5 network retries; the manifest is written after every file and keeps stale entries; result `files` and
+      `skipped_existing` are counts.
+W7. **hfhub interpretations (live APIs checked 2026-11):** HF tree entries give `lfs.oid` = sha256 (used) and
+    `xetHash` (not a sha256, ignored); non-LFS files are verified by their git blob sha1 (`oid`). HF answers 401
+    `RepoNotFound` for missing *and* private repos → `not_found` with the token hint; `GatedRepo` (or a gated/restricted
+    body on 401/403) → `forbidden` with the gated hint. ModelScope has no HEAD sha in the listing: the commit is the
+    newest file `Revision` (all listed files are unchanged since that commit), and `repo?Revision=<sha>&FilePath=`
+    serves files at that sha (checked live). A listing still running at the call deadline continues in a daemon
+    thread (≤ 600 s) and fills the 10 min cache, so the retry the timeout hint asks for is fast; the cache key also
+    holds the token name. The ModelScope token is sent as `Authorization: Bearer` (not verified with a private repo).
+W8. **model.pull interpretations:** dry runs are not counted against `max_concurrent_pulls`; the busy check runs once
+    early and again under the module lock right before `start_job`; refused targets use rule `protected_path`;
+    `models.dir: null` → `~/models`; the unbound-token note is also the hint of a gated/401 error while anonymous;
+    the dry-run `note` additionally names files that would be skipped as unsafe (the closed dry-run schema has no
+    `skipped_unsafe`). A target that is non-empty without a manifest of the same source+repo is a `conflict` (entries
+    listed) before the per-file size check.
+W9. **model.forward / net.* interpretations:** model.forward appends `/v1` to an `ollama`-kind base like model.chat,
+    uses `GET` for `models`, and records `service`, `path`, `status`, `bytes_out`, `model`, `stream` (as requested) and
+    `usage` in audit `extra`; the reply is decoded as UTF-8 with replacement. net.http returns `body` when the
+    content type is textual or the bytes are valid UTF-8 without NUL, else `body_base64`; header values are cut at
+    4096 chars; `max_bytes` is capped by `limits.max_response_bytes`. net.download vets the first hop (and the
+    secret's host binding / C1) in the handler before starting the job. net.ports reads `procinfo.listeners()`
+    (WP4; the P0 stub gives `method: "unavailable"`) and checks ports in parallel threads.
+W10. **Open items (WP3b):** Windows/macOS-only paths (winreg read, SIGBREAK in `_download`, no `O_NOFOLLOW`) are
+    tested with mocks only; a private ModelScope repo with a token was not tried. The opt-in live check
+    `HIVE_LIVE_NET=1 python -m unittest tests.test_pull.TestLiveListing` (skipped by default) lists
+    `openai-community/gpt2` on huggingface.co and `Qwen/Qwen2.5-0.5B-Instruct` on www.modelscope.cn through the real
+    netproxy (passed here through the env HTTPS proxy, i.e. a real CONNECT tunnel + verified TLS).

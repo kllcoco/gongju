@@ -504,9 +504,9 @@ class TestPipeline(unittest.TestCase):
                 self.assertFalse(env["ok"])
                 self.assertEqual(env["error"]["code"], "policy_denied")
                 for name in ("fs.list", "fs.edit", "fs.search", "fs.copy", "fs.delete", "model.chat",
-                             "model.endpoints"):
+                             "model.endpoints", "model.pull", "model.forward", "net.http", "net.download",
+                             "net.ports"):     # WP3b merged
                     self.assertIn(name, rt.implemented())
-                self.assertNotIn("model.pull", rt.implemented())
             finally:
                 rt.stop()
 

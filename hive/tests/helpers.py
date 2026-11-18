@@ -572,7 +572,7 @@ class FakeEffectivePolicy:
 
     @property
     def proxies(self) -> netproxy.ProxySettings:
-        return netproxy.load_proxy_settings(None)
+        return netproxy.load_proxy_settings({"proxy": "off"})   # WP3b: the real netproxy reads env; fakes use none
 
     # process
     def check_kill(self, pid: int, info: dict, *, protected: Mapping[int, str]) -> None:
