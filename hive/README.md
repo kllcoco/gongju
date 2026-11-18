@@ -146,7 +146,7 @@ hive --version
 
 ### 2.5 RunPod / AutoDL / Vast（云 GPU）
 
-云机器上**不用手动安装**：在中枢上执行 `hive hub add-node pod-a --relay`，它会打印几行命令，贴到云机器的网页终端里运行即可（自动下载 `hive.pyz`、校验 sha256、加入中枢、自动后台运行）。详见 [4.5](#45-云-gpurunpod-等)。
+云机器上**不用手动安装**：在中枢上执行 `hive hub add-node pod-a --relay`，它会打印几行命令，贴到云机器的网页终端里运行即可（自动下载 `hive.pyz`、校验 sha256、加入中枢、自动后台运行）。详见 [4.4](#44-云-gpurunpod-等)。
 
 ### 2.6 单文件 `hive.pyz`（免安装）
 
@@ -256,17 +256,7 @@ hive hub add-node desk --direct http://100.101.1.5:7701 --generate
 | 中枢在别的电脑，WSL 用 mirrored 网络 | WSL 里：`~/.venvs/hive/bin/hive init node --tailscale`；中枢上：`hive hub add-node desk-wsl --direct http://100.101.1.5:7702 --generate`（IP 换成这台 Windows 的 Tailscale IP），再在 WSL 里运行打印的命令 | 能 |
 | 中枢在别的电脑，WSL 是默认 NAT 网络 | 中枢上：`hive hub add-node desk-wsl --relay`，把打印的 `HIVE_JOIN='hvj1.…' ~/.venvs/hive/bin/hive join` 那行贴到 WSL 里运行 | 不能（整段生成完一次显示，照常可用） |
 
-### 4.4 （可选）在节点上保存密钥
-
-下载需要登录的模型（比如 Llama）要 Hugging Face 口令。在**那台节点**上：
-
-```sh
-hive node secret set HF_TOKEN       # 值从键盘输入，不会出现在命令行和历史里
-```
-
-Agent 只能按名字使用它，永远看不到值；默认只会发给 huggingface.co，输出里如果出现也会被打码。
-
-### 4.5 云 GPU（RunPod 等）
+### 4.4 云 GPU（RunPod 等）
 
 在**中枢**上：
 
@@ -292,10 +282,20 @@ HIVE_HOME=/workspace/.hive python3 hive.pyz join --install
 - 加入码泄露了（截图、聊天记录、分享的模板）：`hive hub rotate-token pod-a`，旧码立刻作废并打印新的。
 - 不加 `--via` 时：中枢监听 Tailscale 就默认给出走 Tailscale 内网的加入码（给家里 NAT 模式的 WSL 这类机器用）；如果还开了 Funnel，会同时打印给云机器用的公网命令块。
 
-### 4.6 停止与重启
+### 4.5 停止与重启、云机器“换了机器”
 
 - `hive node stop` / `hive hub stop` 会真正停下来（不会被系统服务马上拉起）；`hive node restart` / `hive hub restart` 才是重启。
 - 中枢提示某台云机器“换了一台机器注册”（identity changed）：如果**不是你**换的，执行 `hive hub rotate-token pod-a`；确实是你新开的 pod，才执行 `hive hub ack-node pod-a`（会先显示对方的 IP、主机名让你确认）。
+
+### 4.6 （可选）在节点上保存密钥
+
+下载需要登录的模型（比如 Llama）要 Hugging Face 口令。在**那台节点**上：
+
+```sh
+hive node secret set HF_TOKEN       # 值从键盘输入，不会出现在命令行和历史里
+```
+
+Agent 只能按名字使用它，永远看不到值；默认只会发给 huggingface.co，输出里如果出现也会被打码。
 
 ### 4.7 给 Agent 发口令
 
@@ -517,7 +517,7 @@ hive doctor --no-network # 不做联网检查
 | 改了配置后中枢 / 节点“停了” | 改配置会让正在运行的进程重启；前台运行（`hive hub run`）时没有人把它拉起来，再运行一次，或用 `hive service install hub`（节点：`hive service install node`）安装成服务 |
 | 聊天软件连不上网关地址 | 软件走了系统代理：把 `100.64.0.0/10`、`*.ts.net` 加进代理的直连列表；https 网页版软件要用 Funnel 的 https 地址 |
 | Windows 上升级报 `WinError 32` | 先退出 Claude Desktop、Cursor、Claude Code（它们在运行 `hive.exe`），再 `py -m pip install -U .\hive` |
-| 云机器显示“换了一台机器注册” | 见 4.6：不是你换的就 `hive hub rotate-token NAME`，是你新开的才 `hive hub ack-node NAME` |
+| 云机器显示“换了一台机器注册” | 见 4.5：不是你换的就 `hive hub rotate-token NAME`，是你新开的才 `hive hub ack-node NAME` |
 | WSL 里的节点过一会儿就掉线 | Windows 节点要有 keepalive：`hive init node --wsl-keepalive Ubuntu-24.04`（在 Windows 上执行） |
 | 下载模型很慢 / 失败 | 国内用 `--mirror cn` 和代理（第 9 节）；`hive logs 节点 任务号 -f` 看进度 |
 
