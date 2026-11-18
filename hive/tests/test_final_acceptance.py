@@ -217,7 +217,24 @@ class TestMcpRemove(CliCase):
         with mock.patch.object(cli, "_desktop_config_path", return_value=missing):
             code, out, err = run(["mcp-config", "--remove"])
         self.assertEqual(code, 0, err)
-        self.assertIn("nothing to remove", out)
+        self.assertIn(f"nothing to remove: {missing} does not exist", out)
+        self.assertNotIn("no \"hive\" entry", out)
+        # FA-C4: cursor without ~/.cursor/mcp.json does not suggest the file exists
+        with mock.patch.object(Path, "home", return_value=self.home / "nohome"):
+            code, out, err = run(["mcp-config", "--client", "cursor", "--remove"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("does not exist", out)
+        self.assertNotIn("no \"hive\" entry", out)
+
+    def test_remove_with_write_is_a_usage_error(self):
+        cfgf = self.home / "Claude" / "claude_desktop_config.json"
+        cfgf.parent.mkdir(parents=True)
+        cfgf.write_text(json.dumps({"mcpServers": {"hive": {"command": "hive"}}}))
+        with mock.patch.object(cli, "_desktop_config_path", return_value=cfgf):
+            code, out, err = run(["mcp-config", "--remove", "--write"])
+        self.assertEqual(code, 2)
+        self.assertIn("--remove and --write cannot be used together", out + err)
+        self.assertIn('"hive"', cfgf.read_text())                  # nothing removed
 
     def test_readme_mentions_it(self):
         text = (ROOT / "README.md").read_text(encoding="utf-8")

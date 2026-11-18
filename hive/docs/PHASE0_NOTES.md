@@ -2259,5 +2259,22 @@ FA-B5g. **`hub restart-node --outdated` without auto-update:** the node reports 
     prints the reason and the remedy (role narrowed: `hive init node --relay-role operator --auto-update`; not a pod:
     upgrade by hand with the commands; older nodes without the field: both possible reasons). New `hive init node
     --auto-update / --no-auto-update` (on needs a relay with role operator and no deny_actions). README 11 explains.
+FA-C1. **Integration helper held a connection per call:** `tests/integration/m3util.NodeDaemon.call` made a new
+    `hclient.connect` client per call and kept it until the node stopped, so every call left one idle authenticated
+    keep-alive connection; ~32 quick owner calls within the node's 30 s idle timeout filled its authenticated pool and
+    the next call got 503 `busy` (seen as a flaky `test_e2e_m3_pull::test_07_modelscope`: `unavailable` instead of
+    `unsupported`; reproduced with the old helper: call 33 of 40 fails). `NodeDaemon.client()` now caches one client
+    per token (`close_clients()` on restart and stop); regression `test_08_helper_reuses_one_client` (40 calls, one
+    client per token). Other helpers checked: `test_e2e3_security.connect` closes its clients per test (at most a
+    few each), the rest open one client and close it.
+FA-C2. **`hub remove-node` of a direct node** no longer says "its relay token no longer works" (a direct node has
+    none): "removed (the hub no longer calls it)" plus the command for that machine, `hive node token revoke
+    hub-<hub>`. Relay nodes keep the relay-token note.
+FA-C3. **Direct node that refuses the hub token:** NodeSummary `hub_token_rejected` (direct links: offline and the
+    last probe got 401/403; false for relay rows). `hub status` NOTE: "hub token not accepted: run the printed 'hive
+    node token add hub-<hub>' on that machine"; `hive nodes` prints the same as a `note: <node>: …` line under the
+    table. A switched-off machine (connection refused) gets no such note. README 4.2 mentions it.
+FA-C4. **`mcp-config --remove`:** `--remove --write` is a usage error (exit 2, nothing removed); a missing app
+    config says "nothing to remove: <path> does not exist" (not "no "hive" entry in <path>").
 FA-check. Full suite after these fixes: 1557 tests, OK (13 skipped) on Python 3.13 and 3.9, run while a real node
     listened on 127.0.0.1:7701 and a real hub on 127.0.0.1:7700 (their request logs: no contact from any test).

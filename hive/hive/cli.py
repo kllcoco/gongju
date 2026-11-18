@@ -2815,11 +2815,15 @@ def _mcp_remove(client: str, out: Out) -> int:
                        hint="for another MCP client, delete its \"hive\" server entry by hand")
     path = Path.home() / ".cursor" / "mcp.json" if client == "cursor" else _desktop_config_path()
     data: Any = None
-    if path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8-sig") or "{}")
-        except (OSError, ValueError) as e:
-            raise CliError(f"cannot read {path}: {e}", hint="fix it, or delete its \"hive\" entry by hand")
+    if not path.exists():
+        out.line(f"nothing to remove: {path} does not exist")
+        if client == "cursor":
+            out.line("(a project's own .cursor/mcp.json is not touched; delete its \"hive\" entry by hand)")
+        return EXIT_OK
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig") or "{}")
+    except (OSError, ValueError) as e:
+        raise CliError(f"cannot read {path}: {e}", hint="fix it, or delete its \"hive\" entry by hand")
     servers = data.get("mcpServers") if isinstance(data, dict) else None
     if not isinstance(servers, dict) or "hive" not in servers:
         out.line(f"nothing to remove: no \"hive\" entry in {path}")
@@ -2882,6 +2886,9 @@ def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
     from .client import _cfg_base, _conn_token, connect
     from .config import load_client_config
     if getattr(args, "remove", False):
+        if getattr(args, "write", False):
+            raise CliError("--remove and --write cannot be used together",
+                           hint="--remove takes the \"hive\" entry out; --write adds it (pick one)")
         return _mcp_remove(args.client or "claude-desktop", out)
     cc = load_client_config()
     if args.local:
