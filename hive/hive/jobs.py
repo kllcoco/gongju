@@ -48,22 +48,15 @@ def _parse_ts(s: Optional[str]) -> Optional[float]:
         return None
 
 
-def _redact(text: str) -> str:
-    try:
-        from .audit import redact_text
-        return redact_text(text)
-    except Exception:  # noqa: BLE001
-        return text
-
-
 def display_command(argv_or_cmdline: Union[List[str], str], limit: int = 200) -> str:
-    """Redacted one-line command text (job records show at most 200 chars)."""
+    """Redacted one-line command text (job records show at most 200 chars). Audit round 4 (DoS): only a bounded
+    head is redacted (``audit.redact_head``), never the whole (possibly megabyte) command."""
     if isinstance(argv_or_cmdline, str):
         text = argv_or_cmdline
     else:
         text = " ".join(str(a) for a in argv_or_cmdline)
-    text = _redact(text.replace("\n", " ").replace("\r", " "))
-    return text[:limit]
+    from .audit import redact_head
+    return redact_head(text.replace("\n", " ").replace("\r", " "), limit)[0]
 
 
 def job_owner(identity: Any) -> Optional[str]:

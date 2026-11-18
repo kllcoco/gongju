@@ -17,7 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, MutableMapping, Optional, Pattern, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, MutableMapping, Optional, Sequence, Tuple
 
 from .errors import HiveError, bad_request, denied, not_found
 from .util import FileLock, IS_WINDOWS, iso_utc, read_json, secure_file, write_json_atomic
@@ -117,8 +117,7 @@ class SecretStore:
         self._mtime: Optional[Tuple[float, int]] = None
         self._last_check = 0.0
         self._mask_key: Optional[Tuple[Tuple[str, str], ...]] = None
-        self._mask_re: Optional[Pattern[str]] = None
-        self._mask_names: Dict[str, str] = {}
+        self._mask_pairs: Tuple[Tuple[str, str], ...] = ()
         self._import_env()
         self._reload(force=True)
 
@@ -304,31 +303,55 @@ class SecretStore:
         return tuple(sorted(((s.name, s.value) for s in self._all() if len(s.value) >= MIN_MASK_CHARS),
                             key=lambda nv: (-len(nv[1]), nv[0])))
 
-    def _mask_state(self) -> Tuple[Optional[Pattern[str]], Dict[str, str]]:
+    def _mask_state(self) -> Tuple[Tuple[str, str], ...]:
+        """The maskable ``(name, value)`` pairs, longest value first, one entry per distinct value."""
         self._maybe_reload()
         key = self._maskable()
         with self._lock:
             if key != self._mask_key:
                 self._mask_key = key
-                if key:
-                    self._mask_re = re.compile("|".join(re.escape(v) for _n, v in key))
-                    names: Dict[str, str] = {}
-                    for n, v in key:
-                        names.setdefault(v, n)
-                    self._mask_names = names
-                else:
-                    self._mask_re = None
-                    self._mask_names = {}
-            return self._mask_re, self._mask_names
+                seen: Dict[str, str] = {}
+                for n, v in key:
+                    seen.setdefault(v, n)
+                self._mask_pairs = tuple((n, v) for v, n in seen.items())
+            return self._mask_pairs
 
     def mask(self, text: str) -> str:
-        """Replace every secret value (>= 8 chars) with ``«secret:NAME»``."""
+        """Replace every secret value (>= 8 chars) with ``«secret:NAME»``.
+
+        Audit round 4 (DoS): occurrences are found with ``str.find`` per value (C speed) and overlapping
+        occurrences are masked as one union, instead of one regex alternation of all values, which re-compared a
+        long value at every position of a text repeating its prefix (a 1 MB text took ~50 s)."""
         if not isinstance(text, str) or not text:
             return text
-        rx, names = self._mask_state()
-        if rx is None:
+        pairs = self._mask_state()
+        if not pairs:
             return text
-        return rx.sub(lambda m: f"«secret:{names.get(m.group(0), '?')}»", text)
+        spans: List[Tuple[int, int, str]] = []
+        for name, value in pairs:
+            n = len(value)
+            start = text.find(value)
+            while start >= 0:
+                spans.append((start, -n, name))
+                start = text.find(value, start + n)
+        if not spans:
+            return text
+        spans.sort()
+        out: List[str] = []
+        pos = 0
+        cur_s, cur_e, cur_n = spans[0][0], spans[0][0] - spans[0][1], spans[0][2]
+        for st, neg, name in spans[1:]:
+            if st < cur_e:
+                cur_e = max(cur_e, st - neg)
+                continue
+            out.append(text[pos:cur_s])
+            out.append(f"«secret:{cur_n}»")
+            pos = cur_e
+            cur_s, cur_e, cur_n = st, st - neg, name
+        out.append(text[pos:cur_s])
+        out.append(f"«secret:{cur_n}»")
+        out.append(text[cur_e:])
+        return "".join(out)
 
     def mask_edges(self, data: bytes, before: bytes, after: bytes) -> Tuple[bytes, bool]:
         """Mask secret occurrences that overlap ``data`` within ``before + data + after`` (range reads)."""

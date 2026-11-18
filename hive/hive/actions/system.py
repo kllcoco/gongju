@@ -17,6 +17,7 @@ from . import ActionContext, handler
 
 ALL_SECTIONS = ("os", "cpu", "memory", "disk", "gpu", "network", "software")
 CMD_MAX = 300
+FILTER_MAX = 4096                   # proc.list filter: name + this much of the redacted command line
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -63,22 +64,27 @@ def system_info(ctx: ActionContext, p: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------------
 # proc.list
 
-def _redacted(cmd: Any) -> str:
-    """The whole command line joined with spaces and passed through ``audit.redact_text`` ("" for none)."""
+def _joined(cmd: Any) -> str:
+    """The whole command line joined with spaces ("" for none)."""
     if not cmd:
         return ""
-    from ..audit import redact_text
-    text = " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
-    return redact_text(text)
+    return " ".join(str(c) for c in cmd) if isinstance(cmd, (list, tuple)) else str(cmd)
+
+
+def _filter_text(cmd: Any) -> str:
+    """The redacted head (FILTER_MAX chars) of the command line that ``filter`` is matched against."""
+    from ..audit import redact_head
+    return redact_head(_joined(cmd), FILTER_MAX)[0]
 
 
 def _cmd_text(cmd: Any) -> Optional[str]:
+    """Audit round 4 (DoS): only a bounded head of the command line is redacted (``audit.redact_head``), so a
+    local user's process with a megabyte argv cannot stall proc.list."""
     if not cmd:
         return None
-    text = _redacted(cmd)
-    if len(text) > CMD_MAX:
-        text = text[:CMD_MAX - 1] + "…"
-    return text
+    from ..audit import redact_head
+    text, cut = redact_head(_joined(cmd), CMD_MAX - 1)
+    return text + "…" if cut else text
 
 
 def _user_key(u: Optional[str]) -> str:
@@ -111,9 +117,9 @@ def proc_list(ctx: ActionContext, p: dict) -> dict:
         if user and _user_key(r.get("user")) != _user_key(user):
             continue
         if flt:
-            # matched against the same redacted text `cmd` shows (not cut to 300 chars): `total`/`shown` must not
-            # become an oracle for secrets on a command line (§5.8)
-            hay = (str(r.get("name") or "") + " " + _redacted(r.get("cmdline"))).casefold()
+            # matched against redacted text like `cmd` shows (not cut to 300 chars): `total`/`shown` must not
+            # become an oracle for secrets on a command line (§5.8). Round 4 (DoS): the first FILTER_MAX chars only
+            hay = (str(r.get("name") or "") + " " + _filter_text(r.get("cmdline"))).casefold()
             if flt not in hay:
                 continue
         sel.append(r)

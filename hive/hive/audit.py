@@ -19,7 +19,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .errors import internal
 from .util import canonical_json, iso_utc, new_id, secure_mkdir
@@ -67,21 +67,66 @@ def _apply_mask(s: str, mask: Optional[Callable[[str], str]] = None) -> str:
         return s
 
 
-_SECRET_FLAG = r"--?[A-Za-z0-9_-]*(?:key|token|secret|passw(?:or)?d|passwd|auth|cred|cookie|bearer)[A-Za-z0-9_-]*"
+_SECRET_WORDS = r"(?:key|token|secret|passw(?:or)?d|passwd|auth|cred|cookie|bearer)"
+# Audit round 4 (DoS): every rule is linear in the input. Python 3.9 has no atomic groups, so a whole flag word or
+# NAME word is consumed atomically with the lookahead + backreference idiom ``(?=(X*))\1`` after a lazy lookahead
+# proved it contains a secret word; nothing can backtrack into the word (the old ``X*KEY X*`` forms were quadratic).
+_FLAG_RE = re.compile(r"(?i)(?<![\w-])(?=--?[A-Za-z0-9_-]*?" + _SECRET_WORDS + r")(?=(--?[A-Za-z0-9_-]*))\1"
+                      r"(=|[ \t]+)(\"[^\"]*\"|'[^']*'|[^\s\"']+)")
+_FLAG_WORD_RE = re.compile(r"(?i)(?=--?[A-Za-z0-9_-]*?" + _SECRET_WORDS + r")(?=(--?[A-Za-z0-9_-]*))\1\n?\Z")
+_MYSQL_WORD = re.compile(r"(?i)\b(?:mysql|mysqldump|mysqladmin|mariadb|psql)\b")
+_MYSQL_P = re.compile(r"(?i)\s-p")
+_MYSQL_VALUE = re.compile(r"[ \t]*([^\s-]\S*)")
+_SEGMENT_END = re.compile(r"[\n;|&]")
+
+
+def _redact_mysql(s: str) -> str:
+    """mysql/psql ``-p SECRET`` / ``-pSECRET``: the first ``-p`` with a value after each client name within its
+    command segment (up to newline ; | &). Linear: each region is scanned once (a segment without ``-p`` is skipped
+    whole, it holds none for any later client name either)."""
+    w = _MYSQL_WORD.search(s)
+    if w is None:
+        return s
+    out: List[str] = []
+    pos = 0
+    seg_end = -1
+    e = None
+    while w is not None:
+        if w.end() > seg_end:          # the segment end is searched once per segment, not once per client name
+            e = _SEGMENT_END.search(s, w.end())
+            seg_end = e.start() if e is not None else len(s)
+        # the whitespace before -p may be the newline that ends the segment ("mysql …\n-pSECRET")
+        p_end = seg_end + 3 if e is not None and s[seg_end] == "\n" else seg_end
+        nxt = seg_end
+        at = w.end()
+        while True:
+            m = _MYSQL_P.search(s, at, p_end)
+            if m is None:
+                break
+            v = _MYSQL_VALUE.match(s, m.end())
+            if v is not None:
+                out.append(s[pos:v.start(1)])
+                out.append("***")
+                pos = nxt = v.end()
+                break
+            at = m.end()
+        w = _MYSQL_WORD.search(s, nxt)
+    out.append(s[pos:])
+    return "".join(out)
+
+
 _RULES = [
-    # --api-key X / --token=X / --password X (also -p after mysql/psql below)
-    (re.compile(r"(?i)(?<![\w-])(" + _SECRET_FLAG + r")(=|[ \t]+)(\"[^\"]*\"|'[^']*'|[^\s\"']+)"), r"\1\2***"),
-    # mysql/psql -p SECRET / -pSECRET
-    (re.compile(r"(?i)(\b(?:mysql|mysqldump|mysqladmin|mariadb|psql)\b[^\n;|&]*?\s-p)([ \t]*)([^\s-][^\s]*)"),
-     r"\1\2***"),
-    # URL userinfo (scheme://user:pass@host), incl. proxy URLs
-    (re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://)[^/\s@\"'<>]+@"), r"\1***@"),
+    # --api-key X / --token=X / --password X (also -p after mysql/psql, _redact_mysql)
+    (_FLAG_RE, r"\1\2***"),
+    # URL userinfo (scheme://user:pass@host), incl. proxy URLs. Round 4: matched from "://" on (the old
+    # ``scheme*://`` start was quadratic on long letter runs); whatever precedes "://" is kept as it is
+    (re.compile(r"(://)[^/\s@\"'<>]+@"), r"\1***@"),
     # Authorization / Proxy-Authorization header values
     (re.compile(r"(?i)\b((?:proxy-)?authorization)(\s*[:=]\s*)(?:\"[^\"\n]*\"|'[^'\n]*'|[^\n,;\"'}]+)"), r"\1\2***"),
     # Hive tokens
     (re.compile(r"\bhv_[A-Za-z0-9_-]{8,}"), "hv_***"),
-    # NAME=value assignments of secret-looking names
-    (re.compile(r"(?i)\b([A-Z0-9_]*(?:PASS|SECRET|TOKEN|KEY|AUTH|CRED)[A-Z0-9_]*)=(\S+)"), r"\1=***"),
+    # NAME=value assignments of secret-looking names (whole NAME word consumed atomically)
+    (re.compile(r"(?i)\b(?=[A-Z0-9_]*?(?:PASS|SECRET|TOKEN|KEY|AUTH|CRED))(?=([A-Z0-9_]*))\1=(\S+)"), r"\1=***"),
     # well-known key prefixes
     (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), "***"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "***"),
@@ -91,15 +136,40 @@ _RULES = [
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "***"),
 ]
 
+# a node secret value is at most secretstore.MAX_VALUE_CHARS long: masking this far past a cut masks a value that
+# straddles it whole (never half)
+_MASK_SPAN = 16384
+
 
 def redact_text(s: str) -> str:
-    """Text with tokens, keys, URL userinfo, known secret prefixes and node secret values masked."""
+    """Text with tokens, keys, URL userinfo, known secret prefixes and node secret values masked (linear time)."""
     if not isinstance(s, str) or not s:
         return s
     out = _apply_mask(s)
-    for rx, repl in _RULES:
+    out = _FLAG_RE.sub(r"\1\2***", out)
+    out = _redact_mysql(out)
+    for rx, repl in _RULES[1:]:
         out = rx.sub(repl, out)
     return _apply_mask(out)
+
+
+def redact_head(s: str, limit: int) -> Tuple[str, bool]:
+    """``(redacted text of at most limit chars, cut)``. Audit round 4 (DoS): only a bounded window of ``s`` is
+    ever redacted (2*limit + 64 chars; the secret-value mask looks 16 KiB further so a value across the cut is
+    masked whole), and the word cut by the window is dropped, so a token is never shown half-redacted."""
+    limit = max(0, int(limit))
+    window = 2 * limit + 64
+    if not isinstance(s, str):
+        s = str(s)
+    if len(s) <= window:
+        out = redact_text(s)
+        return (out[:limit], True) if len(out) > limit else (out, False)
+    head = _apply_mask(s[:window + _MASK_SPAN])[:window]
+    i = len(head) - 1
+    while i >= 0 and not head[i].isspace():
+        i -= 1
+    out = redact_text(head[:i + 1] if i >= 0 else "")
+    return out[:limit], True
 
 
 def redact_env(env: Mapping[str, str]) -> Dict[str, str]:
@@ -142,23 +212,22 @@ def _names_only(value: Any) -> List[str]:
 
 
 def _short(s: str, limit: int) -> str:
-    s = redact_text(s)
-    if len(s) > limit:
-        return s[:limit] + f"…[{len(s) - limit} chars]"
-    return s
+    out, cut = redact_head(s, limit)
+    if cut:
+        return out + f"…[{max(1, len(s) - len(out))} chars]"
+    return out
 
 
 def _redact_argv(argv: List[Any]) -> List[str]:
     out: List[str] = []
     hide_next = False
-    flag_re = re.compile(r"(?i)^" + _SECRET_FLAG + r"$")
     for item in argv:
         s = str(item)
         if hide_next:
             out.append("***")
             hide_next = False
             continue
-        if flag_re.match(s):
+        if len(s) <= 256 and _FLAG_WORD_RE.match(s):
             hide_next = True
             out.append(s)
             continue
@@ -334,4 +403,5 @@ class AuditLog:
                     log.warning("could not prune %s: %s", p, e)
 
 
-__all__ = ["SECRET_KEY_RE", "KINDS", "AuditLog", "redact_params", "redact_env", "redact_text", "set_text_mask"]
+__all__ = ["SECRET_KEY_RE", "KINDS", "AuditLog", "redact_params", "redact_env", "redact_text", "redact_head",
+           "set_text_mask"]
