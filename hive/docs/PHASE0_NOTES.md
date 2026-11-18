@@ -2032,8 +2032,8 @@ A4-6. **Bodies buffered before per-identity limits (MEDIUM):** a hub buffered an
     429 `inflight`; (c) a global byte budget `listen.max_buffered_bytes` (node 128 MiB, hub 256 MiB, ≥ 2 ×
     `max_body_bytes`, a quarter reserved for owners; `limits.BodyBudget`) charged until the response is written, wait
     ≤ 2 s then 503 `busy` `Retry-After: 2`; both close the connection. (d) `json_depth_ok` runs at C speed: escape
-    pairs dropped (`\\\\` then `\\"`, left to right as JSON pairs them), `translate` keeps only brackets/quotes,
-    strings cut (find loop or one regex; an unterminated string runs to the end), `()`-removal passes, then
+    pairs dropped (backslash pairs, then backslash-quote, left to right as JSON pairs them), `translate` keeps only
+    brackets/quotes, strings cut (find loop or one regex; an unterminated string runs to the end), `()`-removal passes, then
     `itertools.accumulate` over bracket runs; never True when the parse would nest deeper (fuzzed against the old
     loop). Measured, hub, 40 concurrent 48 MiB POSTs from two agent tokens + an owner 1 MiB POST: peak RSS 1580 MiB,
     90.7 s, all 40 buffered → 265 MiB, 9 s, 2–4 accepted at a time and the rest 503 `busy` before their bodies were
