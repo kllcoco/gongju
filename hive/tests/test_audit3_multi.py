@@ -27,8 +27,8 @@ class _Case(unittest.TestCase):
         return url, toks, hub
 
 
-class TestRelayCannotTakeDirectNodeId(_Case):
-    """Finding 1 end to end: a real hub, a real direct node and a fake relay pod speaking the §7 protocol."""
+class _DeskAndPod(_Case):
+    """A real hub, a real direct node (desk) and a fake relay pod (pod-a) speaking the §7 protocol."""
 
     def setUp(self):
         self.hub_tok = util.new_token()
@@ -77,6 +77,10 @@ class TestRelayCannotTakeDirectNodeId(_Case):
             th.join(10)
         self.addCleanup(finish)
         return got
+
+
+class TestRelayCannotTakeDirectNodeId(_DeskAndPod):
+    """Finding 1 end to end."""
 
     def test_register_with_direct_node_id_is_refused(self):
         self.fake.register(node_id=self.desk_id)
@@ -130,6 +134,74 @@ class TestRelayCannotTakeDirectNodeId(_Case):
         self.fake.register(node_id="n_podaown1234")
         self.assertEqual(self.pod.node_id, "n_podaown1234")
         self.assertIs(self.hub.resolve("n_podaown1234"), self.pod)
+
+
+class TestDirectIdSurvivesRestart(_DeskAndPod):
+    """Verification fix (A3-1b): the learned direct node_id is persisted (state/direct_ids.json) and preloaded at hub
+    start, so a pod cannot claim it after a hub restart while the direct node is offline."""
+
+    def restart_hub(self):
+        from hive import config, hub as hubmod
+        self.hub.server.stop()
+        self.hub.stop()
+        conf = config.load_hub_config(str(self.hub.config_path))
+        h = hubmod.Hub(conf, config_path=self.hub.config_path)
+        h.start()
+        server = hubmod.build_server(h)
+        bound = server.start()
+        h.server = server
+
+        def stop():
+            server.stop()
+            h.stop()
+        self.addCleanup(stop)
+        return f"http://127.0.0.1:{bound[0][1]}", h
+
+    def test_register_after_restart_with_direct_node_offline(self):
+        stored = json.loads((self.hub.data_dir / "state" / "direct_ids.json").read_text())
+        self.assertEqual(stored["nodes"]["desk"]["node_id"], self.desk_id)
+        self.nrt.test_stop()                      # desk goes offline (same URL, nothing answers)
+        url, hub2 = self.restart_hub()
+        self.url, self.hub = url, hub2
+        self.desk, self.pod = hub2.links["desk"], hub2.links["pod-a"]
+        # known before any probe could have succeeded
+        self.assertEqual(self.desk.node_id, self.desk_id)
+        self.fake = FakeRelay(url, self.rtok, "pod-a")
+        self.fake.register(node_id=self.desk_id)
+        self.assertEqual(self.pod.node_id, "")
+        self.assertIsNone(hub2.relay_ids.get("pod-a").get("node_id"))
+        self.assertIs(hub2.resolve(self.desk_id), self.desk)
+        got = self.poll_in_background()
+        with self.assertRaises(HiveError) as cm:
+            HttpTransport(url, self.toks["agent"]).request(
+                "POST", "/v1/call", {"action": "node.info", "params": {}, "node": self.desk_id, "timeout": 5})
+        # routed to desk (offline), never to the pod
+        self.assertEqual((cm.exception.code, cm.exception.details.get("reason")), ("unavailable", "connect"))
+        self.assertIn("node desk", cm.exception.message)
+        st, _h, _b = req(url, "GET", f"/openai/{self.desk_id}/qwen/v1/models", token=self.toks["podapp"])
+        self.assertEqual(st, 403)
+        self.assertEqual(got, [])
+
+    def test_stale_relay_binding_dropped_at_start(self):
+        # a binding accepted before this fix (relay_ids.json "node_id" = desk's id) is dropped when the hub starts
+        self.fake.register()
+        rec = self.hub.relay_ids.get("pod-a")
+        rec["node_id"] = self.desk_id
+        self.hub.relay_ids.save()
+        _url, hub2 = self.restart_hub()
+        self.assertIsNone(hub2.relay_ids.get("pod-a").get("node_id"))
+        self.assertIs(hub2.resolve(self.desk_id), hub2.links["desk"])
+
+    def test_changed_url_forgets_the_id(self):
+        from hive import hub as hubmod
+        p = self.hub.data_dir / "state" / "direct_ids.json"
+        d = hubmod.DirectIds(p)
+        entry = self.hub.cfg.nodes[0]
+        self.assertEqual(d.load([entry]), {"desk": self.desk_id})
+        moved = type("E", (), {"name": "desk", "url": "http://127.0.0.1:9", "tls_pin": None})()
+        self.assertEqual(d.load([moved]), {})
+        pinned = type("E", (), {"name": "desk", "url": entry.url, "tls_pin": "sha256/" + "A" * 43 + "="})()
+        self.assertEqual(d.load([pinned]), {})
 
 
 class TestAmbiguousNodeId(_Case):

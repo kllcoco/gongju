@@ -104,7 +104,9 @@ configured node; a body `node` that differs → 403.
   configured name or alias, the id of another link — including the id a direct node reports in its `node.info` to
   the hub's probe — or an id `relay_ids.json` binds to another node. Audit round 3: when a direct probe later learns
   an id a relay node already claimed, the claim (live session and `relay_ids.json` binding) is dropped ("relay
-  node_id claim dropped").
+  node_id claim dropped"). The ids direct links learned are persisted in `state/direct_ids.json` (with the
+  node's url and pin; a changed url or pin forgets the entry) and loaded at hub start, so they are refused from the
+  first register after a restart, even while the direct node is offline.
 
 - A new register supersedes the old session: delivered, unfinished tasks fail with `unavailable`
   `session_replaced` (`maybe_executed` true for mutating actions); queued tasks are kept.

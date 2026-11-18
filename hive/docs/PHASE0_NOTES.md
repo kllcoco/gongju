@@ -1912,3 +1912,16 @@ A3-2b. **Relay session throttle let one pod take every pod offline (MAJOR):** th
     DESIGN §6 v4), and `relay_register` clears both the count and an active block for its `(node, ip)` key. Tests:
     `TestRelaySession.test_pods_sharing_one_ip_do_not_block_each_other`, `test_register_clears_an_active_block`,
     `test_session_mismatches_are_throttled_per_ip` (valid session proceeds while blocked). DESIGN §7.2, PROTOCOL §5.2.
+A3-1b. **Direct node_ids were forgotten at every hub restart (MAJOR):** `DirectLink._node_id` started as "" on each
+    start, so after a restart with the direct node offline a pod re-registering with its bound key and the direct
+    node's id was accepted (and written to `relay_ids.json`), and calls and gateway requests addressed by that id
+    reached the pod until the direct node came back and was probed. New `hub.DirectIds`
+    (`<data>/state/direct_ids.json`, 0600, `{name: {node_id, url, tls_pin, learned_at}}`): `_learn_node_id` writes an
+    entry when an authenticated `node.info` reports a different id; `Hub.__init__` loads the entries whose url and pin
+    still match the config into `DirectLink._node_id` before the API server and the prober start, and runs
+    `_direct_id` for each so an old `relay_ids.json` binding to that id is dropped. Remaining window (SECURITY.md):
+    before the first-ever successful probe of a node (new hub, node added, url or pin changed, file deleted). Tests:
+    `TestDirectIdSurvivesRestart` (restart with desk offline: register with desk's id refused, `/v1/call` by the id
+    → desk's `unavailable`/`connect`, gateway by the id → 403 for a `pod-a/*` app, the polling pod gets no task;
+    stale binding dropped at start; changed url or pin forgets the id). DESIGN §8.3, file table; PROTOCOL §5.1;
+    SECURITY relay row and limits.

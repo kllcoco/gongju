@@ -739,6 +739,9 @@ class DirectLink(NodeLink):
         if nid == self._node_id:
             return
         self._node_id = nid
+        ids = getattr(self.hub, "direct_ids", None)
+        if ids is not None:
+            ids.put(self.entry, nid)
         self.hub._direct_id(self, nid)
 
     def _fresh(self) -> bool:
@@ -941,6 +944,51 @@ class RelayIds:
                 log.error("cannot write %s: %s", self.path, e)
 
 
+class DirectIds:
+    """``<hub data>/state/direct_ids.json``: ``{"v":1,"nodes":{name:{node_id, url, tls_pin, learned_at}}}``, the
+    node_ids direct links learned from an authenticated ``node.info`` (verification fix of audit round 3), so a hub
+    restart does not reopen the window in which a relay pod could claim a direct node's id. An entry whose url or
+    tls_pin no longer matches the configured node is ignored (the configured node may be another machine)."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.lock = threading.RLock()
+        self.nodes: Dict[str, dict] = {}
+
+    def load(self, entries: Sequence[Any]) -> Dict[str, str]:
+        """Read the file; returns {name: node_id} for the configured direct nodes whose url and pin still match."""
+        try:
+            d = read_json(self.path, default=None)
+        except HiveError as e:
+            log.warning("direct_ids.json unreadable (%s); starting empty", e.message)
+            d = None
+        nodes = d.get("nodes") if isinstance(d, dict) and isinstance(d.get("nodes"), dict) else {}
+        out: Dict[str, str] = {}
+        with self.lock:
+            self.nodes = {}
+            for e in entries:
+                rec = nodes.get(e.name)
+                if not isinstance(rec, dict):
+                    continue
+                nid = rec.get("node_id")
+                if rec.get("url") != str(e.url) or rec.get("tls_pin") != (e.tls_pin or None) or \
+                        not isinstance(nid, str) or not NODE_ID_RE.match(nid):
+                    continue
+                self.nodes[e.name] = rec
+                out[e.name] = nid
+        return out
+
+    def put(self, entry: Any, nid: str) -> None:
+        """Record (and write, 0600) the id a direct link learned."""
+        with self.lock:
+            self.nodes[entry.name] = {"node_id": nid, "url": str(entry.url), "tls_pin": entry.tls_pin or None,
+                                      "learned_at": iso_utc()}
+            try:
+                write_json_atomic(self.path, {"v": 1, "nodes": self.nodes}, private=True)
+            except OSError as e:
+                log.error("cannot write %s: %s", self.path, e)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # the hub
 
@@ -1001,6 +1049,15 @@ class Hub:
                 link = self.links[e.name]
                 assert isinstance(link, RelayLink)
                 link.identity_changed = bool(self.relay_ids.get(e.name).get("pending_sha256"))
+        # verification fix (audit round 3): direct node_ids learned before the restart are known from the start
+        # (before the API server or the prober run), so a pod cannot claim one while the direct node is offline;
+        # a relay_ids.json binding to such an id is dropped now
+        self.direct_ids = DirectIds(self.data_dir / "state" / "direct_ids.json")
+        for name, nid in self.direct_ids.load([e for e in cfg.nodes if e.mode != "relay"]).items():
+            dl = self.links.get(name)
+            if isinstance(dl, DirectLink):
+                dl._node_id = nid
+                self._direct_id(dl, nid)
 
     # ------------------------------------------------------------------------------------------- lifecycle
     def start(self) -> None:

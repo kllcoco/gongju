@@ -1633,6 +1633,12 @@ class DirectLink(NodeLink)   # transport to node url with stored hub token; per-
                              # calls node.info over /v1/call with the hub token (X-Hive-Agent: hub-probe, when the node
                              # implements it) and keeps its `node_id` as DirectLink.node_id (a failed call keeps the id
                              # known); a newly learned id is taken from any relay link that claimed it (§7.1, §8.1).
+                             # Verification fix: learned ids are persisted in <data>/state/direct_ids.json
+                             # ({"v":1,"nodes":{name:{node_id,url,tls_pin,learned_at}}}, 0600; an entry whose url or
+                             # tls_pin differs from the config is ignored) and preloaded in Hub.__init__, before the API
+                             # server and the prober start, so a hub restart while the node is offline does not let a
+                             # pod claim its id; a relay_ids.json binding to a preloaded id is dropped at start. The
+                             # entry changes only when an authenticated node.info reports a different id.
     def open_gateway(self, service: str, method: str, path: str, body: bytes, *, agent: str, timeout: float,
                      cancel: threading.Event) -> "GatewayResponse"
                              # v3 (§8.7): raw GET/POST to <node url>/openai/self/<service>/v1/<path>, streamed back;
@@ -2617,7 +2623,7 @@ Default paths (`HIVE_HOME` overrides `~/.hive`; v6, `config.default_paths()` for
 |---|---|
 | node config | `~/.hive/node/config.json` |
 | node data | `data_dir` (v3 rule: `data_dir: null` = the directory that contains the loaded config file; env-only mode = `$HIVE_HOME/node`; `init` writes the absolute path anyway, so the data location never depends on the launcher's environment): `state/`, `audit/`, `logs/node.log`, `node.lock`, `PAUSED`, `relay.disabled`, `approvals.json`, `secrets.json`, `control.json`, `node_id` (env-only), `instance_key` (relay nodes, v4, §7.1), `run/` (`watchdog.pid`, `launcher.json`, transient `relaunch-env.json`), `run-node.sh` (watchdog) |
-| hub config | `~/.hive/hub/config.json` (data under `~/.hive/hub/`, same `data_dir` rule; `state/relay_ids.json`, `hub.lock`, `control.json` (v4)) |
+| hub config | `~/.hive/hub/config.json` (data under `~/.hive/hub/`, same `data_dir` rule; `state/relay_ids.json`, `state/direct_ids.json` (audit round 3), `hub.lock`, `control.json` (v4)) |
 | client config | `~/.hive/client.json` |
 | token files | `~/.hive/tokens/<name>.token` (`this-pc.token` agent, `this-pc-owner.token`, `hub-owner.token`) |
 | pod wrapper | `$HIVE_HOME/hive` (v3, `--pod`/`join`; v6 also `start-hive.sh`: `#!/bin/sh` + `export HIVE_HOME=…` + `exec <self_command> "$@"`, 0700) |
