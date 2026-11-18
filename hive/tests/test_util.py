@@ -4,6 +4,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -259,6 +260,7 @@ class TestFiles(unittest.TestCase):
 class TestFileLock(unittest.TestCase):
     def test_holder_json_readable_while_locked(self):
         d = Path(tempfile.mkdtemp(prefix="hivelock-"))
+        self.addCleanup(shutil.rmtree, d, True)
         p = d / "node.lock"
         a, b = util.FileLock(p), util.FileLock(p)
         self.assertTrue(a.acquire(note="j_123"))
@@ -278,6 +280,7 @@ class TestFileLock(unittest.TestCase):
 
     def test_holder_dead_pid(self):
         d = Path(tempfile.mkdtemp(prefix="hivelock-"))
+        self.addCleanup(shutil.rmtree, d, True)
         p = d / "x.lock"
         p.write_text(json.dumps({"pid": 2 ** 22 + 12345, "ctime": 1.0, "note": ""}))
         self.assertIsNone(util.FileLock(p).holder())
@@ -382,6 +385,7 @@ class TestSelfInvocation(unittest.TestCase):
     def test_prune_cwd_path(self):
         saved_path, saved_cwd = list(sys.path), os.getcwd()
         d = tempfile.mkdtemp(prefix="hiveprune-")
+        self.addCleanup(shutil.rmtree, d, True)
         try:
             os.chdir(d)
             sys.path[:] = ["", d, "/some/where"] + saved_path

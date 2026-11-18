@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -83,7 +82,7 @@ def start_relay_node(hub_url: str, token: str, *, name: str = "pod-a", start_man
                      **cfg: Any) -> Any:
     """A real NodeRuntime with a RelayAgent (listen disabled); ``rt.test_stop()`` stops both."""
     from hive import relay
-    home = Path(tempfile.mkdtemp(prefix="hiverelay-")).resolve()
+    home = helpers.new_temp_home("hiverelay-")
     rel = {"enabled": True, "hub_url": hub_url, "token": token}
     rel.update(cfg.pop("relay", {}))
     raw = helpers.make_node_config(cfg.pop("preset", "standard"), data_dir=str(home / "node"), name=name,
@@ -102,6 +101,7 @@ def start_relay_node(hub_url: str, token: str, *, name: str = "pod-a", start_man
         agent.stop()
         rt.stop()
     rt.test_stop = stop
+    helpers.remove_on_stop(rt, home, "test_stop")
     return rt
 
 

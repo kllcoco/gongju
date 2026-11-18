@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -261,6 +262,7 @@ class TestWp2Real(unittest.TestCase):
 
     def test_presetctx(self):
         d = Path(tempfile.mkdtemp(prefix="hivepreset-")).resolve()
+        self.addCleanup(shutil.rmtree, d, True)
         (d / "Qwen").mkdir()
         (d / "Qwen" / ".hive-pull.json").write_text(json.dumps({"repo": "Qwen/Qwen2.5-7B-Instruct"}))
         (d / "Bad").mkdir()

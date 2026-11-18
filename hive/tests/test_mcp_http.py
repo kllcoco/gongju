@@ -7,6 +7,7 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -59,6 +60,7 @@ class _HubMcp(unittest.TestCase):
         cls._h = helpers.tmp_home()
         cls.home = cls._h.__enter__()
         cls.root = Path(tempfile.mkdtemp(prefix="hivemcp-")).resolve()
+        cls.addClassCleanup(shutil.rmtree, cls.root, True)
         cls.hub_tok = util.new_token()
         cls.nurl, _a, cls.nrt = helpers.start_node_server(
             start_managers=True, auth={"tokens": [hub_token_entry(cls.hub_tok)]}, workdir=str(cls.root),

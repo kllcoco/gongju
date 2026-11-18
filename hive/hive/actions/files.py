@@ -901,7 +901,7 @@ def _move_across(ctx: ActionContext, src: Path, dst: Path, *, is_link: bool) -> 
                            copied_files=done["files"])
         if sys.version_info >= (3, 12):
             shutil.rmtree(_lp(src), onexc=_rm_onerror)   # type: ignore[call-arg]
-        else:  # pragma: no cover - Python < 3.12
+        else:   # Python 3.9-3.11 (onexc is 3.12+); covered by the 3.9 run
             shutil.rmtree(_lp(src), onerror=_rm_onerror)
 
 
@@ -1039,7 +1039,7 @@ def fs_delete(ctx: ActionContext, p: dict) -> dict:
                 files, dirs = _count_tree(path, int(ctx.policy.limits.max_delete_entries))
                 if sys.version_info >= (3, 12):
                     shutil.rmtree(_lp(path), onexc=_rm_onerror)   # type: ignore[call-arg]
-                else:  # pragma: no cover - Python < 3.12
+                else:   # Python 3.9-3.11 (onexc is 3.12+); covered by the 3.9 run
                     shutil.rmtree(_lp(path), onerror=_rm_onerror)
                 dirs += 1
         else:

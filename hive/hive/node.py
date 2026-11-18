@@ -278,6 +278,9 @@ class NodeRuntime:
                 if not self._inflight:
                     break
             time.sleep(0.05)
+        sched = self._sched
+        if sched is not None and sched is not threading.current_thread():
+            sched.join(5)       # QA L2: no periodic task (paused.ack, prune) writes into the data dir after stop()
         for mgr in (self.services, self.jobs):
             if not isinstance(mgr, _Unavailable):
                 try:
@@ -371,7 +374,7 @@ class NodeRuntime:
             return
         try:
             write_json_atomic(self.data_dir / PAUSED_ACK, {"paused": paused, "id": nonce, "pid": os.getpid(),
-                                                           "at": iso_utc()}, private=True)
+                                                           "at": iso_utc()}, private=True, mkdir=False)
             self._acked = key
         except OSError as e:
             log.warning("cannot write %s: %s", PAUSED_ACK, e)

@@ -7,6 +7,7 @@ raises ``unittest.SkipTest`` while the hub is a Phase 0 stub.
 """
 from __future__ import annotations
 
+import atexit
 import contextlib
 import copy
 import http.server
@@ -160,10 +161,51 @@ def _wp_missing(e: BaseException) -> bool:
     return isinstance(e, HiveError) and e.code == "unsupported"
 
 
+_TEMP_HOMES: List[Path] = []      # QA L2: temp homes the helpers created; removed on stop and at exit
+
+
+def _remove_temp_homes() -> None:
+    for d in list(_TEMP_HOMES):
+        shutil.rmtree(d, ignore_errors=True)
+    _TEMP_HOMES.clear()
+
+
+atexit.register(_remove_temp_homes)
+
+
+def temp_home(prefix: str) -> Path:
+    """``HIVE_HOME`` when set (the caller owns it), else a new temp dir this module removes later (QA L2)."""
+    if os.environ.get("HIVE_HOME"):
+        return Path(os.environ["HIVE_HOME"]).resolve()
+    return new_temp_home(prefix)
+
+
+def new_temp_home(prefix: str) -> Path:
+    """A new temp dir removed by ``remove_on_stop`` or at exit (QA L2)."""
+    d = Path(tempfile.mkdtemp(prefix=prefix)).resolve()
+    _TEMP_HOMES.append(d)
+    return d
+
+
+def remove_on_stop(rt: Any, home: Path, attr: str = "stop") -> None:
+    """Wrap ``rt.<attr>`` so a temp home this module created is deleted once the runtime stopped (QA L2)."""
+    if home not in _TEMP_HOMES:
+        return
+    orig = getattr(rt, attr)
+
+    def stop(*a: Any, **kw: Any) -> Any:
+        try:
+            return orig(*a, **kw)
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+    setattr(rt, attr, stop)
+
+
 def make_runtime(preset: str = "standard", *, start_managers: bool = True, **policy_overrides: Any) -> Any:
-    """A started real NodeRuntime on a temp HIVE_HOME (SkipTest until WP1 merges)."""
+    """A started real NodeRuntime on a temp HIVE_HOME (SkipTest until WP1 merges); a temp home it created is
+    removed by ``rt.stop()``."""
     from hive import config, node
-    home = Path(os.environ.get("HIVE_HOME") or tempfile.mkdtemp(prefix="hivetest-")).resolve()
+    home = temp_home("hivetest-")
     raw = make_node_config(preset, data_dir=str(home / "node"), policy=policy_overrides)
     path = home / "node" / "config.json"
     util.write_json_atomic(path, raw, private=True)
@@ -175,6 +217,7 @@ def make_runtime(preset: str = "standard", *, start_managers: bool = True, **pol
         if _wp_missing(e):
             raise unittest.SkipTest(f"NodeRuntime not available yet (WP1): {e.message}")
         raise
+    remove_on_stop(rt, home)
     return rt
 
 
@@ -190,7 +233,7 @@ def start_node_server(**cfg: Any) -> Tuple[str, str, Any]:
     preset = cfg.pop("preset", "standard")
     start_managers = cfg.pop("start_managers", False)
     agent_entry = cfg.pop("agent_entry", {})
-    home = Path(os.environ.get("HIVE_HOME") or tempfile.mkdtemp(prefix="hivetest-")).resolve()
+    home = temp_home("hivetest-")
     agent, owner = util.new_token(), util.new_token()
     entry = {"name": "test-agent", "sha256": util.hash_token(agent), "kind": "agent", "role": "operator"}
     entry.update(agent_entry)
@@ -216,6 +259,7 @@ def start_node_server(**cfg: Any) -> Tuple[str, str, Any]:
         server.stop()
         rt.stop()
     rt.test_stop = stop
+    remove_on_stop(rt, home, "test_stop")
     return f"http://127.0.0.1:{bound[0][1]}", agent, rt
 
 

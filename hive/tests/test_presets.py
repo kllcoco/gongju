@@ -157,7 +157,9 @@ class TestBuilders(unittest.TestCase):
         self.assertEqual(d["argv"][-3:], ["serve", "--host", "0.0.0.0"])
 
     def test_local_model_rules(self):
-        work = Path(helpers.FakeRuntime().workdir)
+        frt = helpers.FakeRuntime()      # kept referenced: a collected FakeRuntime removes its dir (QA L2)
+        self.addCleanup(frt.cleanup)
+        work = Path(frt.workdir)
         (work / "models" / "Qwen").mkdir(parents=True)
         (work / "models" / "Qwen" / ".hive-pull.json").write_text(json.dumps({"repo": "Qwen/Qwen2.5-7B-Instruct"}))
         pol = helpers.FakeEffectivePolicy(workdir=work)
