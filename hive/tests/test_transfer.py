@@ -215,6 +215,8 @@ class TestNodeFS(_Tmp):
         gate.set()
         st = tm.status(ids[0], wait=10)
         self.assertEqual(st["state"], "cancelled")
+        for tid in ids[1:]:
+            self.assertEqual(tm.status(tid, wait=10)["state"], "done")
 
 
 class TestRealNode(_Tmp):

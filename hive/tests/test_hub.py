@@ -549,3 +549,143 @@ class TestSummary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _stub_node(preset="standard", call_reply=None):
+    """A StubHTTPServer speaking enough of the node API for a DirectLink."""
+    env = lambda r: {"ok": True, "result": r, "meta": {"api": 1}}      # noqa: E731
+    stub = helpers.StubHTTPServer()
+    stub.add("GET", "/v1/nodes", 200, env({"nodes": [{"name": "real-name", "mode": "self", "online": True,
+                                                       "os": "Linux", "version": "1.0.0", "preset": preset,
+                                                       "max_timeout": 600, "status": {}}]}))
+    stub.add("GET", "/v1/actions", 200, env({"node": "real-name", "implemented": ["fs.stat", "shell.run"],
+                                             "actions": [{"name": "fs.stat"}, {"name": "shell.run"}]}))
+    stub.add("POST", "/v1/call", 200, call_reply or env({"exists": True}))
+    return stub.start()
+
+
+class TestDirectLinkStub(_HubCase):
+    def test_row_name_mode_and_approval_rewrite(self):
+        stub = _stub_node(call_reply={"ok": False, "error": {"code": "approval_required", "message": "x",
+                                                             "details": {"approval_id": "ap_evil1234"}},
+                                      "meta": {}})
+        self.addCleanup(stub.stop)
+        url, toks, hub = self.make_hub([{"name": "desk", "mode": "direct", "url": stub.url, "token": util.new_token()}])
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        helpers.wait_until(lambda: hub.links["desk"].online(), 10)
+        row = c.nodes()[0]
+        self.assertEqual((row["name"], row["mode"], row["identity_changed"], row["max_timeout"]),
+                         ("desk", "direct", False, 600))
+        with self.assertRaises(HiveError) as cm:
+            c.call("fs.stat", {"path": "/"}, node="desk")
+        self.assertEqual(cm.exception.code, "internal")
+        call = [r for r in stub.requests if r["path"] == "/v1/call"][-1]
+        self.assertEqual(call["headers"].get("X-Hive-Agent"), "test-agent")
+        self.assertNotIn("X-Hive-Exec-Gated", call["headers"])
+        body = json.loads(call["body"])
+        self.assertNotIn("approval_id", body)
+
+    def test_exec_gated_header_for_files_agent(self):
+        stub = _stub_node()
+        self.addCleanup(stub.stop)
+        url, toks, hub = self.make_hub([{"name": "desk", "mode": "direct", "url": stub.url,
+                                         "token": util.new_token()}], agent_entry={"role": "files"})
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        c.call("fs.stat", {"path": "/"}, node="desk")
+        call = [r for r in stub.requests if r["path"] == "/v1/call"][-1]
+        self.assertEqual(call["headers"].get("X-Hive-Exec-Gated"), "1")
+
+    def test_cautious_direct_gates_after_restart(self):
+        stub = _stub_node(preset="cautious")
+        self.addCleanup(stub.stop)
+        url, toks, hub = self.make_hub([{"name": "desk", "mode": "direct", "url": stub.url,
+                                         "token": util.new_token()}])
+        # simulate "right after a hub restart": no cached row yet -> synchronous probe first
+        link = hub.links["desk"]
+        with link.lock:
+            link._row = None
+            link._row_ok_at = None
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        self.assertTrue(c.call("fs.stat", {"path": "/"}, node="desk")["exists"])     # read: not gated
+        with self.assertRaises(HiveError) as cm:
+            c.call("shell.run", {"command": "true"}, node="desk")
+        self.assertEqual(cm.exception.code, "approval_required")
+        self.assertEqual([r["path"] for r in stub.requests if r["path"] == "/v1/call"].count("/v1/call"),
+                         len([r for r in stub.requests if r["path"] == "/v1/call"]))
+
+
+class TestDirectTls(_HubCase):
+    def test_pin_pass_and_fail(self):
+        from tests.test_transport import TEST_PIN, CertFiles
+        certs = CertFiles()
+        self.addCleanup(certs.cleanup)
+        tok = util.new_token()
+        nurl, _a, nrt = helpers.start_node_server(
+            auth={"tokens": [hub_token_entry(tok)]},
+            listen={"tls": {"cert": str(certs.cert), "key": str(certs.key)}})
+        self.addCleanup(nrt.test_stop)
+        surl = nurl.replace("http://", "https://")
+        url, toks, hub = self.make_hub([
+            {"name": "good", "mode": "direct", "url": surl, "token": tok, "tls_pin": TEST_PIN},
+            {"name": "bad", "mode": "direct", "url": surl, "token": tok, "tls_pin": "sha256:" + "00" * 32}])
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        self.assertTrue(c.call("fs.stat", {"path": "~"}, node="good")["exists"])
+        with self.assertRaises(HiveError) as cm:
+            c.call("fs.stat", {"path": "~"}, node="bad")
+        self.assertEqual((cm.exception.code, cm.exception.details["maybe_executed"]), ("unavailable", False))
+
+
+class TestCancelAndRunHub(_HubCase):
+    def test_cancel_through_hub_stops_node_command(self):
+        tok = util.new_token()
+        nurl, _a, nrt = helpers.start_node_server(start_managers=True, auth={"tokens": [hub_token_entry(tok)]})
+        self.addCleanup(nrt.test_stop)
+        url, toks, hub = self.make_hub([{"name": "desk", "mode": "direct", "url": nurl, "token": tok}])
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        box = call_async(c.call, "shell.run", {"command": "sleep 30", "timeout": 60}, node="desk",
+                         request_id="r_cancelme1")
+        helpers.wait_until(lambda: "r_cancelme1" in hub._inflight and "r_cancelme1" in nrt._inflight, 10)
+        t0 = time.monotonic()
+        self.assertTrue(c.cancel("r_cancelme1"))
+        box["thread"].join(20)
+        self.assertLess(time.monotonic() - t0, 15)
+        res = box.get("result") or {}
+        err = box.get("error")
+        self.assertTrue((err is not None and err.code == "cancelled") or res.get("state") in ("cancelled", "killed"),
+                        (err, res))
+
+    def test_run_hub_control_restart_and_hub_code(self):
+        import threading
+        from hive import hub as hubmod
+        url, toks, hub = helpers.start_hub()
+        path = hub.config_path
+        hub.server.stop()
+        hub.stop()
+        import logging
+        import shutil
+        root = logging.getLogger("hive")
+        before, level = list(root.handlers), root.level
+
+        def restore():
+            for h in [h for h in root.handlers if h not in before]:
+                root.removeHandler(h)
+                h.close()
+            root.setLevel(level)
+            shutil.rmtree(str(Path(hub.data_dir).parent), ignore_errors=True)
+        self.addCleanup(restore)
+        rc = {}
+        t = threading.Thread(target=lambda: rc.setdefault("code", hubmod.run_hub(str(path))), daemon=True)
+        t.start()
+        data = Path(hub.data_dir)
+        helpers.wait_until(lambda: (data / "run" / "hub-code.json").exists(), 15)
+        code = json.loads((data / "run" / "hub-code.json").read_text())
+        self.assertEqual(code["v"], 1)
+        self.assertIn("package_dir", code)
+        util.write_json_atomic(data / "control.json", {"cmd": "restart", "at": util.iso_utc()}, private=True)
+        t.join(20)
+        self.assertEqual(rc.get("code"), 75)
