@@ -565,9 +565,17 @@ class TestContainers(unittest.TestCase):
         self.assertIn("Hive did not create", env["error"]["message"])
         self.assertNotIn(["rm", "-f", "hive-dk"], self.calls())
 
+    def caps_up(self):
+        # WP4 capabilities() probes the daemon (`docker version`), and service.define refuses the docker preset while
+        # it is down (§10.6); these tests model a daemon that goes down after the define/at the next start
+        return mock.patch("hive.sysinfo.capabilities", return_value={"psutil": False, "nvidia_smi": False,
+                                                                      "docker": True, "docker_gpu": False,
+                                                                      "wsl": False})
+
     def test_daemon_down_waits_then_starts(self):
         self.set("mode", "down")
-        env = self.define(max_restarts=0)
+        with self.caps_up():
+            env = self.define(max_restarts=0)
         self.assertTrue(env["ok"], env)
         r = env["result"]
         self.assertEqual((r["state"], r["last_error"]), ("starting", services.DOCKER_WAIT_ERROR))
@@ -580,7 +588,8 @@ class TestContainers(unittest.TestCase):
 
     def test_daemon_down_cap(self):
         self.set("mode", "down")
-        self.define()
+        with self.caps_up():
+            self.define()
         sm = self.n.rt.services
         base = services._mono()
         with mock.patch.object(services, "_mono", return_value=base + services.DOCKER_WAIT_MAX_S + 5):

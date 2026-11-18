@@ -901,7 +901,7 @@ def _docker_caps() -> Tuple[bool, Optional[bool]]:
         code, out, _err = proctree.run_quick([exe, "version", "--format", "{{.Server.Version}}"], timeout=5)
     except Exception:  # noqa: BLE001
         code, out = 1, b""
-    ok = code == 0 and bool(util.decode_text(out).strip())
+    ok = code == 0
     if not sys.platform.startswith("linux"):
         return ok, None
     gpu = os.path.exists("/etc/cdi/nvidia.yaml")
@@ -925,7 +925,9 @@ def capabilities(refresh: bool = False) -> dict:
             has_wsl = False
         return {"psutil": _psutil() is not None, "nvidia_smi": bool(gpu.find_tool("nvidia-smi")) if not IS_MAC
                 else False, "docker": docker, "docker_gpu": docker_gpu, "wsl": bool(has_wsl)}
-    return dict(_cached("caps", CAPS_TTL, build, refresh=refresh))
+    from . import proctree
+    # keyed by the trusted PATH: a node that set another PATH (or a test's fake docker) gets a fresh probe
+    return dict(_cached("caps:" + proctree.trusted_path(), CAPS_TTL, build, refresh=refresh))
 
 
 def summary_line() -> str:

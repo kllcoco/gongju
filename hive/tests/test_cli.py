@@ -157,8 +157,8 @@ class TestNodeCommands(CliCase):
         code, out, err = run(["node", "stop"])
         self.assertEqual((code, out.strip()), (0, "node is not running"))
         code, out, err = run(["node", "restart"])
-        self.assertEqual(code, 1)  # install.restart is the P0 stub until WP4
-        self.assertIn("unsupported", err)
+        self.assertEqual(code, 4)  # WP4 install.restart: not running, nothing installed -> unavailable
+        self.assertIn("hive node run", err)
         self.assertEqual(run(["node", "pause"])[0], 0)
         self.assertTrue((self.home / "node" / "PAUSED").exists())
         self.assertEqual(run(["node", "resume"])[0], 0)

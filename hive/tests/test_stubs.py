@@ -321,9 +321,13 @@ class TestWp3Stubs(unittest.TestCase):
 
 
 class TestWp4Wp5Wp6Stubs(unittest.TestCase):
-    def test_procinfo(self):
-        self.assertEqual(procinfo.listeners(), ([], "unavailable"))
-        self.assertIsNone(procinfo.process_info(os.getpid()))
+    def test_procinfo_real(self):
+        # WP4 CONTRACT-REQUEST: procinfo is real; process_info has the v3 shape (tests/test_system.py)
+        rows, method = procinfo.listeners()
+        self.assertIsInstance(rows, list)
+        self.assertIn(method, ("psutil", "proc", "lsof", "netstat", "unavailable"))
+        info = procinfo.process_info(os.getpid())
+        self.assertEqual(set(info), {"pid", "ppid", "name", "cmdline", "uid", "user", "create_time"})
 
     def test_declared_bases(self):
         # §4.6 / §15.2: HubGatewayBackend(GatewayBackend), NodeGatewayBackend(GatewayBackend), HttpTarget(Target),
@@ -338,23 +342,24 @@ class TestWp4Wp5Wp6Stubs(unittest.TestCase):
         with self.assertRaises(HiveError):
             tools.RuntimeTarget(None, None, "127.0.0.1")
 
-    def test_node_info_probes_neutral(self):
-        # node.info and GET /v1/nodes compose these before WP4 merges (§9.2 null fallback)
+    def test_node_info_probes_real(self):
+        # WP4 CONTRACT-REQUEST: the probes node.info composes are real (shapes; values depend on the machine)
         from hive import gpu, sysinfo
-        self.assertEqual(sysinfo.capabilities(), {})
-        self.assertEqual(sysinfo.summary_line(), "")
-        self.assertEqual(sysinfo.live_status(), {})
+        self.assertEqual(set(sysinfo.capabilities()), {"psutil", "nvidia_smi", "docker", "docker_gpu", "wsl"})
+        self.assertIsInstance(sysinfo.summary_line(), str)
+        self.assertEqual(set(sysinfo.live_status()), {"cpu_pct", "mem_pct", "gpus"})
         d = gpu.detect()
         self.assertEqual(set(d), {"backend", "gpus", "processes", "errors", "driver", "cuda"})
-        self.assertEqual((d["backend"], d["gpus"], d["processes"]), (None, [], []))
-        with self.assertRaises(HiveError):
-            sysinfo.os_info()
+        self.assertIn("system", sysinfo.os_info())
 
-    def test_install_restart(self):
-        with self.assertRaises(HiveError) as cm:
-            install.restart("node")
-        self.assertEqual((cm.exception.code, cm.exception.message),
-                         ("unsupported", "service install not available yet"))
+    def test_install_restart_real(self):
+        # WP4 CONTRACT-REQUEST: install.restart is real; a node that is neither running nor installed is
+        # `unavailable` with the "start it" hint
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HIVE_HOME": d}):
+            with self.assertRaises(HiveError) as cm:
+                install.restart("node")
+        self.assertEqual(cm.exception.code, "unavailable")
+        self.assertIn("hive node run", cm.exception.hint)
 
     def test_build_pyz(self):
         # WP5b CONTRACT-REQUEST: build_pyz is real (tests/test_dist.py); self_update without a node config or with

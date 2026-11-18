@@ -199,7 +199,7 @@ class NodeRuntime:
             if IS_WINDOWS and cfg.wsl.keepalive:  # pragma: no cover - Windows only
                 try:
                     from . import wsl
-                    self.keepalive = wsl.Keepalive()
+                    self.keepalive = wsl.Keepalive(self.state_dir)
                     self.keepalive.start(list(cfg.wsl.keepalive))
                     self.add_periodic(self.keepalive.check, 10, "wsl-keepalive")
                 except Exception as e:  # noqa: BLE001
