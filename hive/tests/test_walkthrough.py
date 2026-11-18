@@ -87,7 +87,9 @@ class TestForegroundRestart(unittest.TestCase):
                 mock.patch.object(cli, "_MAIN_ARGV", ["node", "run", "--config", "c.json"]):
             code = cli._foreground_run("node", self._args(), lambda *a, **k: 75)
         self.assertEqual(code, 0)
-        self.assertEqual(seen["argv"], util.self_command() + ["node", "run", "--config", "c.json"])
+        self.assertEqual(seen["argv"], cli._relaunch_prefix() + ["node", "run", "--config", "c.json"])
+        with mock.patch.object(cli.sys, "argv", [os.path.join("x", "hive", "__main__.py"), "node", "run"]):
+            self.assertEqual(cli._relaunch_prefix(), util.self_command())     # python -m hive
         self.assertEqual(seen["cwd"], os.getcwd())
 
     def test_supervised_or_other_codes_return(self):

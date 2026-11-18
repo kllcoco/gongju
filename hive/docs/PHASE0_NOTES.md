@@ -1555,7 +1555,7 @@ X-W1. **Foreground restart (owner decision A; `cli.py`, `node.py`, `hub.py`, `in
     `hive hub run` started by hand in a terminal (`node.foreground_restart_ok`: stdin or stderr is a TTY, not
     `--relaunched`/`--supervise`, no `HIVE_WATCHDOG=1`, no systemd `INVOCATION_ID`, not the Windows loop's child
     `HIVE_FOREGROUND_CHILD=1`) re-exec themselves after exit 75 (`node.reexec_foreground`: prints "restarting to apply
-    new settings…", chdir back to the original cwd, POSIX `os.execv(util.self_command() + CLI args)`; Windows runs the
+    new settings…", chdir back to the original cwd, POSIX `os.execv(cli._relaunch_prefix() + CLI args)` (the pyz, the `hive` script from argv[0], else `python -m hive`); Windows runs the
     same command as a child in a loop). Supervised runs keep exit 75. Contract change: the node and hub lock notes are
     `"node <hex>"` / `"hub <hex>"` (per start), and `install.restart` compares holders by `(pid, ctime, note)` — its
     exit wait ends when the pid exits or the holder changes, `_wait_new_holder(ctx, old_holder, …)` accepts any

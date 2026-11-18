@@ -574,6 +574,23 @@ def cmd_init_client(args: argparse.Namespace, out: Out) -> int:
 _MAIN_ARGV: Optional[List[str]] = None   # the arguments main() was called with (a foreground re-exec repeats them)
 
 
+def _relaunch_prefix() -> List[str]:
+    """The program this process was started as: the pyz, the ``hive`` console script (sys.argv[0]), else
+    ``python -m hive`` (also for ``python -m hive``, whose argv[0] is ``__main__.py``)."""
+    zp = util._zipapp_path()
+    if zp is not None:
+        return [sys.executable, str(zp)]
+    a0 = sys.argv[0] if sys.argv else ""
+    if a0 and os.path.basename(a0) != "__main__.py" and os.path.isfile(a0):
+        a0 = os.path.abspath(a0)
+        if os.name != "nt" and os.access(a0, os.X_OK):
+            return [a0]
+        if a0.lower().endswith(".exe"):
+            return [a0]
+        return [sys.executable, a0]
+    return util.self_command()
+
+
 def _foreground_run(kind: str, args: argparse.Namespace, run: Any) -> int:
     """v8.1: a hand-started ``hive node run`` / ``hive hub run`` in a terminal survives requested restarts (exit 75
     after a config change, ``hive … restart``, an upgrade): it re-execs the same command instead of ending.
@@ -587,7 +604,7 @@ def _foreground_run(kind: str, args: argparse.Namespace, run: Any) -> int:
     argv = list(_MAIN_ARGV) if _MAIN_ARGV is not None else list(sys.argv[1:])
     if not argv:
         argv = [kind, "run"]
-    return nodemod.reexec_foreground(util.self_command() + argv, cwd)
+    return nodemod.reexec_foreground(_relaunch_prefix() + argv, cwd)
 
 
 def cmd_node_run(args: argparse.Namespace, out: Out) -> int:
