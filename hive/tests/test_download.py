@@ -368,10 +368,10 @@ class TestFileMode(DownloadCase):
         d.mkdir()
         real_open = os.open
 
-        def picky_open(path: Any, flags: int, *a: Any) -> int:
+        def picky_open(path: Any, flags: int, *a: Any, **kw: Any) -> int:
             if os.path.basename(str(path)) == "odd.bin":
                 raise OSError(36, "File name too long")
-            return real_open(path, flags, *a)
+            return real_open(path, flags, *a, **kw)
         with mock.patch.object(_download.os, "open", picky_open):
             code, res, _p = self.run_spec(file_spec(self.srv.url + "/odd", directory=str(d)))
         self.assertEqual((code, os.listdir(str(d))), (0, ["download.bin"]))
@@ -379,10 +379,10 @@ class TestFileMode(DownloadCase):
         d = self.tmp / "odd2"
         d.mkdir()
 
-        def no_open(path: Any, flags: int, *a: Any) -> int:
+        def no_open(path: Any, flags: int, *a: Any, **kw: Any) -> int:
             if flags & os.O_EXCL:
                 raise OSError(22, "Invalid argument")
-            return real_open(path, flags, *a)
+            return real_open(path, flags, *a, **kw)
         with mock.patch.object(_download.os, "open", no_open):
             code, res, _p = self.run_spec(file_spec(self.srv.url + "/odd", directory=str(d)))
         self.assertEqual((code, res), (1, None))
