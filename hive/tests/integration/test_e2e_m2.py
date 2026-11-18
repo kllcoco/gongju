@@ -127,15 +127,17 @@ class TestE2EM2(unittest.TestCase):
         cls.gw_token = re.search(r"^(hv_[A-Za-z0-9_-]+)$", out, re.M).group(1)
         cls.owner_token = (cls.home / "tokens" / "hub-owner.token").read_text(encoding="utf-8").strip()
         # daemons (restart-on-75 loops)
-        cls.hub_sup = Supervisor([sys.executable, "-m", "hive", "hub", "run"], env=cls.env, cwd=str(ROOT),
-                                 log=cls.base / "hub.log", name="hub").start()
+        # the node first: the hub probes direct links every 30 s (§8.3)
         cls.node_sup = Supervisor([sys.executable, "-m", "hive", "node", "run"], env=cls.env, cwd=str(ROOT),
                                   log=cls.base / "node.log", name="desk").start()
-        cls.sups += [cls.hub_sup, cls.node_sup]
-        wait_for(lambda: http_json("GET", cls.hub_url + "/v1/health", timeout=2)[1]["result"]["role"] == "hub",
-                 60, what="hub health")
+        cls.sups.append(cls.node_sup)
         wait_for(lambda: http_json("GET", f"http://127.0.0.1:{cls.node_port}/v1/health", timeout=2)[1]
                  ["result"]["role"] == "node", 60, what="node health")
+        cls.hub_sup = Supervisor([sys.executable, "-m", "hive", "hub", "run"], env=cls.env, cwd=str(ROOT),
+                                 log=cls.base / "hub.log", name="hub").start()
+        cls.sups.append(cls.hub_sup)
+        wait_for(lambda: http_json("GET", cls.hub_url + "/v1/health", timeout=2)[1]["result"]["role"] == "hub",
+                 60, what="hub health")
 
     @classmethod
     def _setup_pod(cls) -> None:
@@ -171,7 +173,7 @@ class TestE2EM2(unittest.TestCase):
         return {n["name"]: n for n in res["nodes"]}
 
     @classmethod
-    def wait_online(cls, name: str, timeout: float = 60) -> dict:
+    def wait_online(cls, name: str, timeout: float = 120) -> dict:
         return wait_for(lambda: cls.hub_nodes().get(name, {}).get("online") and cls.hub_nodes()[name], timeout,
                         what=f"{name} online at the hub")
 

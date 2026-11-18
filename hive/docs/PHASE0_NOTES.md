@@ -1338,3 +1338,67 @@ R6b-9. **gateway (amends S4):** `gateway token add` with a non-glob first model 
     escapes the model id it puts into the Provider line (§19).
 R6b-10. **approvals list:** when every place fails, it prints the per-place lines but not "no pending approvals" and
     exits with that failure's code (4 for "not running"), like `approvals revoke`.
+
+## M2 integration (lead, §22.1 step 5)
+
+(Items numbered M2-1… . Tests: `tests/integration/test_e2e_m2.py` (E2E 1), `test_e2e2_restart.py` (E2E 2),
+`test_e2e3_security.py` (E2E 3), `test_e2e_gateway.py` (the §21.2 gateway list end to end), helpers `m2util.py`.)
+
+M2-1. **Real processes, not one process.** §21.2 says E2E 1 runs "in one process"; the M2 tests instead drive real
+    daemons on loopback (`hive hub run`, `hive node run`, the downloaded `hive.pyz node run`), each under a
+    restart-on-75 loop (`m2util.Supervisor`, the watchdog/D55 rule), plus the CLI, the Python client, an MCP stdio
+    subprocess and the hub's `/mcp`. In-process hub + direct + relay coverage stays in the WP5 tests
+    (`tests/test_hub.py`, `test_relay.py`, `test_gateway.py`). A join code never names a loopback hub (R5b-6), so the
+    tests use `hub add-node … --relay --host 10.255.0.1` and point the decoded code's `u` at the loopback port.
+    CI containers run as root: the tests set `allow_root` in the written configs (§13.1).
+M2-2. **CONTRACT-REQUEST (M2 → WP6 `tools.py`, behaviour fix):** an `fs_transfer` call whose copy ended `failed`
+    within the wait (e.g. the source holds a node secret value, §15.3 v7 `masked`) returned `isError:false` with the
+    text "transfer … failed … error: …"; §18.2 says execution errors are `isError:true`. `_run_fs_transfer` now marks a
+    `failed` status as an error result (rendering unchanged; `running`, `done` and an explicit `cancelled` stay
+    non-errors).
+M2-3. **CONTRACT-REQUEST (M2 → WP5 `gateway.py`, audit only):** (a) gateway audit rows name the canonical node: the
+    node backend wrote the URL segment (`"node":"self"` on every hub passthrough row), the hub wrote an alias as given;
+    new optional backend method `audit_node(node) -> str` (node: its own name; hub: `hub.resolve(node).name`, unknown
+    names unchanged), used only for the audit row. (b) the hub's direct-link passthrough recorded `usage: null` for
+    every non-streamed reply (only SSE tails were scanned): replies of ≤ `USAGE_SCAN_MAX` (1 MiB) that are not SSE are
+    now parsed for `usage` once the stream ends (§8.7 step 5 lists usage). Nothing changes in what the app receives.
+M2-4. **(M2 → WP6 `__main__.py`, robustness):** `hive … | head` printed a `BrokenPipeError` traceback; the CLI entry
+    now exits 1 quietly (stdout redirected to devnull, the Python docs recipe).
+M2-5. **WIP fix kept (M2 → WP2 `jobs.py`):** `JobManager._save` skips a record that was removed meanwhile (a finished
+    `shell.run` whose run dir was already deleted) instead of logging "cannot write job record" (seen as log noise in
+    the E2E 1 node log).
+M2-6. **Interpretations in the tests (no code change):**
+    - E2E 3 "readonly token sees no mutating tools": §17.2 filtering keeps `fs_op` with `op` enum `["stat"]`,
+      `fs_transfer` (its `fs.read_chunk` side is allowed; every node-side write is refused) and `call_action` (only
+      read actions reach the node). The test asserts that no other mutating tool is listed and that `fs_op` is
+      narrowed. A server-hosted Toolkit (node `GET /v1/tools`, hub `/mcp`) has no `local:` endpoint, so `fs_transfer`
+      is useless to a readonly token there; hiding it when every reachable write side is denied would be a §17.2
+      change (lead).
+    - E2E 3 "docker preset with volume `~`": refused as `policy_denied` rule `contains_denied` (`~` holds Hive's
+      `.hive` and secret paths), not a docker-specific rule. A fake `docker` on a trusted PATH dir makes the define
+      reach the volume check.
+    - E2E 3 "interpreter's site.py": only meaningful when the stdlib is inside an rw root, so the node gets the
+      stdlib's parent as an extra root and the test writes the file's own bytes (harmless if a check regressed). The
+      path must be given resolved: §5.4 step 4 is a lexical pre-check (uv's `cpython-3.9-…` dir is a symlink).
+    - Gateway v8 "a models token for desk/llm asking for desk/other → 404": §8.7 step 1 refuses a pair outside the
+      token's globs with 403 first; the test accepts 403 or 404 there (as WP5's test does) and asserts that the
+      message names no other service or node; an unknown node is 404.
+    - E2E 2 reboot: simulated by stopping the node (exit 0), killing every shim/child it started and rewriting the
+      stored `boot_key` of each service's `runtime.json`: the autostart service restarts, the other is `stopped` with
+      the §10.5 "not restarted after reboot" error, the running job is `lost`. A crash in the same boot (SIGKILL of
+      the daemon and of one service shim) restarts that service; a surviving shim is adopted.
+M2-7. **M2 observations (no change made):**
+    - `hive hub add-node NAME --relay` on a hub that listens on 127.0.0.1 exits 2 ("another machine cannot reach")
+      unless `--host` is given; with `--host <private IP>` it prints the tailnet `hive join` block, not the pod
+      one-liner (that needs `public_url`, §20.4). The pod one-liner itself (`GET /v1/dist/hive.pyz` without a token,
+      `X-Hive-Sha256` = the local deterministic build, `join --pod`, `_update`, `node run`) works.
+    - `hive node restart` on a foreground daemon without a loop answers exit 4 "the node stopped, but it ran in the
+      foreground" after ~20 s (per §13.1); under a loop it reports "node restarted" in < 1 s.
+    - `hive gateway url NODE SERVICE --token-file F` still prints the "no token yet? hive gateway token add …" line.
+    - The node lists `HF_TOKEN` from its own environment in `secrets` (§5.13 env secrets) although `node secret list`
+      (store only) is empty; correct, but owners may find the two lists confusing.
+    - The hub probes direct links every 30 s (`PROBE_INTERVAL`), and `hub.nodes` reports the last probe: a node that
+      starts a moment after the hub shows `offline` for up to 30 s (calls still probe synchronously, §8.3 v5). The
+      M2 tests start nodes before the hub.
+    - `hive join` without `--pod` keeps the node listener on the default `127.0.0.1:7701`; two joined nodes on one
+      machine (tests running in parallel) collide, so the tests move it to a free port.

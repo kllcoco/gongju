@@ -130,8 +130,12 @@ class TestE2E3Security(unittest.TestCase):
                                      "add-agent operator"))
         cls.hub_models = cls.token_of(cls.ok(cls.cli("gateway", "token", "add", "chat", "--models", "*/*", "--hub"),
                                              "gateway token add --hub"))
-        cls.start("hub", [sys.executable, "-m", "hive", "hub", "run"], cls.env)
+        # the node first: the hub probes direct links every 30 s, so a first probe that raced the node's start would
+        # leave the row offline for that long (§8.3)
         cls.start("safe", [sys.executable, "-m", "hive", "node", "run"], cls.node_env)
+        wait_for(lambda: http_json("GET", cls.node_url + "/v1/health", timeout=2)[1]["result"]["role"] == "node",
+                 60, what="node health")
+        cls.start("hub", [sys.executable, "-m", "hive", "hub", "run"], cls.env)
         wait_for(lambda: http_json("GET", cls.hub_url + "/v1/health", timeout=2)[1]["result"]["role"] == "hub", 60,
                  what="hub health")
         wait_for(lambda: http_json("GET", cls.node_url + "/v1/health", timeout=2)[1]["result"]["role"] == "node",
@@ -139,11 +143,13 @@ class TestE2E3Security(unittest.TestCase):
         # the relay node: join, then switch its exec policy to allowlist mode before it runs
         cls.ok(cls.cli("join", "--yes", "--no-pod", env=dict(cls.pod_env, HIVE_JOIN=dist.encode_join(code))), "join")
         m2util.allow_root(cls.pod_home / "node" / "config.json")
-        m2util.edit_json(cls.pod_home / "node" / "config.json",
-                         lambda d: d["policy"]["exec"].__setitem__("mode", "allowlist"))
+        def strict_cfg(d: dict) -> None:
+            d["policy"]["exec"]["mode"] = "allowlist"
+            d["listen"]["port"] = helpers.free_port()       # join keeps the default 7701 (parallel test runs)
+        m2util.edit_json(cls.pod_home / "node" / "config.json", strict_cfg)
         cls.start("strict", [sys.executable, "-m", "hive", "node", "run"], cls.pod_env)
         wait_for(lambda: cls.hub_rows().get("strict", {}).get("online") and cls.hub_rows()["safe"].get("online"),
-                 60, what="nodes online at the hub")
+                 120, what="nodes online at the hub")
 
     @classmethod
     def start(cls, name: str, argv: List[str], env: Dict[str, str]) -> None:

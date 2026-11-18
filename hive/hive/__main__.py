@@ -54,7 +54,16 @@ def _main():
         dist.self_update(None)   # WP5 wires `hive _update` (fetches only when relay.auto_update)
         return 0
     from hive import cli
-    return cli.main(sys.argv[1:])
+    try:
+        return cli.main(sys.argv[1:])
+    except BrokenPipeError:
+        # M2: `hive … | head` closed the pipe: exit quietly instead of printing a traceback (the Python docs recipe)
+        try:
+            fd = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(fd, sys.stdout.fileno())
+        except (OSError, ValueError, AttributeError):
+            pass
+        return 1
 
 
 if __name__ == "__main__":

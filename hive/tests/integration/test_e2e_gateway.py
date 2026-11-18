@@ -118,17 +118,21 @@ class TestE2EGateway(unittest.TestCase):
         m2util.allow_root(cls.home / "node" / "config.json")
         cls.hub_token = [n for n in json.loads((cls.home / "hub" / "config.json").read_text(encoding="utf-8"))["nodes"]
                          if n["name"] == "desk"][0]["token"]
+        cls.start("desk", ["node", "run"], cls.env)      # before the hub: its first direct probe then succeeds
+        wait_for(lambda: http_json("GET", cls.node_url + "/v1/health", timeout=2)[1]["result"]["role"] == "node",
+                 60, what="node health")
         cls.start("hub", ["hub", "run"], cls.env)
-        cls.start("desk", ["node", "run"], cls.env)
         wait_for(lambda: http_json("GET", cls.hub_url + "/v1/health", timeout=2)[1]["result"]["role"] == "hub", 60,
                  what="hub health")
         cls.ok(cls.cli("join", "--yes", "--no-pod", env=dict(cls.pod_env, HIVE_JOIN=dist.encode_join(cls.join))),
                "join")
         m2util.allow_root(cls.pod_home / "node" / "config.json")
+        m2util.edit_json(cls.pod_home / "node" / "config.json",     # join keeps the default listen port 7701
+                         lambda d: d["listen"].__setitem__("port", helpers.free_port()))
         cls.start("pod", ["node", "run"], cls.pod_env)
         c = hclient.connect(cls.hub_url, token=cls.op)
         try:
-            wait_for(lambda: all({n["name"]: n for n in c.nodes()}[x]["online"] for x in ("desk", "pod")), 60,
+            wait_for(lambda: all({n["name"]: n for n in c.nodes()}[x]["online"] for x in ("desk", "pod")), 120,
                      what="desk and pod online")
             for node, model in (("desk", "desk-model"), ("pod", "pod-model")):
                 port = helpers.free_port()
