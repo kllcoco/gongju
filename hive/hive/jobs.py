@@ -248,10 +248,15 @@ class JobManager:
     def _save(self, rec: Dict[str, Any]) -> None:
         with self._lock:
             snap = dict(rec)
+            if self._jobs.get(snap.get("job_id")) is not rec:
+                return      # removed meanwhile (a finished shell.run job): its run dir is gone, nothing to save
         try:
             util.write_json_atomic(self._run_dir(snap["job_id"]) / "job.json", snap, private=True)
         except OSError as e:
-            log.warning("cannot write job record %s: %s", snap.get("job_id"), e)
+            with self._lock:
+                gone = self._jobs.get(snap.get("job_id")) is not rec
+            if not gone:
+                log.warning("cannot write job record %s: %s", snap.get("job_id"), e)
 
     def _rehold(self, jid: str, rec: Dict[str, Any]) -> None:
         paths = rec.get("held_paths") or []
