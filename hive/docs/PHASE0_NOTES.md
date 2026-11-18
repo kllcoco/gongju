@@ -657,3 +657,64 @@ by the lead or a line in DESIGN.md.
 82. **CONTRACT-REQUEST (WP3a review fixes → P0 `catalog.py`, additive):** the fs.copy result schema gained the
     optional integer `skipped_links` (not required; present only when a Windows node without
     SeCreateSymbolicLinkPrivilege / Developer Mode skipped links in a recursive copy instead of aborting halfway).
+
+## WP6a hand-off (tools.py, render.py, guides.py, mcp.py stdio, cli.py init/node/call/sh)
+
+83. **CONTRACT-REQUEST (WP6a → P0 test `tests/test_stubs.py`):** `test_route_registration_noops` no longer expects
+    `tools.register_agent_routes` to be a warning no-op: it registers `GET /v1/tools` on a recording fake server (the
+    `role="node", mcp=True` → `ValueError` and the gateway no-op checks are unchanged).
+84. **CONTRACT-REQUEST (WP6a → WP5b `transfer.py`):** the `fs_transfer` tool constructs
+    `transfer.TransferManager(client, local_roots=<Toolkit.local_roots>)` lazily in the tool-host process (§15.3 gives
+    no constructor). It calls `start(src, dst, overwrite=bool) -> "tx_…"`, `status(id, wait=s)` (polled in ≤ 1 s
+    steps up to the inner wait `w`, which also drives MCP progress notifications ≤ 1/s) and `cancel(id)`. While the
+    P0 stub raises `unsupported`, the tool renders that error.
+85. **Additive names (WP6a):**
+    - tools: `TOOLS` / `TOOLS_BY_NAME` (registry), `TOOL_HIDE`, `DESCRIPTIONS` (§17.5 verbatim), `INSTRUCTIONS`
+      (§17.8), `derive_params(tool)` (1:1 params from the live catalog), `parse_options(options)` (service_define
+      `options`), `resolve_wait_budget(explicit, *, config, stdio, env)` (§17.4 order), `lint_tools()`,
+      `is_mutating(tool)`; `Toolkit.get_tool(name)`, `Toolkit.export(fmt, *, protocol_version=None)`,
+      `Toolkit.connected`. `Toolkit(None, …)` is allowed: a static, unfiltered catalog (used by `hive tools export`
+      without a connection); its calls answer `unsupported` except `guide`.
+    - mcp: `serve_stdio(core, inp, out)` (the stdio loop, testable with byte streams), `build_parser()`,
+      `CallHandle`; `McpCore.watch` / `watch_interval` / `start_watcher(send)` / `close(session, wait)` (the hub's
+      HTTP handler (WP6b) sets `watch=False`).
+    - guides: `LIMITS` (the §17.8 caps, tested), `presets_text()`.
+    - render: per-tool renderers named like the tools, `error`, `finalize`, `next_call`, `idle_marker`, `head`,
+      `fence`, `table`, `clean`.
+    - cli: `build_parser()`, `exit_code_for(err)`, `Out`, `CliError`.
+86. **Interpretations (WP6a):**
+    - `Toolkit.tools()` returns copies whose `params` are the final input schemas (`node` first, required when §17.3
+      says so; `approval_id` when advertised); the registry (`TOOLS`) keeps the §17.5 schemas without them.
+    - Every tool forwards only the arguments the caller gave (validated with `defaults=False`, like the v6
+      `service_define` rule), so node-side `ctx.given` rules hold for all tools (e.g. `sys_info(which=[…])` without
+      `sections` returns only `which`, §9.2). Renderers see the arguments with defaults applied.
+    - Filtering: `nodes_list`, `guide` and `list_actions` are never dropped; `fs_transfer` counts as backed by
+      `fs.read_chunk`/`fs.write_chunk` (a read-only token keeps it: node → local copies only read); `call_action` by
+      every node-scope action. Static mode (server unreachable) filters nothing; a failed `refresh()` keeps the
+      previous state.
+    - `node` param: static mode (kind unknown) offers an optional `node`; `nodes_list` on a direct target has no
+      params. Unknown names → `not_found` with did-you-mean; a direct target accepts `self`/its own name.
+    - The 40 000-char lint (§17.2) measures the 28 standard tools' §17.5 schemas (no injected `node`/`approval_id`)
+      in compact JSON (`separators=(",",":")`, as the stdio transport writes) in all four formats: mcp 38.2 k,
+      anthropic 33.9 k, openai 34.7 k, openai-responses 34.4 k. With an injected optional `node` the static MCP export
+      is ≈ 40.4 k; a hub with 12 described nodes adds more (lead: re-measure in Phase 1 as §17.2 says).
+    - MCP `title` (top-level) is omitted for 2025-03-26; `annotations` always carry all four hints explicitly (MCP's
+      defaults are `destructiveHint:true`/`openWorldHint:true`) plus `title`.
+    - Read retry (§17.6): one retry with the same request id after 2 s, cancel-aware.
+    - `approval_required`: rendered only from a pattern-checked `details.approval_id` and the Toolkit's own
+      `whoami.server` (`hub:<name>` / `node:<name>`); followed by `refresh()`; MCP sends `tools/list_changed` when the
+      tool list changed during a call.
+    - `hive call` keeps `--json '{…}'` for params (§19); the global machine-output `--json` must come before the
+      command (`hive --json call …`). `hive call/sh/node status` default to `this-pc-owner` when no `--connection`,
+      `HIVE_URL` or `HIVE_CONNECTION` is set (§14.4). `hive sh NODE`: `self`, `.`, `-`, `local` mean the direct node;
+      words after `--` are joined with spaces; stdout/stderr are kept apart (`merge_stderr:false`).
+    - `hive node restart` reports the P0 `install.restart` stub's `unsupported` (exit 1) until WP4; config-changing
+      commands (`init node` edits, `node token add/revoke`) print "restart to apply: hive node restart" when a daemon
+      holds the lock and the restart is unsupported. `node token revoke` refuses to remove the last owner token.
+    - `hive init node --config P` is refused unless P is the default path (init writes `$HIVE_HOME`'s config).
+87. **Open items (WP6a → WP6b):** hub `/mcp` (`mcp.http_handler` stays `unsupported`; `register_agent_routes(mcp=True)`
+    logs a warning and registers only `/v1/tools`), the remaining CLI (`join`, `hub …`, `gateway …`, `approvals …`,
+    `service …`, `doctor`, `push`/`pull`, `logs`, `mcp-config`, `tls-pin`, `audit`, `dist`: they answer "not
+    available yet (WP6b)" with exit 2), `pyproject.toml` (console script `hive = hive.cli:main`; `_console_command()`
+    falls back to `python [-P] -m hive` without it), README, examples and the CI workflow. E2E-M1 runs here as
+    `tests/test_e2e_m1.py` (POSIX; the Windows variant is for the lead's CI).

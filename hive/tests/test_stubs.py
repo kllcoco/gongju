@@ -380,8 +380,16 @@ class TestWp4Wp5Wp6Stubs(unittest.TestCase):
             dist.decode_join(extra)
 
     def test_route_registration_noops(self):
-        with self.assertLogs("hive.tools", level="WARNING"):
-            tools.register_agent_routes(object(), lambda i, r: None, role="node")
+        # WP6a CONTRACT-REQUEST: register_agent_routes is real now (GET /v1/tools); the gateway one stays a no-op
+        class _Srv:
+            def __init__(self):
+                self.routes = []
+
+            def route(self, method, pattern, fn, **kw):
+                self.routes.append((method, pattern))
+        srv = _Srv()
+        tools.register_agent_routes(srv, lambda i, r: None, role="node")
+        self.assertEqual(srv.routes, [("GET", "/v1/tools")])
         with self.assertRaises(ValueError):
             tools.register_agent_routes(object(), lambda i, r: None, role="node", mcp=True)
         with self.assertLogs("hive.gateway", level="WARNING"):
