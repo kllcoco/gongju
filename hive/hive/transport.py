@@ -23,7 +23,7 @@ import ssl
 import threading
 import time
 import weakref
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from . import __version__, catalog
@@ -349,6 +349,63 @@ class HttpTransport:
         if raw:
             return status, rheaders, data
         return self._parse(status, rheaders, data)
+
+    def open_stream(self, method: str, path: str, body: Optional[bytes] = None, *, headers: Optional[dict] = None,
+                    timeout: Optional[float] = None, cancel: Optional[threading.Event] = None
+                    ) -> Tuple[int, Dict[str, str], Iterator[bytes]]:
+        """One request on a fresh connection whose response body is yielded in chunks as it arrives (WP5b: the hub's
+        gateway passthrough, §8.7). Connect-phase failures are retried like ``request`` (D12); ``cancel`` (or closing
+        the iterator) closes the connection. Errors after the request was sent: ``unavailable`` reason ``lost`` /
+        ``timeout``, both ``maybe_executed=True``."""
+        method = str(method or "").upper()
+        if not re.match(r"^[A-Z]{3,7}\Z", method):
+            raise bad_request(f"invalid HTTP method {method!r}")
+        if not isinstance(path, str) or not path.startswith("/") or not _PATH_RE.match(path) or "#" in path:
+            raise bad_request(f"invalid request path {path!r}")
+        sock_timeout = float(timeout) if timeout is not None else self.timeout
+        hdrs = self._headers(headers, body is not None)
+        failures = 0
+        while True:
+            try:
+                conn = self._open(sock_timeout)
+                break
+            except HiveError as e:
+                if (e.code == "unavailable" and e.details.get("reason") in _RETRY_REASONS
+                        and failures < CONNECT_RETRIES):
+                    failures += 1
+                    time.sleep(0.2 * failures)
+                    continue
+                raise
+        try:
+            conn.sock.settimeout(sock_timeout)
+            conn.request(method, self._prefix + path, body=body, headers=hdrs)
+            resp = conn.getresponse()
+        except socket.timeout:
+            conn.close()
+            raise timeout_error(f"no response from {self.url} within {sock_timeout:.0f} s", maybe_executed=True)
+        except (OSError, http.client.HTTPException) as e:
+            conn.close()
+            raise unavailable(f"connection to {self.url} lost: {_errtext(e)}", reason="lost", maybe_executed=True)
+        rheaders = {k: v for k, v in resp.getheaders()}
+
+        def chunks() -> Iterator[bytes]:
+            try:
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        return
+                    try:
+                        b = resp.read1(READ_CHUNK) if hasattr(resp, "read1") else resp.read(READ_CHUNK)
+                    except socket.timeout:
+                        raise timeout_error(f"idle timeout reading from {self.url}", maybe_executed=True)
+                    except (OSError, http.client.HTTPException, ValueError) as e:
+                        raise unavailable(f"connection to {self.url} lost: {_errtext(e)}", reason="lost",
+                                          maybe_executed=True)
+                    if not b:
+                        return
+                    yield b
+            finally:
+                conn.close()
+        return resp.status, rheaders, chunks()
 
     def close(self) -> None:
         """Close every keep-alive connection (the transport stays usable; new requests reconnect)."""
