@@ -1668,3 +1668,89 @@ X-S6. **Host header (finding 6, INFO; `httpserver.py`):** `httpserver.valid_host
     `test_httpserver.test_v81_strict_host_header` (6), `test_hub.TestHubFileBinding.test_v81_cd_unbinds_later_relative_words`
     (3, hub side), updated `test_shell` (cd header, review `cwd` key), `test_phase2_review` (`Hub._split` tuple),
     `test_services` (`code_files`, bound file stays protected while defined).
+
+### External review, round 2 (independent reviewers, fresh containers)
+
+R2-1. **Approval binding of `~` words (blocker; `presets.py`, `hub.py`):** words are bound as the path the program
+    opens. `presets.bind_plan(argv_or_command, shell=, os_name=) -> (spellings, moved, unbound)` (new; `bindable_words`
+    keeps its 2-tuple as the first two parts). POSIX shell strings are tokenized by `_posix_tokens` (per-character
+    quoting: unquoted / inside "…" / literal), so only an unquoted, unescaped leading `~` (tilde prefix up to the first
+    unquoted `/`) stays `~…` (expanded by the binding); a quoted/escaped one becomes the literal spelling `./~/…`
+    (relative to the reviewed cwd, normally `absent`). argv elements are literal: a leading `~` is bound as `./~/…`
+    **and** expanded (programs often expand it themselves); PowerShell/cmd words likewise. `KEY=~/x` words: bash
+    expands only `NAME=~…`; `--opt=~/x` binds both. Variables: a leading `$HOME`-style variable of `policy.PATH_VARS`
+    outside single quotes stays (PathGuard expands it; `bind_files` and `Hub._join` no longer join such a word to the
+    cwd, which gave `<cwd>/home/…`); any other expanded `$`, or a literal word PathGuard would expand, is header item
+    "<word> (variables; not bound)" when path-like. Services: the literal path is in the approval's files, so it is in
+    `approved_files`/`code_files` (absent; created later -> respawn refused, gated writes refused). DESIGN §5.6, §8.2.
+R2-2. **cd detection (major; `presets.text_may_change_cwd`):** for shell strings the decision is on the whole text:
+    a cwd changer anywhere (`cd|chdir|pushd|popd|set-location|sl|push-location|pop-location` with delimiter-agnostic
+    boundaries, so `cd/d`, `cd..`, `cd\sub`, `{cd`, `` `echo cd` ``, `C=cd`, `cd${IFS}` match; `SetLocation`,
+    `SetCurrentDirectory`, `CurrentDirectory =`) or code the review cannot read (backtick, `$(`, eval, source, `. x`,
+    iex/Invoke-Expression/Invoke-Command, a `$VAR`/`${…}` in command position) moves **every** relative word, before and
+    after, to "(cwd may change)". The word-order rule (`changes_cwd`) stays for argv lists and for `-C`-style options in
+    text. `Hub._split` returns the 3-tuple and drops words either reading moved. DESIGN §5.6.
+R2-3. **Exec paths (major; `policy.DEFAULT_EXEC_PATHS`):** toolchain homes (`~/.cargo/**`, `~/.rustup/**`,
+    `~/go/bin/**`, `~/.bun/**`, `~/.deno/**`, `~/.npm-global/**`, `~/.nvm/**`, `~/.volta/**`, `~/.local/share/pnpm/**`,
+    `~/.pyenv/**`, `~/.rbenv/**`, `~/.sdkman/**`, `~/*conda*/**`), `~/.oh-my-zsh/**`, zsh/tcsh/csh/ksh/xonsh/nushell
+    startup files, starship, terminal configs (alacritty, kitty, foot, ghostty, konsole), WM autostarts (openbox,
+    labwc, river, bspwm/sxhkd, awesome, qtile, niri, herbstluftwm, xmonad, xfce4 xinitrc, lxsession), REPL rc files
+    (julia, octave, ghci, irb, pry, psql, sqlite, lldb), `~/.mailcap`, VS Code extensions, `**/pyvenv.cfg`. The generic
+    `~/**/bin/**` rule is not taken (project `bin/` folders). DESIGN §5.5.
+R2-4. **Review binding uses the read check (minor; `presets.bind_files`):** words resolve with `resolve_path(cand)`
+    (was `write=True`), so a service's bound file, an exec path or a held input is shown and bound; when the caller
+    may not write it the file line says "…; agents cannot change it". The service.start review after an out-of-band
+    edit now shows and binds the new content. DESIGN §5.6.
+R2-5. **Hub binds the named path (minor; `Hub._bind_files`):** each `files` entry is keyed by the path as the command
+    names it (cwd + word; `real` = the real path fs.stat returned, shown in the review lines); the node's
+    `FileHolds.acquire` re-resolves it at consume, so a symlinked cwd (or word) retargeted after approval ends in
+    `conflict`. Chosen over a hub-side cwd pin (no protocol field needed). DESIGN §8.2 step 4.
+R2-6. **Env values that name files (minor; `presets.env_file_values`, `_env_words`):** BASH_ENV, ENV, PYTHONSTARTUP,
+    LD_PRELOAD/DYLD_INSERT_LIBRARIES entries and NODE_OPTIONS `-r/--require/--import/--loader` targets are bound
+    (relative -> `./x` against the reviewed cwd, so a missing one is `absent`; `~` both expanded and literal); a value
+    with `$`/backtick is "env K=V (variables; not bound)". Node and hub (shell.run, job.start, service.define/start).
+R2-7. Verification side effect (pkill of another agent's nodes): no code change.
+R2-8. **Listen edits (major; `config._sync_local_node_listen`, `edit_hub_init`):** `init node --listen/--no-listen`
+    on an existing config points client.json `this-pc`/`this-pc-owner` at the new URL or removes them (default moves to
+    another connection), and moves the hub-on-this-machine's direct entry for the old URL (the CLI restarts that hub;
+    with --no-listen it warns). `init hub --listen` moves `hub-local`. `cfg._notes` carries the printed lines.
+    `cli._local_owner_conn`: node status / pause / resume use HTTP only with --connection/env or this-pc-owner
+    (never the client default), else the lock and state files ("it does not listen, so this is read from its state
+    files").
+R2-9. **Uninstall (major; `install._stop_or_warn_services`, `services.running_offline`):** `--stop-services` also
+    acts in the no-installation branch; without it a note names "N services and M jobs keep running; … use
+    --stop-services". README uninstall blocks (Linux/macOS, Windows, pyz, English) use `--stop-services`.
+R2-10. **Restart failure advice (major):** (a) `config.check_listen_raw(listen)` runs before init/edit writes (node and
+    hub): plaintext on a non-loopback, non-tailnet host without TLS/allow_insecure_remote -> `forbidden` "refusing
+    plaintext HTTP on H; nothing was changed". (b) `install.restart` records the log sizes (`logs/<kind>.log`,
+    `logs/stdout.log`) before the control write; with no new holder it raises "the <kind> restarted but could not
+    start: <reason>" when a start failure was logged since, and `_restart_daemon` prints it as "not applied: …".
+R2-11. **service define (minor; CLI + `ServiceManager.define`):** state backoff/failed/exited -> stderr "it did not
+    start: <last_error>", the last ≤ 8 output lines, the logs command, exit 1. A NEW definition whose manual start is
+    refused with a port conflict is deleted ("…; the service was not saved"); an existing one stays.
+R2-12. **--connection in hints (minor):** `_conn_flag(args)` is appended to define's printed follow-ups; `Out.error`
+    extends a not_found "this is node '…'" hint with "other nodes are reached through the hub: --connection hub-local"
+    when client.json has a hub connection (`_via_hub_hint`).
+R2-13. **join --install failure (minor):** `cli._hive_cmd()` (pod wrapper, `python3 <pyz>`, `hive` or `python3 -m hive`,
+    with `HIVE_HOME=` when set) in the fix hints; a start failure adds "the installed background service keeps
+    retrying … to stop it instead: <cmd> service uninstall node".
+R2-14. **Foreground restart (minor; `node.foreground_restart_ok`):** INVOCATION_ID alone no longer disables it.
+R2-15. **pause/resume confirmation (minor; `node.pause` returns an id, `NodeRuntime._ack_paused`, `node.pause_acked`):**
+    PAUSED holds `{"at","id"}`; the node writes `paused.ack` `{"paused","id","pid","at"}` when its watcher applies a
+    change; `cli._wait_paused(…, data_dir=, paused=, nonce=)` accepts the ack or node.info. `hive node resume` waits
+    ≤ 3 s the same way ("resumed: the running node did not confirm within 3 s …" otherwise).
+R2-16. **Bare `hive init node|hub` on an existing config:** exit 0 "already set up at …; nothing to change"; README 4.2
+    notes the line can be skipped after section 3.
+R2-17. **service install with a hand-started daemon (minor):** `install.install` notes "a <kind> started by hand is
+    running (pid N): stop it (Ctrl-C in its window, or hive <kind> stop) and the service takes over …" when the lock
+    is held and nothing is installed.
+R2-18. **init client token check (minor):** `CLIENT_TOKEN_RE = ^hv_[A-Za-z0-9_-]{32,256}$` before anything is saved
+    (exit 2, "that does not look like a Hive token"); no URL probe.
+R2-19. **Broken pipe (minor):** `cli.main` wraps `_main`; BrokenPipeError -> stdout to devnull, exit 0.
+R2-20. **presets guide for CLI users (minor):** `hive guide presets` starts with `cli.PRESETS_CLI_LINE` (preset_args ->
+    `--arg key=value`, model -> `--model`).
+    Regression tests: `tests/test_ext_review2.py` (R2-1, 2, 4, 5, 6: presets unit, node end-to-end, service respawn,
+    hub fake relay and hub with a real node), `tests/test_ext_review2_cli.py` (R2-8 … R2-20), `test_policy.TestDenyWrite`
+    (R2-3), `test_services` port preflight (R2-11), `test_walkthrough.TestForegroundRestart` (R2-14), updated
+    `test_sec_audit` (whole-text cd), `test_shell` (exec path bound and labelled), init no-op and token fixtures in
+    `test_cli`/`test_walkthrough`/`test_wp6a_review`.

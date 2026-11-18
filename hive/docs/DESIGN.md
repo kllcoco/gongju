@@ -2575,7 +2575,7 @@ Managers are created by late import inside `start()`; an `ImportError` yields an
 
 **Graceful stop/restart without signals (v2, D40).** `schtasks /End` is TerminateProcess (no signal reaches `pythonw.exe`), so the node relies on crash-consistent state (already atomic) and offers `hive node stop` / `hive node restart`: the CLI writes `<data>/control.json {"cmd":"stop"|"restart","at"}` (0600), the periodic scheduler polls it every 1 s, deletes it and performs a graceful shutdown (jobs/services keep running) → v5 (D55) exit **0** for `stop` and **75** for `restart`. Every install method restarts only non-zero exits (§20.1), so `hive node stop` leaves the node stopped under systemd, launchd, the watchdog and Task Scheduler alike, and a stopped node is started again with `hive node restart` (or the method's own start command). `restart` (CLI side, WP4 `install.restart(kind)`, v6 sequence): read the lock holder `{pid, ctime}`; if there is none (already stopped), run the method's start command at once (below, without the 20 s wait); else write `control.json` `restart` and wait ≤ 30 s until `pid_alive(pid, ctime)` is false. Start step: **every method** (v6: schtasks too, because the Windows launcher loop relaunches on 75 by itself) → first wait ≤ 20 s for a new lock holder (systemd RestartSec 5 s, launchd throttle 10 s, watchdog `sleep 5`, Windows launcher at once), and only if none appears run the start command once (`schtasks /Run /TN "Hive Node"` when the launcher in `<data>/run/launcher.json` is no longer alive, `systemctl [--user] start hive-<kind>`, `launchctl kickstart gui/<uid>/ai.hive.<kind>`, or re-launch `run-<kind>.sh` with `setsid nohup` when the watchdog pid is dead), so the daemon is never started twice; **no installed method** (foreground) → print "start it again: hive node run". Then wait ≤ 20 s for a new lock holder; on Windows, if none appears, run `schtasks /End` + `/Run` once (safe: jobs, services and the keepalive are outside the task job) and otherwise print the manual command and exit 4. The README upgrade procedure uses `hive node restart`. Config-changing CLI commands use the same restart (§8.6).
 
-(v8.1) **Foreground runs restart themselves.** `hive node run` / `hive hub run` started by hand in a terminal (stdin or stderr is a TTY; not `--relaunched`/`--supervise`; no `HIVE_WATCHDOG=1` or systemd `INVOCATION_ID`) treat exit 75 as "start again": they print `restarting to apply new settings…` and, on POSIX, `os.execv` the same command (`cli._relaunch_prefix()`: the pyz, the `hive` script it was started as, else `python -m hive`; + the CLI arguments, the original cwd, the same env), so the process and its pid stay; on Windows the first process runs the same command as a child in a loop (with `HIVE_FOREGROUND_CHILD=1`, ignoring Ctrl-C itself) until it exits with something other than 75. Supervised runs keep exit 75 for their supervisor. Because a re-exec keeps pid and ctime, the node and hub lock notes carry a per-start nonce (`"node <hex>"`, `"hub <hex>"`) and `install.restart` compares the holder `(pid, ctime, note)`: the exit wait ends when the pid exits **or** the holder changes, and a new holder is any holder that differs from the old one. "No installed method" then normally finds the re-exec'd holder; only a foreground run without a terminal still ends with "start it again: hive node run".
+(v8.1) **Foreground runs restart themselves.** `hive node run` / `hive hub run` started by hand in a terminal (stdin or stderr is a TTY; not `--relaunched`/`--supervise`; no `HIVE_WATCHDOG=1`; v8.1 round 2: `INVOCATION_ID` alone no longer counts, terminals started by a systemd user unit inherit it, and a unit never has a TTY) treat exit 75 as "start again": they print `restarting to apply new settings…` and, on POSIX, `os.execv` the same command (`cli._relaunch_prefix()`: the pyz, the `hive` script it was started as, else `python -m hive`; + the CLI arguments, the original cwd, the same env), so the process and its pid stay; on Windows the first process runs the same command as a child in a loop (with `HIVE_FOREGROUND_CHILD=1`, ignoring Ctrl-C itself) until it exits with something other than 75. Supervised runs keep exit 75 for their supervisor. Because a re-exec keeps pid and ctime, the node and hub lock notes carry a per-start nonce (`"node <hex>"`, `"hub <hex>"`) and `install.restart` compares the holder `(pid, ctime, note)`: the exit wait ends when the pid exits **or** the holder changes, and a new holder is any holder that differs from the old one. "No installed method" then normally finds the re-exec'd holder; only a foreground run without a terminal still ends with "start it again: hive node run" (v8.1 round 2: when the daemon logged a start failure since the restart request — "<kind> failed to start: …", "refusing to run", address in use — `install.restart` raises "the <kind> restarted but could not start: <reason>" instead).
 
 ### 13.2 `NodeRuntime.call` pipeline (the single PEP; order is binding)
 1. `t0`; validate or generate `request_id`.
@@ -2846,7 +2846,11 @@ def edit_config(path: Path, fn: Callable[[dict], None], *, kind: str) -> None
     #   everything else are kept; returns (config, {}); the CLI prints what changed and restarts a running daemon (§8.6).
     #   Profile flags that need a new config (--preset, --wsl, --pod, --name) are ignored with the join rule's printed
     #   note; with no changeable flag at all -> exit 2, hint "config exists; pass the settings to change, or --force to
-    #   rewrite (new tokens)". --force keeps the v3 behaviour (fresh config,
+    #   rewrite (new tokens)" (v8.1: the CLI turns that into a friendly no-op, exit 0, "already set up at …; nothing to
+    #   change"; a listen change also points client.json this-pc/this-pc-owner at the new URL, drops them for
+    #   --no-listen, moves the hub-on-this-machine's direct entry for the old URL and restarts that hub; a plaintext
+    #   non-loopback, non-tailnet listen without TLS/allow_insecure_remote is refused before writing, as at startup).
+    #   --force keeps the v3 behaviour (fresh config,
     #   new owner/agent tokens and this-pc* connections; a kind:hub token added with node token add is gone)
     # v8: init_node writes client.json "default" = "this-pc" (agent) only when client.json has no default yet
 def protected_paths(node_cfg, hub_cfg=None, client_cfg=None) -> Tuple[List[Path], List[Path]]   # (deny_all, deny_write), §5.4
@@ -3335,6 +3339,8 @@ hive init node   [--name N] [--preset readonly|standard|cautious|full] [--root P
         flags name (e.g. `hive init node --tailscale` switches listen, `--wsl-keepalive Ubuntu-24.04` adds the WSL
         keepalive), keeps tokens and everything else, prints the changes and restarts a running daemon; with no such
         flag it exits 2 ("config exists; pass the settings to change, or --force to rewrite (new tokens)"), §14.5
+        (v8.1: exit 0 "already set up at …; nothing to change", for `init hub` too; listen edits keep client.json and
+        the hub's local-node entry in step)
 hive init hub    [--name N] [--listen HOST:PORT | --tailscale] [--funnel] [--public-url URL] [--tls-cert F --tls-key F]
                  [--with-local-node] [--yes] [--force]
      (--funnel: listen.proxy_port 7709, public_url https://<machine>.<tailnet>.ts.net, allowed_hosts; prints `tailscale funnel --bg 7709`;
@@ -3374,7 +3380,10 @@ hive node stop | restart                                    (graceful via contro
                                                              every install method; restart exits 75 and is relaunched, §13.1)
 hive node pause | resume [--no-relay] | panic [--yes]       (node.pause/resume/panic, §5.10; work with the daemon down;
                                                              (v8.1) pause waits ≤ 3 s for the running node to report
-                                                             paused (node.info) before it returns; panic/approve/deny
+                                                             paused (node.info) before it returns (v8.1 round 2: or its
+                                                             data-dir file paused.ack echoing the PAUSED id, so listen-
+                                                             off relay nodes confirm too; resume waits the same way for
+                                                             paused:false); panic/approve/deny
                                                              without a TTY and --yes say "add --yes";
                                                              v8: on a Windows node with wsl.keepalive entries also prints the WSL line, §5.10)
 hive node token add NAME [--role R | --classes C1,C2] [--kind agent|hub] [--deny GLOBS] [--approval GLOBS | --cautious | --no-cautious]
@@ -3449,12 +3458,18 @@ hive service install node|hub [--method auto|systemd|launchd|schtasks|watchdog] 
      (systemd: user unit by default; --system = system unit with User=$SUDO_USER, refused when SUDO_USER is empty unless
       allow_root:true; Windows installs at logon only, owner decision §23)
 hive service uninstall node|hub [--stop-services]      hive service status node|hub
+     (v8.1: --stop-services also acts without an installation record; without it, uninstall names the services
+     and jobs that keep running; the README uninstall blocks use --stop-services)
 hive service define NAME (--preset P [--model M] [--arg K=V …] | --argv 'PROG ARGS' | --command 'SHELL LINE') [--port N]
                     [--endpoint URL] [--cwd D] [--autostart] [--no-start] [--wait S (30)] [--param K=V …] [--node N]
                     [--approval AP_ID]
      ((v8.1) a thin wrapper over the service.define action; --model -> preset arg `model` (vllm, sglang) or
-      `model_path` (llamacpp))
-hive guide [TOPIC] [--list]                                 ((v8.1) prints guides.topic_text, the text of the agents' guide tool)
+      `model_path` (llamacpp); v8.1 round 2: a returned state backoff/failed/exited prints last_error, the last
+      output lines and the `hive logs` command and exits 1; printed follow-up commands keep --connection; a NEW
+      definition the node refuses for a taken port is not saved, "…; the service was not saved")
+hive guide [TOPIC] [--list]                                 ((v8.1) prints guides.topic_text, the text of the agents' guide tool;
+                                                             round 2: `presets` starts with a line mapping preset_args
+                                                             to --arg key=value and model to --model)
 hive tls-pin CERT.pem                                       (v3: replaces `hive cert gen/fingerprint`, D51)
 hive doctor      [node|hub|client] [--no-network] [--deep]   ((v8.1) without a kind: node and hub when both configs exist)
 hive audit tail  [-n 50] [--node | --hub] [--follow]
