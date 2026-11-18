@@ -531,6 +531,43 @@ class TestRealNodes(_HubCase):
         self.assertEqual(cm.exception.code, "conflict")
 
 
+class TestReviewServiceDefineRealNode(_HubCase):
+    """§21.2: a service_define command='bash run.sh' approval, then rewrite, retry -> conflict, nothing started."""
+
+    def setUp(self):
+        self.hub_tok = util.new_token()
+        self.nurl, _a, self.nrt = helpers.start_node_server(start_managers=True,
+                                                            auth={"tokens": [hub_token_entry(self.hub_tok)]})
+        self.addCleanup(self.nrt.test_stop)
+
+    def test_service_define_rewrite_conflict(self):
+        url, toks, hub = self.make_hub([{"name": "desk", "mode": "direct", "url": self.nurl, "token": self.hub_tok}],
+                                       agent_entry={"require_approval": ["service.define"]})
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        wd = Path(self.nrt.workdir)
+        marker = wd / f"svc-ran-{os.getpid()}"
+        script = wd / f"svc-run-{os.getpid()}.sh"
+        script.write_text(f"touch {marker}\nsleep 30\n")
+        self.addCleanup(lambda: script.exists() and script.unlink())
+        params = {"name": "bindsvc", "command": f"bash {script.name}", "cwd": str(wd)}
+        with self.assertRaises(HiveError) as cm:
+            c.call("service.define", params, node="desk")
+        self.assertEqual(cm.exception.code, "approval_required")
+        aid = cm.exception.details["approval_id"]
+        rec = hub.approvals.get(aid)
+        self.assertIn(str(script), rec["files"])
+        HttpTransport(url, toks["owner"]).request("POST", f"/v1/approvals/{aid}/approve", {})
+        script.write_text(f"touch {marker}\necho tampered\nsleep 30\n")
+        with self.assertRaises(HiveError) as cm:
+            c.call("service.define", params, node="desk", approval_id=aid)
+        self.assertEqual(cm.exception.code, "conflict")
+        names = [r.get("name") for r in (c.call("service.list", {}, node="desk").get("services") or [])]
+        self.assertNotIn("bindsvc", names)
+        time.sleep(0.5)
+        self.assertFalse(marker.exists())
+
+
 class TestSummary(unittest.TestCase):
     def test_summary_from_info(self):
         class E:
@@ -770,3 +807,211 @@ class TestHubFileBinding(_HubCase):
         box, _seen = self.run_call({"command": "bash run.sh"}, answer)
         self.assertEqual(box["error"].code, "unavailable")
         self.assertEqual(self.hub.approvals.list(), [])
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP5b review fixes
+
+class TestReviewRelayLink(_HubCase):
+    def setUp(self):
+        ea, self.tok_a = self.relay_entry("pod-a")
+        eb, self.tok_b = self.relay_entry("pod-b")
+        desk = {"name": "desk", "mode": "direct", "url": f"http://127.0.0.1:{helpers.free_port()}",
+                "token": util.new_token(), "aliases": ["pc", "n_alias1234"]}
+        self.url, self.toks, self.hub = self.make_hub([ea, eb, desk])
+        self.client = connect(self.url, token=self.toks["agent"])
+        self.addCleanup(self.client.close)
+
+    def test_node_id_cannot_shadow_names_aliases_or_other_nodes(self):
+        a = FakeRelay(self.url, self.tok_a, "pod-a")
+        b = FakeRelay(self.url, self.tok_b, "pod-b")
+        b.register(node_id="n_podb12345")
+        for bad in ("pc", "desk", "n_alias1234", "pod-b", "n_PODB12345", "n_" + "x" * 80, 42):
+            with self.subTest(node_id=bad):
+                a.register(node_id=bad)
+                self.assertEqual(self.hub.links["pod-a"].node_id, "")
+        self.assertIs(self.hub.resolve("pc"), self.hub.links["desk"])
+        self.assertIs(self.hub.resolve("n_alias1234"), self.hub.links["desk"])
+        self.assertIs(self.hub.resolve("n_podb12345"), self.hub.links["pod-b"])
+        a.register(node_id="n_poda12345")
+        self.assertIs(self.hub.resolve("N_PODA12345"), self.hub.links["pod-a"])
+        audit = "".join(p.read_text() for p in (self.hub.data_dir / "audit").glob("*.jsonl"))
+        self.assertIn("relay node_id refused", audit)
+
+    def test_max_poll_bytes_keeps_fifo(self):
+        """§7.2: the hub stops adding tasks at the budget; a later small task does not overtake a large one."""
+        self.hub.links["pod-a"].cfg.max_poll_bytes = 70000
+        fake = FakeRelay(self.url, self.tok_a, "pod-a")
+        fake.register()
+        boxes = []
+        for path, params in (("/tmp/fa", {"content": "x" * 60000}), ("/tmp/fb", {"content": "y" * 60000}),
+                             ("/tmp/fc", None)):
+            if params is None:
+                boxes.append(call_async(self.client.call, "fs.stat", {"path": path}, node="pod-a"))
+            else:
+                boxes.append(call_async(self.client.call, "fs.write", dict(params, path=path), node="pod-a"))
+            time.sleep(0.25)
+        first = fake.poll(free_slots=8)["tasks"]
+        self.assertEqual([t["params"]["path"] for t in first], ["/tmp/fa"])
+        second = fake.poll(free_slots=8)["tasks"]
+        self.assertEqual([t["params"]["path"] for t in second], ["/tmp/fb", "/tmp/fc"])
+        for t in first + second:
+            fake.result(t["task_id"], ok_env({}))
+        for bx in boxes:
+            bx["thread"].join(10)
+            self.assertNotIn("error", bx)
+
+
+class TestReviewIdentityChanged(_HubCase):
+    relay_cfg = dict(FAST_RELAY, offline_after=5)
+
+    def test_foreign_instance_gets_no_restart_flag(self):
+        e, rtok = self.relay_entry()
+        url, toks, hub = self.make_hub([e])
+        owner = HttpTransport(url, toks["owner"])
+        link = hub.links["pod-a"]
+        a = FakeRelay(url, rtok, "pod-a")
+        a.register()
+
+        def offline():
+            with link.lock:
+                link.last_poll_end = time.monotonic() - 100
+        offline()
+        b = FakeRelay(url, rtok, "pod-a")
+        b.register()
+        self.assertTrue(link.identity_changed)
+        # restart-node while a foreign instance holds the session: nothing queued
+        self.assertEqual(owner.request("POST", "/v1/hub/nodes/pod-a/restart", {}), {"queued": False})
+        with link.lock:
+            link.refresh = "restart"                 # queued for the bound instance before it went away
+            link.cancels.append("t_old")
+        r = b.poll()
+        self.assertEqual((r["refresh"], r["cancel"], r["tasks"]), (False, [], []))
+        self.assertEqual(link.refresh, "restart")
+        offline()
+        a.register()                                 # the real pod comes back
+        r = a.poll()
+        self.assertEqual(r["refresh"], "restart")
+
+
+class TestReviewDirectProbe(_HubCase):
+    def test_concurrent_callers_share_one_probe(self):
+        """§8.3 v5: one probe in flight per link; waiters share its failure instead of probing again."""
+        from hive.errors import unavailable
+        url, toks, hub = self.make_hub([{"name": "gone", "mode": "direct",
+                                         "url": f"http://127.0.0.1:{helpers.free_port()}",
+                                         "token": util.new_token()}])
+        link = hub.links["gone"]
+        calls = []
+
+        def slow(*a, **kw):
+            calls.append(1)
+            time.sleep(1.0)
+            raise unavailable("connection refused", reason="connect", maybe_executed=False)
+        link.transport.request = slow
+        with link.lock:
+            link._row = None
+            link._row_ok_at = None
+        t0 = time.monotonic()
+        boxes = [call_async(link.ensure_fresh) for _ in range(4)]
+        for bx in boxes:
+            bx["thread"].join(15)
+        self.assertLess(time.monotonic() - t0, 2.6)          # serialized probes would take >= 4 s
+        self.assertLessEqual(len(calls), 2)                  # (the background prober may hold one)
+        for bx in boxes:
+            self.assertEqual((bx["error"].code, bx["error"].details["reason"]), ("unavailable", "connect"))
+
+
+class TestReviewDist(_HubCase):
+    def test_concurrent_download_slot_held_until_sent(self):
+        """§5.7: at most 4 concurrent downloads, counted until the body is sent (or the client is gone)."""
+        import hashlib
+        from hive.hub import build_server
+        from hive.httpserver import Request
+        url, toks, hub = self.make_hub([])
+        srv = build_server(hub)
+        fn = [r.fn for r in srv._routes if r.pattern == "/v1/dist/hive.pyz"][0]
+
+        def get(i):
+            return fn(Request(method="GET", path="/v1/dist/hive.pyz", query={}, headers={},
+                              client_ip=f"10.0.0.{i}", body=b"", identity=None))
+        held = [get(i)[2] for i in range(1, 5)]
+        with self.assertRaises(HiveError) as cm:
+            get(9)
+        self.assertEqual(cm.exception.code, "rate_limited")
+        held[0].close()                      # client gone before the first chunk: the slot comes back
+        st, h, body = get(10)
+        data = b"".join(body)
+        self.assertEqual((st, int(h["Content-Length"])), (200, len(data)))
+        self.assertEqual(h["X-Hive-Sha256"], hashlib.sha256(data).hexdigest())
+        for b in held[1:]:
+            b.close()
+        for i in range(11, 15):
+            get(i)[2].close()
+
+
+class TestReviewServiceBinding(_HubCase):
+    """§8.2 step 4 v8: service.define / service.start file binding over the link (scripted relay node)."""
+
+    def setUp(self):
+        e, self.rtok = self.relay_entry()
+        self.url, self.toks, self.hub = self.make_hub(
+            [e], agent_entry={"require_approval": ["service.define", "service.start"]})
+        self.fake = FakeRelay(self.url, self.rtok, "pod-a")
+        self.client = connect(self.url, token=self.toks["agent"])
+        self.addCleanup(self.client.close)
+
+    def run_call(self, action, params, answer):
+        self.fake.register()
+        box = call_async(self.client.call, action, params, node="pod-a")
+        seen = []
+        for _ in range(20):
+            for t in self.fake.poll().get("tasks") or []:
+                seen.append(t)
+                self.fake.result(t["task_id"], answer(t))
+            if not box["thread"].is_alive():
+                break
+        box["thread"].join(10)
+        return box, seen
+
+    def test_service_start_binds_stored_definition(self):
+        def answer(t):
+            a, p = t["action"], t["params"]
+            if a == "service.status":
+                return ok_env({"name": "web", "state": "stopped",
+                               "definition": {"argv": ["python3", "serve.py"], "cwd": "/w"}})
+            if a == "fs.stat":
+                if p["path"] == "/w/serve.py":
+                    return ok_env({"path": "/w/serve.py", "exists": True, "type": "file", "size": 12,
+                                   "mtime": "2026-11-01T00:00:00.000Z"})
+                return ok_env({"path": p["path"], "exists": False})
+            if a == "fs.read":
+                return ok_env({"path": p["path"], "content": "print('hi')\n", "next_start_line": None,
+                               "long_lines_cut": False, "version": "sha256:" + "ab" * 32})
+            return ok_env({})
+        box, seen = self.run_call("service.start", {"name": "web"}, answer)
+        self.assertEqual(box["error"].code, "approval_required")
+        self.assertEqual(seen[0]["action"], "service.status")
+        self.assertTrue(seen[0]["request_id"].endswith(".b0"))
+        self.assertEqual(seen[0]["params"], {"name": "web"})
+        rec = self.hub.approvals.get(box["error"].details["approval_id"])
+        self.assertEqual(rec["files"].get("/w/serve.py").split(":")[-1], "ab" * 32)
+        self.assertIn("print('hi')", rec["review"]["lines"])
+
+    def test_service_define_words_stop_command_and_preset_args(self):
+        stats = []
+
+        def answer(t):
+            if t["action"] == "fs.stat":
+                stats.append(t["params"]["path"])
+            return ok_env({"path": t["params"].get("path"), "exists": False})
+        box, _seen = self.run_call("service.define", {"name": "web", "command": "bash run.sh", "cwd": "/w",
+                                                      "stop_command": ["bash", "/w/stop.sh"]}, answer)
+        self.assertEqual(box["error"].code, "approval_required")
+        box, _seen = self.run_call("service.define", {"name": "llm", "preset": "llamacpp",
+                                                      "preset_args": ["model_path=/w/m.gguf", "port=8080",
+                                                                      "extra_arg=--flag"]}, answer)
+        self.assertEqual(box["error"].code, "approval_required")
+        for p in ("/w/run.sh", "/w/stop.sh", "/w/m.gguf"):
+            self.assertIn(p, stats)
+        self.assertNotIn("--flag", stats)

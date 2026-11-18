@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from hive import relay, util
 from hive.client import connect
 from hive.errors import HiveError
+from hive.transport import HttpTransport
 from tests import helpers
 from tests.fixtures.connect_proxy import ConnectProxy
 from tests.test_transport import TEST_PIN, CertFiles
@@ -141,16 +142,60 @@ class TestRelayNode(_Env):
         with self.assertRaises(HiveError) as cm:
             c.call("fs.write", {"path": bashrc, "content": "x", "mode": "append"}, node="pod-a")
         self.assertEqual(cm.exception.code, "policy_denied")
-        # a relay task carrying bound_files whose file changed -> conflict, nothing runs
-        p = Path(rt.workdir) / f"bound-{os.getpid()}.sh"
-        p.write_text("echo one\n")
-        self.addCleanup(lambda: p.exists() and p.unlink())
-        from hive.auth import relay_identity
-        import dataclasses
-        ident = dataclasses.replace(relay_identity(rt.config), agent="test")
-        env = rt.call(ident, "fs.stat", {"path": str(p)}, via="relay",
-                      bound_files={str(p): "sha256:" + "0" * 64})
-        self.assertEqual(env["error"]["code"], "conflict")
+
+    def test_bound_files_through_hub(self):
+        """§21.2: a relay task with bound_files whose file changed -> conflict, nothing runs (hub -> RelayLink ->
+        RelayAgent -> NodeRuntime.call)."""
+        url, toks, hub, tok = self.hub(agent_entry={"require_approval": ["shell.run"]})
+        rt = start_relay_node(url, tok, start_managers=True)
+        self.addCleanup(rt.test_stop)
+        helpers.wait_until(lambda: hub.links["pod-a"].online(), 15)
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        wd = Path(rt.workdir)
+        marker = wd / f"ran-{os.getpid()}"
+        script = wd / f"bound-{os.getpid()}.sh"
+        script.write_text(f"touch {marker}\n")
+        self.addCleanup(lambda: script.exists() and script.unlink())
+        params = {"command": f"bash {script}"}
+        with self.assertRaises(HiveError) as cm:
+            c.call("shell.run", params, node="pod-a")
+        aid = cm.exception.details["approval_id"]
+        self.assertIn(str(script), hub.approvals.get(aid)["files"])
+        HttpTransport(url, toks["owner"]).request("POST", f"/v1/approvals/{aid}/approve", {})
+        sent = []
+        orig = hub.links["pod-a"].call
+
+        def spy(*a, **kw):
+            sent.append(kw.get("bound_files"))
+            return orig(*a, **kw)
+        hub.links["pod-a"].call = spy
+        script.write_text(f"touch {marker}\necho tampered\n")
+        with self.assertRaises(HiveError) as cm:
+            c.call("shell.run", params, node="pod-a", approval_id=aid)
+        self.assertEqual(cm.exception.code, "conflict")
+        self.assertTrue(any(b and str(script) in b for b in sent))
+        self.assertFalse(marker.exists())
+
+    def test_slow_result_post_not_lost(self):
+        """Review fix: a task stays in ``running`` while its result is still being posted, so the hub does not mark
+        it lost (lost_grace 1 s) during a slow upload or a retry."""
+        url, toks, hub, tok = self.hub()
+        rt = start_relay_node(url, tok, start_managers=False)
+        self.addCleanup(rt.test_stop)
+        helpers.wait_until(lambda: hub.links["pod-a"].online(), 15)
+        agent = rt.relay
+        orig = agent.transport.request
+
+        def slow(method, path, *a, **kw):
+            if path == "/v1/relay/result":
+                time.sleep(3.5)
+            return orig(method, path, *a, **kw)
+        agent.transport.request = slow
+        c = connect(url, token=toks["agent"])
+        self.addCleanup(c.close)
+        out = c.call("fs.stat", {"path": str(rt.workdir)}, node="pod-a")
+        self.assertTrue(out["exists"])
 
     def test_relay_disabled_stops_polling(self):
         url, toks, hub, tok = self.hub()
