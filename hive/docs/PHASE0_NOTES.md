@@ -801,3 +801,89 @@ by the lead or a line in DESIGN.md.
       answers `unsupported` (WP5b TransferManager).
     - Without `pyproject.toml` (WP6b) the MCP snippet printed by `hive init node` (`python3 -P -m hive mcp --local`)
       only works when `hive` is importable (PYTHONPATH / installed).
+
+## WP5b hand-off (hub.py, relay.py, gateway.py, transfer.py, dist.py, client.HubTarget)
+
+(Items numbered B1… so they cannot collide with the notes of WP3b/WP4, which merge in parallel.)
+
+B1. **CONTRACT-REQUEST (WP5b → P0 `tests/helpers.py`):** `start_hub(nodes=(), **cfg)` is real: a `Hub` + its
+    `ApiServer` on 127.0.0.1:0 (temp data dir, `network.proxy: off`), tokens `{"owner", "agent"}` (agent
+    `test-agent`, operator; `agent_entry=` overrides; `extra_tokens=[(key, entry), …]` adds more, plaintext under
+    `key`); `hub.test_stop()`. `test_helpers.test_wp_dependent_helpers_skip` now starts a real hub.
+B2. **CONTRACT-REQUEST (WP5b → P0 `tests/test_stubs.py`, WP6 `tests/test_tools.py`):** `test_build_pyz` checks the real
+    zipapp (and `self_update(None)` without a node config → False); `test_route_registration_noops` now expects the
+    gateway routes (GET/POST/OPTIONS `/openai/{node}/{service}/{rest*}`); `test_fs_transfer`'s last block expects the
+    real TransferManager (a transfer status, no `unsupported`).
+B3. **Additive names (WP5b):** `hub.build_server(hub) -> ApiServer` (the hub routes, not started; like
+    `node.build_server`), `hub.write_hub_code(data_dir)`, `hub.summary_from_info(...)`, `hub.RelayIds`,
+    `Hub.resolve(node)`, `Hub.whoami(identity)`, `Hub.approval_set(identity, link)`, `Hub.pyz()`,
+    `Hub.request_stop(code)`, `Hub.relay_tokens`, `Hub.limits`; `NodeLink.preset()/os_name()/node_id`;
+    `RelayLink.register/poll/result/reap/request_restart`; `DirectLink.probe()`; `relay.NetworkTransport`
+    (HttpTransport whose `auto` proxy follows a node/hub `network` block), `relay.relay_transport(cfg, network=,
+    token=, timeout=)` (also used by `dist.self_update`), `relay.check_hub_url`, `relay.relay_token`,
+    `relay.load_instance_key`; `transport.HttpTransport.open_stream(method, path, body, headers=, timeout=,
+    cancel=) -> (status, headers, chunks)` (fresh connection, connect-only retry; the hub's gateway passthrough);
+    `gateway.synthesize_sse`, `rewrite_stream`, `normalize_path`, `ROUTE`; `transfer.PART_SUFFIX`,
+    `LocalFS.sha256`, `NodeFS.sha256`, `NodeFS(target, node=None)`, `TransferManager(client, *, local_roots=None)`
+    (`start(src, dst, overwrite=False, chunk=…)`); `dist.pyz_sha256(data)`, `dist.self_update(relay_cfg=None, *,
+    pyz_path=None)` (test seam), `dist.add_node_instructions(hub_cfg, name, token, *, via=None, tailnet_ip=None,
+    pyz_sha256_hex=None, tls_pin=None) -> {"variants","codes","lines"}` — the §20.4 T/A/B/C blocks; the WP6b CLI
+    (`hive hub add-node --relay [--via]`) prints `lines` (it creates the relay token and the hub entry itself).
+B4. **Interpretations (hub):**
+    - §8.2 order: a relay link that is offline or `identity_changed` is refused in `RelayLink.ensure_fresh()` (before
+      the hub checks), so an offline node answers `unavailable offline` immediately instead of a D29 `not_found` for
+      an empty action list. Hub-scope actions ignore `node`; an action the hub does not know → `not_found` "the hub
+      runs hive X … upgrade the hub" (removed v1 names keep their replacement hint).
+    - The approval set is computed only for `kind:agent` tokens (owner/models: none); `exec_gated` uses it for every
+      identity (`auth.exec_gated`), so a `models` token's `model.forward` is sent with `X-Hive-Exec-Gated: 1`
+      (narrowing only). With `approval_id` given the hub skips the review/file binding and only consumes.
+    - Hub file binding sub-calls (§8.2 step 4) use request ids `<rid[:72]>.b<i>` (i from 1; `.b0` is the
+      `service.status` read of service.start/restart). `bad_request` from a sub-call counts like `not_found` (word not
+      bound). `fs.read` is shown only when complete (`next_start_line` null, no cut lines, `version` set) and its
+      `max_bytes` is the remaining shown budget (≥ 1024); otherwise `fs.stat {sha256:true}` binds with
+      `shown:false`. The not-bound header goes right after "changes what runs:" (or first).
+    - Cancel: `POST /v1/cancel` on the hub sets the call's event and forwards (`/v1/cancel` on a direct node, a relay
+      `cancel` for a delivered task; a still-queued relay task is dropped with `cancelled`).
+    - Relay queue: a queued task whose call deadline passes before pickup ends as `timeout` (`maybe_executed:false`);
+      the pickup-timeout reason is `busy` when the node polled while the task waited (no free slot, or the
+      `model.forward` slot reserve), else `not_polling`. Hub stop fails queued tasks (`maybe_executed:false`) and
+      delivered ones (`maybe_executed` = mutating) with `unavailable` reason `lost`.
+    - `POST /v1/hub/nodes/{name}/restart` sets the flag only while the node is online (`queued:false` otherwise);
+      `/ack` on a direct node → `bad_request`; an ack with a hash other than the current pending one returns
+      `bound:false` with `refused` "the pending registration changed; run hive hub ack-node again".
+    - The relay token store is separate from the agent store: a relay token on `/v1/call` and an agent token on
+      `/v1/relay/*` both get 401 (not 403) — neither is a valid token for that route.
+    - `GET /v1/dist/hive.pyz`: the zipapp is built at hub start in a background thread (and on first request);
+      6/min per client IP, ≤ 4 concurrent, `dist.enabled:false` → 404.
+    - NodeSummary rows: relay rows from register `info` (+ poll `status`, ≤ 4 KiB); direct rows are the node's own
+      row with `name`/`mode`/`tags`/`description`/`last_call_at` replaced. `nodes_for` does not probe synchronously
+      (a direct row before the first probe has `preset: null` and `online: false`).
+B5. **Interpretations (gateway):** an unknown node → 404 whose did-you-mean lists only node names the token's globs
+    name; a known node whose `<canonical>/<service>` pair is outside the globs → 403 (§8.7 step 1; the message names
+    only what was asked, so T18 holds); a 404 from the node over a direct link, or `not_found` from a relay
+    `model.forward`, is replaced by the hub's own 404 listing only the token's matching globs. (The §21.2 v8 test text
+    "desk-wsl/other → 404" is read as "no other names leak"; we answer 403 per §8.7 step 1 — lead to confirm.) The
+    per-token inflight key is token name + sha256 on the hub and `display_name` + sha256 on a node. Node-side: when the
+    ServiceManager is not running, `model_endpoints` names still resolve; `ollama` endpoints get `/v1` appended.
+B6. **Interpretations (relay agent):** status is sent on the first poll after register and then every 30 s;
+    `relay.disabled` drops the session (re-register when it disappears); a `refresh:"restart"` calls
+    `rt.request_stop(75)` and stops the poll loop (run_node then stops the relay and returns 75). Task identity:
+    `relay_identity(rt.config)` + `agent` (dropped unless it matches `^[A-Za-z0-9._/-]{1,64}$`) + `exec_gated`; the
+    `forbidden` of `model.forward` for a role without `net` gets the §7.5 v8 hint in relay.py.
+B7. **Interpretations (transfer):** `copy()` refuses an existing destination without `overwrite` (and a folder
+    destination) before any chunk; a part file larger than the source restarts at 0; a `conflict` with
+    `details.part_size` during the copy resumes once from that size (source sha first); cancel is checked before
+    every read and write (the part file stays for a later resume); a zero-byte file is one final empty chunk.
+    `LocalFS(roots)` resolves relative paths against the first root; `TransferManager.start` refuses local paths
+    outside the roots synchronously; >4 running → `rate_limited` reason `inflight`; a `"self:"` location is sent as
+    node `None`.
+B8. **Interpretations (dist):** `build_pyz` packs `hive/**` (`.py`, `.json`, `.txt`, `.md`, `.tmpl`, `.typed`; no
+    `__pycache__`) from the source tree, or from the running zipapp, with fixed timestamps and sorted names behind a
+    `#!/usr/bin/env python3` line; the root `__main__.py` calls `hive.__main__._main()` (so D56 pruning and the
+    `_shim`/`_download`/`_update` dispatch apply). `self_update` logs and returns False when not running from a
+    zipapp (pip installs), when the hub answers non-200, or on a sha mismatch.
+B9. **Open items (WP5b):** the CLI wiring (`hive hub …`, `hive join`, `hive gateway url`, `restart-node --outdated`
+    with its re-registration wait, `ack-node` prompt) is WP6b; `hub add-node` text is provided by
+    `dist.add_node_instructions`. `/mcp` on the hub stays WP6b (`register_agent_routes(mcp=…)` is called). The relay
+    and gateway paths were tested against the real WP3b `model.forward` handler and netproxy as merged at the time of
+    this hand-off; E2E M2 (lead) still has to run them together with the CLI.

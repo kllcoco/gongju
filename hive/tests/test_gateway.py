@@ -331,3 +331,33 @@ class TestSse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRelayGatewayRealNode(_GwCase):
+    def test_relay_model_forward_end_to_end(self):
+        from hive.actions import HANDLERS, load_all
+        load_all()
+        if "model.forward" not in HANDLERS:
+            self.skipTest("model.forward handler not merged yet (WP3b)")
+        from tests.wp5util import start_relay_node
+        stub = self.start_stub()
+        rtok = util.new_token()
+        url, toks, hub = helpers.start_hub(
+            [{"name": "pod-a", "mode": "relay", "token_sha256": util.hash_token(rtok)}], relay=dict(FAST_RELAY),
+            extra_tokens=[("models", {"name": "chatbox", "kind": "models", "models": ["pod-a/stub"]})])
+        self.addCleanup(hub.test_stop)
+        rt = start_relay_node(url, rtok, start_managers=True,
+                              model_endpoints=[{"name": "stub", "base_url": stub.url + "/v1", "api_key_env": None}])
+        self.addCleanup(rt.test_stop)
+        helpers.wait_until(lambda: hub.links["pod-a"].online(), 15)
+        st, _h, body = req(url, "GET", "/openai/pod-a/stub/v1/models", token=toks["models"])
+        self.assertEqual(st, 200, body)
+        self.assertEqual(json.loads(body)["data"][0]["id"], "qwen-7b")
+        st, h, body = req(url, "POST", "/openai/pod-a/stub/v1/chat/completions", token=toks["models"],
+                          body={"model": "qwen-7b", "stream": True, "messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(st, 200, body)
+        self.assertTrue(h["content-type"].startswith("text/event-stream"))
+        self.assertIn(b"hello there", body)
+        self.assertTrue(body.rstrip().endswith(b"data: [DONE]"))
+        sent = json.loads(stub.requests[-1]["body"])
+        self.assertIs(sent.get("stream"), False)

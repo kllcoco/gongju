@@ -628,8 +628,12 @@ class RelayLink(NodeLink):
             return True
 
     def stop(self) -> None:
-        """Wake every waiting poll."""
+        """Hub shutdown: fail queued (never executed) and delivered (maybe executed) tasks, wake every poll."""
         with self.lock:
+            for t in list(self.queue):
+                self._finish(t, unavailable("the hub is shutting down", reason="lost", maybe_executed=False))
+            for t in list(self.delivered.values()):
+                self._finish(t, unavailable("the hub is shutting down", reason="lost", maybe_executed=t.mutating))
             self.cond.notify_all()
 
 
