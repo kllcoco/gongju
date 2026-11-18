@@ -670,8 +670,10 @@ class TestCancelAndRunHub(_HubCase):
         import shutil
         root = logging.getLogger("hive")
         before, level = list(root.handlers), root.level
+        cwd = os.getcwd()          # run_hub chdirs into the hub data dir (removed below)
 
         def restore():
+            os.chdir(cwd)
             for h in [h for h in root.handlers if h not in before]:
                 root.removeHandler(h)
                 h.close()
