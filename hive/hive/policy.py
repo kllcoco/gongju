@@ -166,16 +166,15 @@ _RESERVED = {"con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} | {
 _GLOB_CHARS = set("*?[")
 WRITE_METHODS_SAFE = ("GET", "HEAD", "OPTIONS")
 OPENAI_SUFFIXES = ("/models", "/chat/completions", "/completions", "/embeddings")
-_HIVE_CMD_RE = re.compile(r"(?i)(-m\s+hive\b|hive\.pyz|[\\/]hive(\.exe)?\b|\bhive(\.exe)?\b)[^\n]*?\b"
-                          r"(node|hub|mcp|_shim|_download)\b")
-# audit round 4 (DoS): _HIVE_CMD_RE.search re-scanned the rest of the line from every "hive" (a local process with a
-# 100 KB "hive hive …" argv took 20+ s in check_kill); _is_hive_cmd answers the same question in linear time
+# audit round 4 (DoS): the old _HIVE_CMD_RE.search re-scanned the rest of the line from every "hive" (a local process
+# with a 100 KB "hive hive …" argv took 20+ s in check_kill); _is_hive_cmd answers the same question in linear time.
+# Verification round 4: the dead quadratic regex is gone (tests keep it as the reference oracle).
 _HIVE_START_RE = re.compile(r"(?i)-m\s+hive\b|hive\.pyz|[\\/]hive(\.exe)?\b|\bhive(\.exe)?\b")
 _HIVE_ROLE_RE = re.compile(r"(?i)\b(node|hub|mcp|_shim|_download)\b")
 
 
 def _is_hive_cmd(text: str) -> bool:
-    """A Hive start token followed later on the same line by node/hub/mcp/_shim/_download (``_HIVE_CMD_RE``)."""
+    """A Hive start token followed later on the same line by node/hub/mcp/_shim/_download."""
     for line in text.split("\n"):
         m = _HIVE_START_RE.search(line)
         if m is not None and _HIVE_ROLE_RE.search(line, m.end()) is not None:

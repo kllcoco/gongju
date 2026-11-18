@@ -219,6 +219,21 @@ class TestHfListingPrecount(unittest.TestCase):
         self.assertEqual([f.path for f in files], ["ok.bin"])
 
 
+class TestHiveCmdOracle(unittest.TestCase):
+    def test_dead_regex_removed_and_linear_check_matches_it(self):
+        import re
+        from hive import policy
+        self.assertFalse(hasattr(policy, "_HIVE_CMD_RE"))
+        oracle = re.compile(r"(?i)(-m\s+hive\b|hive\.pyz|[\\/]hive(\.exe)?\b|\bhive(\.exe)?\b)[^\n]*?\b"
+                            r"(node|hub|mcp|_shim|_download)\b")      # the removed (quadratic) definition
+        rnd = random.Random(9)
+        words = ["hive", "hive.pyz", "/usr/bin/hive", "C:\\hive.exe", "-m", " ", "\n", "node", "hub", "mcp",
+                 "_shim", "_download", "nodes", "xhive", "python3", "run", "-m hive", "HIVE", "Node"]
+        for _ in range(4000):
+            text = "".join(rnd.choice(words) for _ in range(rnd.randint(0, 8)))
+            self.assertEqual(policy._is_hive_cmd(text), oracle.search(text) is not None, text)
+
+
 class TestHubBodies(_HubMcp):
     def test_mcp_and_call_refuse_container_soup(self):
         body = b"[" + b"[]," * (1 << 20) + b"[]]"
