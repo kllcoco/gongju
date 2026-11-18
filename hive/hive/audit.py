@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -180,7 +181,60 @@ def redact_env(env: Mapping[str, str]) -> Dict[str, str]:
     return out
 
 
-def _digest(value: Any) -> Dict[str, Any]:
+# Verification round 4 (DoS): params containers were copied whole (twice) into one JSONL line - a 48 MiB body of
+# empty lists wrote a 50 MB audit record. Audit records now go through a bounded walk (``_Budget``): at most
+# _CONTAINER_MAX items/keys per container (_ARGV_MAX argv words), _NODES_MAX values and _DEPTH_MAX levels in all,
+# the rest summarized ("…[+N items]"), and the serialized record is capped at _RECORD_MAX bytes.
+_CONTAINER_MAX = 32
+_ARGV_MAX = 128
+_NODES_MAX = 2000
+_DEPTH_MAX = 24
+_DIGEST_NODES_MAX = 10000
+_RECORD_MAX = 64 << 10
+_MORE = "…"
+
+
+class _Budget:
+    __slots__ = ("left",)
+
+    def __init__(self, nodes: int = _NODES_MAX):
+        self.left = nodes
+
+    def take(self, depth: int) -> bool:
+        """Spend one value; False when the walk is over budget or too deep (summarize instead)."""
+        self.left -= 1
+        return self.left >= 0 and depth <= _DEPTH_MAX
+
+
+def _summary(value: Any) -> Any:
+    """A value the bounded walk does not descend into: its type and size only."""
+    if isinstance(value, dict):
+        return {_MORE: f"[{len(value)} keys]"}
+    if isinstance(value, (list, tuple)):
+        return [f"{_MORE}[{len(value)} items]"]
+    if isinstance(value, str):
+        return f"{_MORE}[{len(value)} chars]"
+    if isinstance(value, bytes):
+        return {"len": len(value)}
+    return value
+
+
+def _nodes_at_most(value: Any, limit: int) -> bool:
+    """True when ``value`` holds at most ``limit`` values (stops counting early)."""
+    stack, seen = [value], 0
+    while stack:
+        v = stack.pop()
+        seen += 1
+        if seen > limit:
+            return False
+        if isinstance(v, (dict, list, tuple)):
+            if len(v) > limit - seen:
+                return False
+            stack.extend(v.values() if isinstance(v, dict) else v)
+    return True
+
+
+def _digest(value: Any, budget: Optional[_Budget] = None) -> Dict[str, Any]:
     if isinstance(value, bytes):
         raw = value
         n = len(value)
@@ -188,6 +242,8 @@ def _digest(value: Any) -> Dict[str, Any]:
         raw = value.encode("utf-8", "surrogatepass")
         n = len(value)
     else:
+        if budget is not None and not _nodes_at_most(value, _DIGEST_NODES_MAX):
+            return {"items": len(value) if isinstance(value, (dict, list, tuple)) else 1, "sha256": None}
         try:
             text = canonical_json(value)
         except (TypeError, ValueError):
@@ -197,17 +253,27 @@ def _digest(value: Any) -> Dict[str, Any]:
     return {"len": n, "sha256": hashlib.sha256(raw).hexdigest()[:12]}
 
 
-def _names_only(value: Any) -> List[str]:
+def _names_only(value: Any, budget: Optional[_Budget] = None) -> List[str]:
     if isinstance(value, dict):
-        return [str(k) for k in value]
+        keys = list(value) if budget is None else list(itertools.islice(value, _CONTAINER_MAX))
+        out = [str(k)[:_STR_MAX] if budget is not None else str(k) for k in keys]
+        if len(value) > len(keys):
+            out.append(f"{_MORE}[+{len(value) - len(keys)} names]")
+        return out
     names: List[str] = []
-    for item in value if isinstance(value, (list, tuple)) else [value]:
-        s = str(item)
+    items = value if isinstance(value, (list, tuple)) else [value]
+    shown = items if budget is None else items[:_CONTAINER_MAX]
+    for item in shown:
+        s = str(item) if budget is None or not isinstance(item, (dict, list, tuple)) else type(item).__name__
+        if budget is not None:
+            s = s[:_STR_MAX]
         for sep in ("=", ":"):
             if sep in s:
                 s = s.split(sep, 1)[0]
                 break
         names.append(s.strip())
+    if len(items) > len(shown):
+        names.append(f"{_MORE}[+{len(items) - len(shown)} names]")
     return names
 
 
@@ -218,11 +284,15 @@ def _short(s: str, limit: int) -> str:
     return out
 
 
-def _redact_argv(argv: List[Any]) -> List[str]:
+def _redact_argv(argv: List[Any], budget: Optional[_Budget] = None, depth: int = 0) -> List[str]:
     out: List[str] = []
     hide_next = False
-    for item in argv:
-        s = str(item)
+    shown = argv if budget is None else argv[:_ARGV_MAX]
+    for item in shown:
+        if budget is not None and not budget.take(depth + 1):
+            out.append(f"{_MORE}[+{len(argv) - len(out)} items]")
+            return out
+        s = str(item) if budget is None or not isinstance(item, (dict, list, tuple)) else repr(_summary(item))
         if hide_next:
             out.append("***")
             hide_next = False
@@ -232,30 +302,51 @@ def _redact_argv(argv: List[Any]) -> List[str]:
             out.append(s)
             continue
         out.append(_short(s, _STR_MAX))
+    if len(argv) > len(shown):
+        out.append(f"{_MORE}[+{len(argv) - len(shown)} items]")
     return out
 
 
-def _redact_value(key: str, value: Any) -> Any:
+def _redact_value(key: str, value: Any, budget: Optional[_Budget] = None, depth: int = 0) -> Any:
     lk = key.lower()
     if lk in _BODY_KEYS and value is not None:
-        return _digest(value)
+        return _digest(value, budget)
     if lk in ("env", "headers", "env_unset"):
-        return _names_only(value) if value is not None else value
+        return _names_only(value, budget) if value is not None else value
     if lk not in _NAME_KEYS and _SECRET_KEY.search(key) and not isinstance(value, (bool, int, float)) \
             and value is not None:
         return "***"
     if lk in ("command", "stop_command") and isinstance(value, str):
         return _short(value, _COMMAND_MAX)
     if lk in ("argv", "stop_argv") and isinstance(value, list):
-        return _redact_argv(value)
-    return _redact_any(value)
+        return _redact_argv(value, budget, depth)
+    return _redact_any(value, budget, depth)
 
 
-def _redact_any(value: Any) -> Any:
+def _key(k: Any, budget: Optional[_Budget]) -> str:
+    s = str(k)
+    return s if budget is None or len(s) <= 128 else _short(s, 128)
+
+
+def _redact_any(value: Any, budget: Optional[_Budget] = None, depth: int = 0) -> Any:
+    if budget is not None and not budget.take(depth):
+        return _summary(value)
     if isinstance(value, dict):
-        return {str(k): _redact_value(str(k), v) for k, v in value.items()}
+        if budget is None:
+            return {str(k): _redact_value(str(k), v) for k, v in value.items()}
+        out = {}
+        for k, v in itertools.islice(value.items(), _CONTAINER_MAX):
+            out[_key(k, budget)] = _redact_value(str(k), v, budget, depth + 1)
+        if len(value) > _CONTAINER_MAX:
+            out[_MORE] = f"[+{len(value) - _CONTAINER_MAX} keys]"
+        return out
     if isinstance(value, (list, tuple)):
-        return [_redact_any(v) for v in value]
+        if budget is None:
+            return [_redact_any(v) for v in value]
+        out_l = [_redact_any(v, budget, depth + 1) for v in value[:_CONTAINER_MAX]]
+        if len(value) > _CONTAINER_MAX:
+            out_l.append(f"{_MORE}[+{len(value) - _CONTAINER_MAX} items]")
+        return out_l
     if isinstance(value, str):
         return _short(value, _STR_MAX)
     if isinstance(value, bytes):
@@ -263,11 +354,20 @@ def _redact_any(value: Any) -> Any:
     return value
 
 
-def redact_params(action: str, params: dict) -> dict:
-    """Params with secret-named keys masked, bodies hashed, env/headers reduced to names, strings capped."""
+def redact_params(action: str, params: dict, *, bounded: bool = False) -> dict:
+    """Params with secret-named keys masked, bodies hashed, env/headers reduced to names, strings capped.
+    ``bounded`` (audit records): containers, total values and depth are capped too (see ``_Budget``)."""
+    budget = _Budget() if bounded else None
     if not isinstance(params, dict):
-        return {} if params is None else {"_": _redact_any(params)}
-    return {str(k): _redact_value(str(k), v) for k, v in params.items()}
+        return {} if params is None else {"_": _redact_any(params, budget)}
+    if budget is None:
+        return {str(k): _redact_value(str(k), v) for k, v in params.items()}
+    out = {}
+    for k, v in itertools.islice(params.items(), _CONTAINER_MAX):
+        out[_key(k, budget)] = _redact_value(str(k), v, budget, 1)
+    if len(params) > _CONTAINER_MAX:
+        out[_MORE] = f"[+{len(params) - _CONTAINER_MAX} keys]"
+    return out
 
 
 def _mask_deep(value: Any, mask: Optional[Callable[[str], str]]) -> Any:
@@ -322,13 +422,25 @@ class AuditLog:
             "identity": identity.name if identity is not None else None,
             "agent": (identity.agent or None) if identity is not None else None,
             "ip": ip or None, "via": via or None, "action": action, "rid": request_id or None,
-            "params": redact_params(action or "", params) if params is not None else None,
+            "params": redact_params(action or "", params, bounded=True) if params is not None else None,
             "ok": bool(ok), "code": code, "ms": int(ms or 0),
-            "extra": _redact_any(extra) if extra else None,
+            "extra": _redact_any(extra, _Budget()) if extra else None,
         }
         rec = _mask_deep(rec, self.mask)
         try:
             line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+            for field in ("params", "extra"):        # verification round 4: one record is at most _RECORD_MAX
+                if len(line) <= _RECORD_MAX:
+                    break
+                if isinstance(rec.get(field), dict):
+                    keys = [str(k)[:64] for k in itertools.islice(rec[field], _CONTAINER_MAX)]
+                    rec[field] = {_MORE: f"[record cut: {len(line)} bytes]", "keys": keys}
+                    line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str) + "\n"
+            if len(line) > _RECORD_MAX:
+                line = json.dumps({"ts": rec["ts"], "id": rec["id"], "kind": rec["kind"],
+                                   "action": str(rec["action"])[:200] if rec["action"] is not None else None,
+                                   "ok": rec["ok"], "code": rec["code"],
+                                   "extra": {_MORE: f"[record cut: {len(line)} bytes]"}}, ensure_ascii=False) + "\n"
         except (TypeError, ValueError) as e:
             line = json.dumps({"ts": rec["ts"], "kind": "warning", "extra": {"error": f"unserializable record: {e}"}}
                               ) + "\n"

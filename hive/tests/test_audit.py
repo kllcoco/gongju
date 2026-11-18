@@ -131,5 +131,58 @@ class TestAuditLog(unittest.TestCase):
         self.assertFalse((self.d / "off").exists())
 
 
+
+class TestBoundedRecordsVerification4(unittest.TestCase):
+    """Verification round 4 (DoS): params containers are capped in audit records (a 48 MiB body of empty lists
+    wrote a 50 MB line), and one record is at most 64 KiB."""
+
+    def setUp(self) -> None:
+        self.d = Path(tempfile.mkdtemp(prefix="hiveaud-"))
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def record(self, params, action="node.info", extra=None):
+        log = AuditLog(self.d)
+        t = time.monotonic()
+        log.record(kind="call", identity=None, ip="127.0.0.1", via="direct", node="n", action=action,
+                   params=params, ok=False, code="bad_request", ms=1, request_id="r", extra=extra)
+        took = time.monotonic() - t
+        (f,) = list(self.d.iterdir())
+        raw = f.read_bytes()
+        f.unlink()
+        self.assertLess(len(raw), 64 << 10)
+        self.assertLess(took, 0.5)
+        return json.loads(raw)
+
+    def test_huge_containers(self):
+        rec = self.record({"x": [[]] * (16 << 20)})                        # 16M elements
+        self.assertEqual(len(rec["params"]["x"]), 33)
+        self.assertEqual(rec["params"]["x"][-1], "…[+16777184 items]")
+        rec = self.record({f"k{i}": i for i in range(1 << 20)})
+        self.assertEqual(rec["params"]["…"], "[+1048544 keys]")
+        rec = self.record({"argv": ["a"] * (1 << 20), "env": {f"E{i}": "v" for i in range(1 << 20)},
+                           "headers": ["H: v"] * (1 << 20), "messages": [{"role": "user"}] * (1 << 20),
+                           "content": [[]] * (1 << 20)})
+        p = rec["params"]
+        self.assertEqual((len(p["argv"]), p["argv"][-1]), (129, "…[+1048448 items]"))
+        self.assertEqual((len(p["env"]), p["headers"][-1]), (33, "…[+1048544 names]"))
+        self.assertEqual(p["messages"], {"items": 1 << 20, "sha256": None})
+        deep: list = []
+        for _ in range(500):
+            deep = [deep, "s" * 400]
+        rec = self.record({"deep": deep, "wide": [["y" * 600] * 32] * 32})      # depth / value budget
+        self.assertIn("…", json.dumps(rec["params"], ensure_ascii=False))
+        rec = self.record({"k": "v"}, extra={"big": [{"a": "z" * 499} for _ in range(3000)]})
+        self.assertIn("…", json.dumps(rec["extra"], ensure_ascii=False))
+        rec = self.record({f"{'k' * 100}{i}": ["v" * 499] * 32 for i in range(32)})   # still > 64 KiB: cut
+        self.assertTrue(rec["params"]["…"].startswith("[record cut: "))
+        rec = self.record({"a": 1}, action="x" * (1 << 20))
+        self.assertEqual(rec["action"], "x" * 200)
+
+    def test_small_params_unchanged(self):
+        params = {"path": "/x", "argv": ["ls", "-la"], "env": {"A": "1"}, "items": list(range(10)),
+                  "content": "hello"}
+        self.assertEqual(redact_params("a", params, bounded=True), redact_params("a", params))
+        self.assertEqual(self.record(params)["params"], redact_params("a", params))
+
 if __name__ == "__main__":
     unittest.main()
