@@ -1782,5 +1782,8 @@ QA-L2. **Temp dirs left per full run:** `helpers.make_runtime`/`start_node_serve
     FakeRuntime referenced (a collected one removed its dir, then the test re-created it). Product: `NodeRuntime.stop()`
     joins the scheduler thread (≤ 5 s), and `paused.ack` is written with `mkdir=False`, so a periodic task never
     re-creates a deleted data dir after stop.
+QA-R. **ResourceWarnings:** the test CONNECT proxy in `test_transport` now closes its upstream socket (5 "unclosed
+    socket" warnings per run gone). One sporadic warning in `test_e2e_m2.test_e2e_1` (a closed socket collected in a
+    client thread) did not reproduce alone and is left.
 QA-M. `# pragma: no cover - Python < 3.12` on the `rmtree(onerror=)` branches of `actions/files.py` removed (they run
     on 3.9–3.11).

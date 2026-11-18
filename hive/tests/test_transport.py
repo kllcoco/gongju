@@ -141,6 +141,7 @@ class ConnectProxy:
             threading.Thread(target=self._one, args=(c,), daemon=True).start()
 
     def _one(self, c: socket.socket) -> None:
+        up: Optional[socket.socket] = None
         try:
             head = b""
             while b"\r\n\r\n" not in head:
@@ -175,6 +176,8 @@ class ConnectProxy:
             return
         finally:
             c.close()
+            if up is not None:      # QA: no ResourceWarning for the upstream socket
+                up.close()
 
     def close(self) -> None:
         self._stop = True
