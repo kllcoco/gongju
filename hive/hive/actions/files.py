@@ -632,9 +632,15 @@ def _cut(s: str, n: int = TEXT_CAP, mask: Optional[fsops.EdgeMask] = None) -> st
     if len(s) <= n:
         return s
     kept = s[:n]
+    i = kept.rfind("«")
+    if i >= 0 and s.startswith("«secret:", i) and "»" not in kept[i:]:
+        j = s.find("»", n, n + 80)
+        if j >= 0:     # a mask marker (fs.search matches on masked text) is never cut in half
+            kept = s[:j + 1]
+            n = len(kept)
     if mask is not None:
         kept = mask(kept, s[n:])[0]
-    return kept + f"…[+{len(s) - n} chars]"
+    return kept + (f"…[+{len(s) - n} chars]" if len(s) > n else "")
 
 
 def _search_files(ctx: ActionContext, root: Path, p: dict, deadline: float) -> Iterable[os.DirEntry]:
