@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "hive": {
+      "command": "/home/me/.venvs/hive/bin/hive",
+      "args": [
+        "mcp",
+        "--connection",
+        "home"
+      ]
+    }
+  }
+}
