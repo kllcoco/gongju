@@ -1082,3 +1082,46 @@ K9. **Open items (WP4):**
     - Not implemented: doctor's "service code dir skipped" warning (needs a ServiceManager), §20.5 item 15 (restart
       warning about running `hive.exe` processes), the `--deep` Docker GPU run was not exercised (no daemon here).
     - CLI wiring of `hive service install|uninstall|status` and `hive doctor` is WP6b.
+
+## WP5b review fixes
+
+(Items numbered R5b-1… so they cannot collide with the notes of parallel review packages.)
+
+R5b-1. **CONTRACT-REQUEST (WP5b → P0 `util.py`, additive):** `util.ClosingIterator(source, on_close=None)`: an iterator
+    whose `close()` closes the source and runs `on_close` exactly once, also when iteration never started (a bare
+    generator's `finally` is skipped by `close()` before the first `next`, so a client gone before the response head
+    leaked inflight slots, sockets, audit records and the dist semaphore). Exhaustion or a source error closes it too.
+R5b-2. **CONTRACT-REQUEST (WP5b → WP3b `netutil.py`, WP5a `transport.py`, one line each):** `netutil._stream_body`
+    (used by `open_stream` and `open_download`) and `HttpTransport.open_stream` return their chunk generator wrapped in
+    `ClosingIterator(gen, conn.close)`, so closing an unread stream closes the connection. Callers see the same
+    iterator API (`__iter__`/`__next__`/`close`).
+R5b-3. **Gateway (amends B5):** every gateway error (authorize, forward, relay `model.forward` errors passed on) has its
+    `hint` folded into the OpenAI-shaped `message` as "`<message> (<hint>)`" (the OpenAI shape has no hint field), so
+    the §8.7 "the hub token on this node needs the net class for the gateway" and the §7.5 v8 relay-role hint reach the
+    app. The hub replaces a direct node's 404 only when its body is the node gateway's own
+    `{"error":{"code":"not_found","message":"service X not found on N …"}}` (read up to 64 KiB); any other 404 (an
+    upstream model server's "model does not exist", a node's "service X has no OpenAI endpoint") is passed through
+    unchanged. Streaming responses (hub and node) are `ClosingIterator`s: slot release, upstream close and the audit
+    record run once even when the server closes the stream before the first chunk.
+R5b-4. **Hub (amends B4):**
+    - Relay register keeps `node_id` only when it matches `^n_[A-Za-z0-9_-]{4,64}$` (the config pattern) and differs
+      case-insensitively from every configured node name, alias and other link's node_id; otherwise it stores `""` and
+      writes a `warning` audit record `relay node_id refused` (a pod could otherwise take over routing for another node,
+      §8.1 resolves node_id before aliases).
+    - `max_poll_bytes`: the hub stops at the first task that does not fit (FIFO, §7.2); the free-slot and
+      `model.forward` slot-reserve skips are unchanged.
+    - While `identity_changed`, a poll gets no tasks, no cancels and no `refresh` (they stay for the bound instance), and
+      `POST /v1/hub/nodes/{name}/restart` answers `queued:false`.
+    - `DirectLink.ensure_fresh`: callers that waited for an in-flight probe share its failure (`unavailable connect`)
+      instead of probing again (one probe in flight per link, §8.3 v5); a success is seen through the fresh row.
+    - `GET /v1/dist/hive.pyz` streams the body (256 KiB chunks, `Content-Length` set) and holds the concurrency slot
+      (≤ 4) until the body is sent or the client is gone.
+R5b-5. **Relay agent (amends B6):** a task id stays in `running` until its result POST finished (incl. retries), so a
+    poll during a slow upload does not make the hub mark it lost; its slot stays counted until then.
+R5b-6. **dist (amends B3/B8):** `add_node_instructions(..., host=None)` (additive): `host` is the hub address a remote
+    machine uses when the listen host is a wildcard or loopback (the WP6b CLI fills it from `--host`/the LAN address).
+    `--via` omitted on a `"tailscale"` hub = `--via tailnet`: variants T (+A with `public_url`) and then C. A join code
+    never contains a loopback/wildcard host: a tailscale hub whose tailnet IP cannot be read → `bad_request` "cannot
+    determine the hub's tailnet IP" (hint: start tailscale, or `--via public`); a T/B code for a wildcard/loopback
+    listen host without `host`/`public_url` → `bad_request` (hint: give the hub address or set `public_url`). IPv6
+    literals are bracketed in URLs.
