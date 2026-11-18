@@ -2194,3 +2194,68 @@ V4-11. **hfhub listing transient memory (minor):** each HF page (and the ModelSc
     `json_body_problem` before `json.loads`: more than 4 arrays/objects per remaining entry (`CONTAINERS_PER_ENTRY`)
     → `too_large` like the entry cap (16 MiB of `{}`: refused unparsed instead of +360 MiB); entries whose path is
     longer than 4096 chars are skipped.
+
+### Final acceptance (independent session)
+
+The independent acceptance run passed 1527 tests on 3.9–3.13 with one environment-dependent failure and confirmed
+every earlier beginner problem fixed; the remaining items, fixed with the owner's decisions:
+
+FA-A. **Tests on the default ports (Part A):** `tests/test_cli.py::TestNodeCommands` ran `hive init node` with the
+    default listener 127.0.0.1:7701; `node status` / `node restart` then reached a developer's own node there (401 →
+    exit 3). `tests.test_cli.run` now passes `--listen 127.0.0.1:<free port>` to every `hive init node|hub` that
+    creates (or `--force` rewrites) a config without choosing its listener (`free_port_init`); the one test that
+    asserts the printed default URL passes `--listen 127.0.0.1:7700` explicitly (nothing connects). Audit: the whole
+    suite (clean HEAD copy) ran with a real node on 7701 and a real hub on 7700; their request logs, matched to
+    per-test start/end times, showed contacts only from those three `TestNodeCommands` tests (`POST /v1/call` 401). All
+    other 7700/7701 occurrences are URL strings in parsing, rendering, join-code and config tests (no socket), or
+    integration tests that already set a free port. `TestNoDefaultPorts` checks the helper and the written configs.
+FA-B1. **`examples/stub_openai.py`:** stdlib OpenAI-compatible stub (`/health`, `/v1/models`,
+    `/v1/chat/completions` incl. `stream` SSE with optional usage chunk, `/v1/completions`; `PORT [--model] [--host]`,
+    127.0.0.1 by default, 1 MiB body cap). README 6.1 copies it with `hive push desk hive/examples/stub_openai.py
+    '~/hive-test/stub_openai.py'`, defines it with `--cwd '~/hive-test'` (quoted: `~` is the node's home) and checks it
+    with `hive call model.chat service=stub prompt=你好 --node desk` (verified against a real node). Tests run it as a
+    subprocess (`TestStubOpenAI`).
+FA-B2. **`--node X` on the hub machine (`cli._auto_hub_connection`):** without `--connection`, HIVE_URL or
+    HIVE_CONNECTION, when the connection the command would use is this computer's node (`this-pc`/`this-pc-owner`)
+    and X is neither that node (its config name) nor self/local/./-, the command uses client.json's hub connection
+    (`hub-local`, else a non-local default connection, else a name containing "hub") and says so on stderr
+    ("note: 'desk' is not this computer's node ('blk'): using the hub connection 'hub-local' …"); printed follow-up
+    commands carry `--connection`. Applies to `call`, `actions`, `tools export`, `service define` (`--node`) and to
+    `sh`, `push`, `pull`, `logs` (NODE argument). README 6.1 explains it and shows `--connection hub-local`.
+FA-B3. **`hive node token set NAME --cautious|--no-cautious`** (agent tokens; `require_approval` =
+    `CAUTIOUS_ACTIONS` or removed; the hash stays, so agent configs are unchanged; restarts a running node) and the
+    hub twin **`hive hub set-agent NAME --cautious|--no-cautious`**. `hive doctor` prints the exact command
+    (`hive node token set <name> --cautious`, `hive hub set-agent <name> --cautious, or narrow its nodes`; T25 names
+    `hive hub set-agent NAME --cautious`); `init hub --with-local-node` names `hive node token set this-pc --cautious`.
+FA-B4. **`hive mcp-config --client X --remove`:** claude-desktop / cursor (`~/.cursor/mcp.json`): deletes only the
+    `"hive"` server (other servers and keys kept, `.bak` copy), "nothing to remove" when absent, needs no Hive config;
+    claude-code: prints `claude mcp remove hive` (and the `-s user` form); generic: usage error. README 11 runs it
+    first in the uninstall steps and says how to remove the entry by hand.
+FA-B5a. **Unknown action through the hub (`hub._unknown_action`):** "upgrade the hub" only when the target node
+    implements the action (a newer node); otherwise `unknown action 'x'` with the closest names (catalog + the node's
+    actions, `details.suggestions`) and "list the actions: hive actions", plus both versions when they differ.
+FA-B5b. **Approval review and echo:** words after `echo` / `printf` / `Write-Output` / `Write-Host` without `.`, `/`
+    or `\` are quiet (`presets._PRINT_ONLY`), so they are no longer listed as "(no file here, not bound)"; path-like
+    words, the same word used elsewhere as a file, interpreter operands and text piped into a shell keep the rules.
+FA-B5c. **Relay goodbye (`POST /v1/relay/unregister`, PROTOCOL 5.3a, DESIGN 7.3a):** `RelayAgent.check_disabled`
+    (poll loop and the node's 1 s PAUSED watcher) sends it when `relay.disabled` appears (reason `panic` when panic
+    wrote it, else `paused`); `run_node` stops the agent with `goodbye=True` unless the exit code is 75 (restart).
+    `RelayLink.unregister` ends the matching session: offline at once, queued calls fail `offline` (not executed),
+    delivered ones `offline` with `maybe_executed` = mutating, the hint names the reason (`hive node resume`); a stale
+    session is ignored; a register clears it.
+FA-B5d. **`gateway url --token-file`:** the "no token yet?" line is printed only without `--token-file`.
+FA-B5e. **Direct nodes just added:** NodeSummary `checking` (true until the hub's first probe of that link ends);
+    `hub status` / `hive nodes` show `checking` instead of `offline`. The prober re-probes a direct node that has not
+    been reached since the hub started after 2 and 4 s, then every 5 s for the hub's first 10 minutes
+    (`FAST_PROBE_MAX`, `FAST_PROBE_WINDOW`), so a node that accepts the hub token later (`hive node token add … --kind
+    hub` on that machine) is online within seconds instead of up to 30 s. README 4.2 explains the states.
+FA-B5f. **"applied by the watchdog":** `install.supervisor(kind)` (watchdog pid alive, `deploy/runpod/start-hive.sh`
+    loop — it now writes `node/run/start-hive.pid` —, the Windows launcher, or an active/activating systemd unit);
+    `cli._restart_daemon` prints "the node is not running right now; applied by the watchdog, which starts it again
+    within a few seconds" instead of "will apply on next start" when one is looping (e.g. `init node --no-listen`
+    after a port conflict on a pod).
+FA-B5g. **`hub restart-node --outdated` without auto-update:** the node reports why (`node.info modes.auto_update_off`
+    / NodeSummary `auto_update_off`: `role:<role>`, `deny_actions`, `not_pod` (no `HIVE_WATCHDOG=1`), `off`); the CLI
+    prints the reason and the remedy (role narrowed: `hive init node --relay-role operator --auto-update`; not a pod:
+    upgrade by hand with the commands; older nodes without the field: both possible reasons). New `hive init node
+    --auto-update / --no-auto-update` (on needs a relay with role operator and no deny_actions). README 11 explains.

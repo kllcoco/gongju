@@ -161,6 +161,13 @@ replaced by the node with `too_large`. The node retries at 1, 3, 9 s on network 
 when it does not expect that result, and with the headers present the body's `task_id` / `session_id` must equal them
 (400 otherwise).
 
+### 5.3a Goodbye — `POST /v1/relay/unregister` (final acceptance)
+`{"node","session_id","reason":"panic"|"paused"|"stop"}` → `{"unregistered":true|false}` (relay token). Sent by the
+node when `relay.disabled` appears (`hive node panic`, within 1 s) and on a real stop (not on a restart, exit 75).
+A matching session ends at once: the node shows offline, queued calls fail `unavailable` `offline`
+(`maybe_executed:false`, hint naming the reason), delivered calls fail `unavailable` `offline` (`maybe_executed` =
+mutating). An unknown or superseded session is ignored (`false`). Older hubs answer 404; the node ignores it.
+
 ### 5.4 Hub-side outcomes (§7.4)
 
 | Situation | Result |

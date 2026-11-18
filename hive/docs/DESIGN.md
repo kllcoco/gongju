@@ -1554,6 +1554,14 @@ The hub holds the request up to `poll_wait` until ≥ 1 task or cancel exists. R
 `{"session_id","task_id","envelope":{…node envelope §6.2…}}` → `{"accepted":true|false}`.
 `false` (logged, 200) when the task is unknown, belongs to another session, completed, or expired. Body capped at `max_result_bytes + 64 KiB`; the node replaces larger envelopes with `too_large`. The node retries posting at 1, 3, 9 s on network errors. Audit round 4: the node also sends `X-Hive-Task: <task_id>` and `X-Hive-Session: <session_id>`; the hub checks them **before reading the body** and answers `{"accepted":false}` unread (connection closed) for a task it does not expect from that session; with the headers present the body's `task_id`/`session_id` must match them (400 otherwise). Without the headers (older relay builds) the body decides, as before.
 
+### 7.3a Goodbye — `POST /v1/relay/unregister` (final acceptance)
+`{"node","session_id","reason"}` → `{"unregistered":bool}`. The node says it goes offline: when `relay.disabled`
+appears (panic; the node's 1 s PAUSED watcher calls `RelayAgent.check_disabled`, so it does not wait for the held
+poll) and on a stop (`RelayAgent.stop(goodbye=True)` from `run_node` unless the exit code is 75, a restart that comes
+back at once). The hub ends the matching session (`RelayLink.unregister`): online at once false, queued tasks fail
+`offline` (not executed), delivered tasks fail `offline` with `maybe_executed` = mutating, and the offline error's hint
+names the reason (`hive node resume` after a panic). A stale session id changes nothing.
+
 ### 7.4 Hub-side semantics (`RelayLink`, WP5)
 
 | Situation | Result for the agent |
