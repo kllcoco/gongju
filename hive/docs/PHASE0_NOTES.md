@@ -1798,6 +1798,64 @@ QA-S. **Stress verification after the QA fixes:** full suite 3x on python3 (3.13
     multi-threaded test process (DeprecationWarning on 3.12+, a possible child deadlock): `pty.openpty()` +
     `subprocess.Popen` (fork+exec in C). The WSL module ran 20x clean with `-W always::ResourceWarning`.
 
+### Audit round 2
+
+Independent approval/exec-path audit. Changes in `presets.py` (command scan, `bind_plan_ex`, `bind_files`),
+`hub.py` (`_split`, `_bind_words`, `_bind_files` only), `policy.py` (`DEFAULT_EXEC_PATHS`); tests
+`tests/test_audit2_binding.py`, `tests/test_policy.py` (exec-path lists), `tests/test_ext_review2.py` (expectations for
+the named path and cmd PATHEXT); DESIGN §5.5, §5.6, overview items 6-7; SECURITY "Approvals" and "Exec paths" rows.
+
+A2-1. **Script operands with plain names were not bound (HIGH):** `bind_files` skipped a missing word that was not
+    path-like, so `bash run3` / `python3 foo2` with the script absent at review had `files: []` and an empty header;
+    after approval the agent created `run3` and the payload ran. Owner decision: the operand of a known interpreter is
+    always bound, missing → `bind:"absent"`; every other missing non-flag non-path word is listed in the header.
+    New `presets._scan_commands` reads each simple command (POSIX lines split at `; & | ( )`/newlines by
+    `_posix_scan`, the old `_posix_tokens` words with the structure kept, redirect targets and `2>&1` fd words set
+    aside; PowerShell/cmd lines split outside quotes; argv as one command): `NAME=VALUE` prefixes and shell keywords,
+    wrappers (`env`, `nice`, `timeout`, `sudo`, `doas`, `xargs`, `nohup`, `setsid`, `time`, `stdbuf`, `ionice`, `chrt`,
+    `taskset`, `exec`, `command`, `builtin`, `caffeinate`, `chroot`, `busybox`, `wsl`, `uv|poetry|pipenv|pdm|conda|
+    mamba|micromamba run`), then the interpreter (sh family, python/pypy/py, perl, ruby, node, deno, bun, Rscript, R,
+    php, lua, awk, sed, tclsh, osascript, pwsh/powershell, cmd, `source`/`.`) with a per-interpreter option table.
+    Its script operand is bound as `./name` (`_Roles.op`); `presets.bind_plan_ex` returns `(words, moved, unbound,
+    quiet)` (`bind_plan` keeps its 3-tuple); `bind_files(..., quiet=)` lists a missing non-path word as
+    "<word> (no file here, not bound)" unless quiet (`listable_missing`: not a command name/known option value/code,
+    not a number, `NAME=VALUE` or text with whitespace). The hub uses the same plan (`Hub._split` returns the quiet set
+    too; with the OS unknown a non-path word is quiet only when both readings say so) and the same listing.
+    One step further (attacker view): options that take a value are skipped with it (`python -X dev s`, `-W x`,
+    `-Xdev`, `bash -O opt`/`-o opt`/`+O opt`, `node --require x`/`--import`/`--env-file`, `perl -I dir`/`-Idir`,
+    `ruby -I/-r`, `php -d/-c`, `deno --config`, `bun --preload`; clusters such as `-uB -X t`; `--`); code options mean
+    no script (`-c`/`-e`/`-r`, `sh -s`, `command -v`, `sudo -l`); `sh -c`, `fish -c`, `env -S`, `cmd /c`, `pwsh
+    -Command` text is planned again (depth ≤ 4); `pwsh -File`, `php -f`, `awk -f`, `sed -f`, `R -f`, `R CMD BATCH`
+    values are the script; `python -m mod` binds `mod.py`, `mod/__init__.py`, `mod/__main__.py` (dotted: `pkg.py`,
+    `pkg/__init__.py`, `pkg/sub.py`) quietly unless `-I`/`-P`; `lua -l m` binds `m.lua`; inline `BASH_ENV=x bash …`
+    (and `env BASH_ENV=x …`) binds `x` like the `env` param; in cmd a non-builtin command word binds
+    `name.com/.exe/.bat/.cmd` in the cwd (cmd searches it before PATH) and `call x` binds `x`; wrapper options that
+    change the directory (`sudo -D`, `env -C`, `ruby -C`, `bun --cwd`, `wsl --cd`, `chroot`, `pwsh -wd`, `conda run
+    --cwd`, `uv run --directory`) move every relative word; `pwsh -EncodedCommand` is a header item. Quiet extras are
+    planned last so they never push a named file over the 8-entry cap. Tests: `TestScriptOperand` (114 command
+    forms and 10 argv forms bound, 28 not-overbroad cases, module files, cmd/PowerShell, cwd-changing options,
+    quiet/listing, nesting bound), `TestNodeOperandBinding` (the repro end to end on a real node for `bash run3`, `python -X dev foo2`, an
+    `env A=1 bash run4` argv and `timeout 30 bash -c 'bash run5'`: absent at review, created after approval →
+    `conflict`, payload never ran; header lists `alpha (no file here, not bound)` but not `bash`, numbers, `FOO=1`;
+    an existing operand behind `nice -n 5 bash -O extglob` still shown and swap-refused), `TestHubOperandBinding`.
+    Limit (documented): `bash name`/`source name` may also search PATH; PATH folders inside rw roots are already exec
+    paths for gated tokens.
+A2-2. **Exec-path gaps (MEDIUM):** added `**/.git/modules/**`, `**/.git/info/attributes`, `~/.mavenrc`,
+    `~/.gradle/init.gradle`, `~/.gradle/init.d/**`, `~/.local/share/dbus-1/services/**`, `**/.vscode/settings.json`,
+    `**/.vscode/launch.json`, `~/.config/Code*/User/**`, `~/Library/Application Support/Code*/User/**`,
+    `~/AppData/Roaming/Code*/User/**`; one step further: VSCodium and Cursor user dirs, `**/.git/config.worktree`,
+    `**/.git/worktrees/*/config.worktree`, `~/.gradle/gradle.properties`, `**/.npmrc`. `test_policy` plants each for
+    a `files` token (denied, operator allowed, reads fine); `test_v81_exec_paths_not_overbroad` gained neighbours that
+    stay writable (`.vscode/extensions.json`, `.git/info/exclude`, `.git/objects/…`, `.git/worktrees/w1/HEAD`, a
+    project `.gradle/init.gradle`, `~/.gradle/caches`, VS Code caches/logs, `dbus-1/other`, `npmrc.txt`, a plain
+    `settings.json`); `~/proj/.vscode/settings.json` moved from that list to the denied list.
+A2-3. **Node binding keyed the resolved path (LOW):** node `files` entries now carry the path as the command names
+    it (`<cwd>/<word>`, `./` segments dropped by `presets._strip_dot_segments`) with `real` when it differs, like the
+    hub (R2-5); `FileHolds.acquire` re-resolves it, so a link retargeted between approve and spawn is `conflict`. A
+    second path to an already bound file (`bash a.sh; bash link.sh`) adds its own entry (same fingerprint, shown once)
+    on the node and the hub. Test: `TestNodeOperandBinding.test_symlink_retargeted_after_approval`,
+    `TestHubOperandBinding.test_hub_binds_second_path_to_same_file`.
+
 ### Audit round 3 (multi-machine)
 
 Hub + direct node + relay pod + gateway audit. Changes in `hub.py` (links, relay routes, resolution only),
