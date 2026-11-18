@@ -482,9 +482,15 @@ by the lead or a line in DESIGN.md.
     - Every connection resolves the host once (≤ 5 s, helper thread) and the direct route connects to those vetted
       addresses (no second lookup), so rule C1 and `proxy_for(..., ips)` decide on the same answer. C1: a token goes
       over `http://` only when the host is loopback, a private/CGNAT IP literal, a name whose resolved addresses are
-      all loopback/private (fake-ip 198.18/15 does not count), or an unresolvable local name / `*.ts.net`;
-      otherwise `policy_denied` rule `plaintext_credentials`, before any connection is made.
-    - Proxy: `"off"` → direct; an explicit URL → every target through it (also loopback/private, §14.4); `"auto"` →
+      all loopback/private (fake-ip 198.18/15 does not count; link-local fe80::/10 and 169.254/16 addresses are
+      ignored when at least one other address is loopback/private, since mDNS hosts publish them and they cannot
+      leave the link — a name resolving only to link-local is still refused), or an unresolvable local name /
+      `*.ts.net`; otherwise `policy_denied` rule `plaintext_credentials`, before any connection is made. A failed
+      lookup on a direct route is `unavailable` reason `dns` (retried) before the C1 check.
+    - Proxy: `"off"` → direct; an explicit URL (syntax `http://[user:pass@]host:port[/]` checked at construction) →
+      `netproxy.load_proxy_settings(None, os.environ, explicit=URL)` on every new connection (§11.4 validation and
+      the v4 `wsl-host` substitution; the scheme's URL is used, no `proxy_for`/bypass) → every target through it
+      (also loopback/private, §14.4); `"auto"` →
       `netproxy.load_proxy_settings({"proxy": HIVE_PROXY or None, "no_proxy": [], "use_system_proxy": true,
       "ca_file": null}, os.environ)` (HIVE_PROXY as a configured source, so bypass rules still apply; never as
       `explicit=`) and `proxy_for(settings, scheme, host, ips)`. A proxied connection always uses
@@ -498,16 +504,22 @@ by the lead or a line in DESIGN.md.
       does not know counts as mutating (fail safe) and gets deadline 30. Idle keep-alive connections are not reused
       after 20 s (servers close at 30 s) or when the peer already closed them (select check), so a POST is never sent
       on a stale socket. A non-JSON or non-envelope response is `internal` (details `status`, escaped `snippet`); a
-      response `X-Hive-Api` other than 1 is `bad_request` "api mismatch"; responses > 128 MiB are refused.
+      response `X-Hive-Api` other than 1 is `bad_request` "api mismatch"; responses > 128 MiB are refused (from
+      `Content-Length` before reading; chunked/unknown-length bodies are read in 1 MiB steps — never
+      `read(128 MiB)`, which preallocates on Python < 3.12). Base URL paths and request paths must be printable
+      ASCII without spaces (`bad_request` before any connection).
     - The socket timeout of `POST /v1/call` is `max(timeout or constructor timeout, catalog.deadline(...) + 25)`
       (§15.1; the constructor timeout is the minimum); other routes use `request(timeout=)` or the constructor value.
-    - `HttpTarget.kind` is lazy (one `GET /v1/whoami`); it returns `"unknown"` while the server is unreachable and on
-      an uninitialised object (Python 3.9's runtime Protocol check calls `hasattr`).
+    - `HttpTarget.kind` is a plain attribute (`kind=` or `"unknown"`), updated by `whoami()`; it never does I/O
+      (Python 3.9-3.11 runtime Protocol checks call `hasattr`). `HttpTarget.resolve_kind()` (additive) asks
+      `GET /v1/whoami` on purpose while unknown; a failed probe returns `"unknown"` and is not repeated for 30 s.
     - `connect()` sends nothing. Resolution (§14.4): `connect(None)` → `HIVE_URL` (token `HIVE_TOKEN`, else
       `HIVE_TOKEN_FILE`; pin `HIVE_TLS_PIN`) → `HIVE_CONNECTION` → `default`; `connect("name")` / `"local"` (=
       `this-pc`, the agent connection; offline → the D45 hint "start it: hive node run (or hive service install
-      node)") ignore `HIVE_URL`; `connect("http(s)://…")` uses the given token, else `HIVE_TOKEN`/`HIVE_TOKEN_FILE`,
-      and `HIVE_TLS_PIN` only when the URL equals `HIVE_URL`; client.json connections are not matched by URL (that
+      node)") ignore `HIVE_URL`; with `HIVE_URL` set, `connect(None)`/`from_config()` load client.json tolerantly
+      (unreadable → `config=None`); `connect("http(s)://…")` uses the given token, else `HIVE_TOKEN`/
+      `HIVE_TOKEN_FILE` only when `HIVE_URL` is unset or equals the URL (the env credential stays bound to its host,
+      §5.1/C2; another URL gets no token), and `HIVE_TLS_PIN` only when the URL equals `HIVE_URL`; client.json connections are not matched by URL (that
       could silently pick an owner token such as `hub-local`). Default node: `connect(default_node=)` →
       `HIVE_NODE` → the connection's `default_node`. Relative `token_file` paths resolve against client.json's
       folder; only the first line of a token file is used. `connect` options: `ca_file`, `tls_pin`, `timeout`,
@@ -516,7 +528,9 @@ by the lead or a line in DESIGN.md.
       `exited` with code 0. `follow_logs` starts with the tail, then follows `next_offset`; a job's stream ends once
       the job is final and a read returns no text; a service's never ends. `JobHandle.wait(timeout)` returns the
       last status when the time is up. `pull_model(dry_run=True)` returns the plan dict.
-    - Transfers: `Client.transfer("local:P" | "NODE:P", …)` (a prefix is required, "self" allowed) and
+    - Transfers: `Client.transfer("local:P" | "NODE:P", …)` (a prefix is required, "self" allowed; a one-letter
+      prefix followed by `\` or `/`, e.g. `C:\data\f.bin`, is a Windows drive path → `bad_request`, hint
+      `local:` prefix) and
       `NodeHandle.upload/download` call `transfer.copy` with `transfer.LocalFS(None)` and
       `transfer.NodeFS(target, node)` — WP5b must give `NodeFS` that constructor (`node` may be None = the direct
       node / default). Until WP5b they raise the stub's `unsupported`. `HubTarget` stays a WP5b stub.

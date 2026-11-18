@@ -435,13 +435,16 @@ class FakeEffectivePolicy:
         return False
 
     def resolve_path(self, path: str, *, write: bool = False, must_exist: bool = False,
-                     subtree: bool = False) -> Path:
+                     subtree: bool = False, nofollow_last: bool = False) -> Path:
         if not isinstance(path, str) or not path or "\x00" in path or len(path) > 4096:
             raise bad_request(f"invalid path: {path!r}")
         p = Path(os.path.expanduser(path))
         if not p.is_absolute():
             p = self._workdir / p
-        real = Path(os.path.realpath(str(p)))
+        if nofollow_last and p.name not in ("", ".", ".."):
+            real = Path(os.path.realpath(str(p.parent))) / p.name
+        else:
+            real = Path(os.path.realpath(str(p)))
         if self._hard_denied(real):
             raise denied(f"path '{real}' is internal to Hive", rule="hive_internal",
                          hint="Hive's own data cannot be read or changed through actions")
@@ -451,6 +454,10 @@ class FakeEffectivePolicy:
 
     def denied_under(self, path: Path, *, write: bool = False, rebase: Optional[Path] = None) -> List[str]:
         return []
+
+    def path_key(self, path: Union[str, Path], *, follow: bool = True) -> str:
+        s = os.path.abspath(str(path))
+        return os.path.normcase(os.path.realpath(s) if follow else os.path.normpath(s)).replace("\\", "/")
 
     def roots(self) -> List[dict]:
         return [{"path": "*", "mode": "rw"}]

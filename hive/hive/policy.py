@@ -773,6 +773,16 @@ class EffectivePolicy:
             real = _long_path_name(real)
         return real
 
+    def _real_nofollow(self, s: str) -> str:
+        t = s
+        seps = "/\\" if IS_WINDOWS else "/"
+        while len(t) > 1 and t[-1] in seps and not (IS_WINDOWS and re.match(r"^[A-Za-z]:[/\\]$", t)):
+            t = t[:-1]
+        parent, base = os.path.split(t)
+        if not base or base in (".", "..") or not parent or parent == t:
+            return self._real(s)
+        return os.path.join(self._real(parent), base)
+
     def _venv_bin(self, real: str) -> bool:
         p = Path(real)
         for anc in p.parents:
@@ -840,9 +850,17 @@ class EffectivePolicy:
             return []
         return [k for k in held_keys() if self.p._under(k, key)]
 
+    def path_key(self, path: Union[str, Path], *, follow: bool = True) -> str:
+        """Comparison key of an absolute path with PathGuard's case rule (casefolded on Windows/macOS and WSL drive
+        paths): realpath'd with ``follow=True``, else normalized lexically (no symbolic link is resolved)."""
+        s = os.path.abspath(str(path))
+        return self.p._key_real(os.path.realpath(s) if follow else os.path.normpath(s))
+
     def resolve_path(self, path: str, *, write: bool = False, must_exist: bool = False,
-                     subtree: bool = False) -> Path:
-        """PathGuard (§5.4, binding step order); returns the real path handlers open."""
+                     subtree: bool = False, nofollow_last: bool = False) -> Path:
+        """PathGuard (§5.4, binding step order); returns the real path handlers open. With ``nofollow_last`` the last
+        component is not resolved (realpath of the parent + the name as given): the path of a symbolic link itself
+        is vetted (fs.delete / fs.move / fs.copy destinations act on the link, not its target)."""
         # 1. basic form
         if not isinstance(path, str) or not path or "\x00" in path or len(path) > 4096:
             raise bad_request("invalid path (empty, NUL or longer than 4096 characters)")
@@ -854,8 +872,8 @@ class EffectivePolicy:
         lex = self.p._cf(path_key(os.path.normpath(s), casefold=False))
         if self.p._match_root(lex) is None:
             raise self._roots_error(path, write)
-        # 5. realpath
-        real = self._real(s)
+        # 5. realpath (of the parent only with nofollow_last)
+        real = self._real_nofollow(s) if nofollow_last else self._real(s)
         key = self.p._key_real(real)
         # 6. root containment on the real path
         root = self.p._match_root(key)

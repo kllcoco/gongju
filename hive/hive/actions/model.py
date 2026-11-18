@@ -155,12 +155,15 @@ def _probe(ctx: ActionContext, row: Dict[str, Any], timeout: float, auth: Option
     """Fill ``healthy``/``models``/``server`` of a row from ``GET <base>/models`` (in place; never raises)."""
     answered = False
     models: Optional[List[Dict[str, Any]]] = None
+    reported = row.get("healthy")
     try:
         r = _get(ctx, _join(row["base_url"], "models"), timeout=timeout, auth=auth)
         answered = True
         if 200 <= r.status < 300:
             models = _models_of(_json(r.body))
             row["healthy"] = True
+        elif r.status in (401, 403) and row.get("source") == "service" and reported is not None:
+            row["healthy"] = bool(reported)   # up, but refused the model list: keep ServiceManager's health check
         else:
             row["healthy"] = False
     except HiveError:
@@ -190,9 +193,15 @@ def list_endpoints(ctx: ActionContext, *, probe: bool, timeout: float) -> List[D
     if sm is not None:
         try:
             for r in sm.endpoints() or []:
+                sauth: Optional[netutil.AuthSpec] = None
+                if r.get("name"):
+                    try:                          # the service's api_key_env (§10.5): probe like model.chat calls
+                        sauth = sm.endpoint_for(str(r["name"]))[2]
+                    except HiveError:
+                        sauth = None
                 add({"name": r.get("name"), "source": "service", "api": r.get("api") or "openai",
                      "server": r.get("server") or "unknown", "base_url": str(r.get("base_url")),
-                     "healthy": r.get("healthy"), "models": r.get("models")})
+                     "healthy": r.get("healthy"), "models": r.get("models")}, sauth)
         except HiveError:
             pass
     for e in getattr(ctx.policy, "model_endpoints", None) or []:
@@ -235,6 +244,11 @@ def list_endpoints(ctx: ActionContext, *, probe: bool, timeout: float) -> List[D
     for row in rows:
         row.pop("_answered", None)
     return rows
+
+
+def _audit_route(ctx: ActionContext, r: netutil.HttpResult) -> None:
+    """§5.4 NetGuard rule 8: audit ``extra`` records ``route`` and ``dns`` (local|remote)."""
+    ctx.audit_extra.update(route=r.route, dns=getattr(r, "dns", "local"))
 
 
 def _connect_hint(base: str) -> str:
@@ -288,6 +302,7 @@ def model_endpoints(ctx: ActionContext, p: dict) -> dict:
     try:
         r = _get(ctx, _join(row["base_url"], "models"), timeout=timeout, auth=auth)
         status = r.status
+        _audit_route(ctx, r)
         if 200 <= r.status < 300:
             models = _models_of(_json(r.body))
     except HiveError as e:
@@ -411,6 +426,7 @@ def model_chat(ctx: ActionContext, p: dict) -> dict:
         raise _reraise_connect(e, base)
     latency = round(time.monotonic() - t_start, 3)
     ctx.audit_extra.update(model=str(model)[:200], base_url=base, status=r.status)
+    _audit_route(ctx, r)
     if r.status == 404:
         known: List[str] = []
         try:

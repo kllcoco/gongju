@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from . import netproxy
 from .errors import HiveError, bad_request, cancelled, denied, timeout, unavailable, unsupported
@@ -68,6 +68,7 @@ class HttpResult:
     truncated: bool
     elapsed_s: float
     route: str
+    dns: str = "local"         # "remote" when the proxy resolved the name (CONNECT/absolute-form by hostname); audit
 
 
 def _host_key(host: str) -> str:
@@ -234,6 +235,10 @@ def _resolve(host: str, port: int, timeout: float = DNS_TIMEOUT) -> List[str]:
     return result[0] if result else []
 
 
+URL_SAFE = "/%?=&:@!$'()*+,;~-._[]"
+HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")    # RFC 9110 token
+
+
 def _split_url(url: str) -> Tuple[str, str, int, str]:
     """(scheme, host, port, path+query) with rule 1 (http/https only, no userinfo)."""
     if not isinstance(url, str) or not url or len(url) > 8192 or any(c in url for c in "\r\n\x00"):
@@ -252,9 +257,15 @@ def _split_url(url: str) -> Tuple[str, str, int, str]:
     host = _host_key(parts.hostname or "")
     if not host:
         raise bad_request(f"URL without host: {url[:200]!r}")
-    path = parts.path or "/"
+    if not host.isascii():                       # IDN -> punycode: DNS names, Host and SNI are ASCII
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise bad_request(f"invalid host name in {url[:200]!r}")
+    # non-ASCII / spaces in the path or query are percent-encoded (UTF-8); existing escapes are kept
+    path = quote(parts.path or "/", safe=URL_SAFE)
     if parts.query:
-        path += "?" + parts.query
+        path += "?" + quote(parts.query, safe=URL_SAFE)
     return scheme, host, port or (443 if scheme == "https" else 80), path
 
 
@@ -467,8 +478,13 @@ def _check_headers(headers: Optional[Mapping[str, str]], auth: Optional[AuthSpec
     for k, v in (headers or {}).items():
         name = str(k).strip()
         low = name.lower()
-        if not name or any(c in name for c in " \t\r\n:") or any(c in str(v) for c in "\r\n\x00"):
+        if not name or not HEADER_NAME_RE.match(name) or any(c in str(v) for c in "\r\n\x00"):
             raise bad_request(f"invalid header {name[:64]!r}")
+        try:
+            str(v).encode("latin-1")
+        except UnicodeEncodeError:
+            raise bad_request(f"header {name[:64]} has characters outside ISO-8859-1",
+                              hint="HTTP header values must be ASCII/Latin-1; percent- or base64-encode the value")
         if low in FRAMING_HEADERS or low.startswith("proxy-"):
             raise bad_request(f"header {name} is set by Hive", hint="remove it from headers")
         if low == "authorization" and auth is not None:
@@ -488,6 +504,18 @@ def _secret_host_error(auth: AuthSpec, host: str) -> HiveError:
     return denied(f"secret '{auth.name}' may not be sent to {host}", rule="secret_host",
                   hint=f"secret {auth.name} may only be sent to {hosts}; the owner can widen it: hive node secret "
                        f"set {auth.name} --hosts +{host}")
+
+
+def _dns_side(target: VettedTarget) -> str:
+    """§5.4 NetGuard rule 8 audit value: ``remote`` when the proxy resolves the name (proxy route naming the host,
+    not pinned to the vetted IP), else ``local``."""
+    if target.route != "proxy" or (target.pin_ip and target.ip):
+        return "local"
+    try:
+        ipaddress.ip_address(_host_key(target.host))
+        return "local"
+    except ValueError:
+        return "remote"
 
 
 def _auth_allowed(auth: AuthSpec, target: VettedTarget) -> bool:
@@ -541,7 +569,7 @@ def guarded_request(method: str, url: str, *, guard: Any, purpose: str, headers:
         if not location:
             return HttpResult(status=status, reason=reason, url=cur_url, headers=dict(rheaders.items()),
                               body=data, truncated=truncated, elapsed_s=round(time.monotonic() - t0, 3),
-                              route=target.route)
+                              route=target.route, dns=_dns_side(target))
         if hop > MAX_REDIRECTS:
             raise unavailable(f"too many redirects (more than {MAX_REDIRECTS})", reason="redirects",
                               maybe_executed=True, url=cur_url)
@@ -638,6 +666,13 @@ def _one_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], bod
             raise unavailable(f"cannot resolve {host}: {e}", reason="dns", maybe_executed=sent_before or conn.sent)
         except socket.timeout:
             raise timeout(f"request to {host}:{port} timed out", maybe_executed=sent_before or conn.sent)
+        except ssl.SSLError as e:      # handshake failure, WRONG_VERSION_NUMBER (https to a plain-http port), …
+            raise unavailable(f"TLS connection to {host}:{port} failed: {getattr(e, 'reason', None) or e}",
+                              reason="tls", maybe_executed=sent_before or conn.sent,
+                              hint=f"is {host}:{port} really an https:// server?")
+        except (UnicodeError, ValueError) as e:   # request line/header not encodable (checked earlier; defensive)
+            raise bad_request(f"the request to {host} cannot be encoded: {e}",
+                              hint="use ASCII (percent-encoded) URLs and Latin-1 header values")
         except ConnectionRefusedError:
             raise unavailable(f"connection to {host}:{port} refused", reason="connect",
                               maybe_executed=sent_before or conn.sent, hint=f"nothing listening on {host}:{port}")

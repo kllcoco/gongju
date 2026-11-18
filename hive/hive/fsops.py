@@ -16,7 +16,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from . import util
 from .errors import HiveError, bad_request, conflict, denied, not_found, too_large, unsupported
@@ -32,6 +32,12 @@ LONG_LINE = 2000                       # lines longer than this are cut with "�
 REGEX_MAX_LEN = 200
 LITERAL_MAX_LEN = 500
 MAX_UNBOUNDED = 4
+MAX_GROUP_REPEAT = 10                  # a repeated group holding a quantifier/'|' may repeat at most this often
+O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+O_BINARY = getattr(os, "O_BINARY", 0)
+
+# ``mask(kept, rest) -> (kept', masked)``: masks secret values cut by the end of ``kept`` (``rest`` follows it)
+EdgeMask = Callable[[str, str], Tuple[str, bool]]
 
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
 _EOL_RE = re.compile(r"(?:\r\n|\r|\n)\Z")
@@ -171,23 +177,50 @@ def _strip_eol(line: str) -> str:
     return _EOL_RE.sub("", line)
 
 
-def _cut_line(line: str) -> Tuple[str, bool]:
+def _cut_line(line: str, mask: Optional[EdgeMask] = None) -> Tuple[str, bool, bool]:
+    """(shown line, was cut, masked): lines longer than LONG_LINE chars are cut; a secret value cut by the edge is
+    masked through ``mask`` (step 10a only masks whole values)."""
     body = _strip_eol(line)
     if len(body) > LONG_LINE:
-        return body[:LONG_LINE] + f"…[+{len(body) - LONG_LINE} chars]" + line[len(body):], True
-    return line, False
+        kept, masked = body[:LONG_LINE], False
+        if mask is not None:
+            kept, masked = mask(kept, body[LONG_LINE:])
+        return kept + f"…[+{len(body) - LONG_LINE} chars]" + line[len(body):], True, masked
+    return line, False, False
 
 
-def read_lines(path: Path, start_line: int, max_lines: int, max_bytes: int, *, line_numbers: bool = False) -> dict:
-    """fs.read core: ``{"content","start_line","end_line","total_lines","next_start_line","size","version",
-    "encoding","long_lines_cut"}``; binary files (NUL in the first 8 KiB) -> unsupported."""
-    start_line = max(1, int(start_line))
-    with os_errors(path):
-        st = os.stat(path)
+def open_regular(path: Any) -> BinaryIO:
+    """Open a regular file for reading without blocking on FIFOs/devices (``O_NONBLOCK``); anything but a regular
+    file -> bad_request."""
+    fd = os.open(long_path(Path(path)), os.O_RDONLY | O_BINARY | O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
         if stat.S_ISDIR(st.st_mode):
             raise bad_request(f"'{path}' is a directory", hint="use fs_list for folders")
+        if not stat.S_ISREG(st.st_mode):
+            raise bad_request(f"'{path}' is not a regular file (device, FIFO or socket)")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_lines(path: Path, start_line: int, max_lines: int, max_bytes: int, *, line_numbers: bool = False,
+               check: Optional[Callable[[], None]] = None, mask: Optional[EdgeMask] = None) -> dict:
+    """fs.read core: ``{"content","start_line","end_line","total_lines","next_start_line","size","version",
+    "encoding","long_lines_cut"}`` (+ ``"masked": true`` when ``mask`` hid a secret cut by a line cut); binary files
+    (NUL in the first 8 KiB) -> unsupported; non-regular files -> bad_request. ``check`` (e.g. ``ctx.check``) is
+    called between chunks of the streamed (> 64 MiB) path so a timed-out or cancelled call stops reading."""
+    start_line = max(1, int(start_line))
+    masked = False
+    with os_errors(path):
+        st = os.stat(long_path(Path(path)))
+        if stat.S_ISDIR(st.st_mode):
+            raise bad_request(f"'{path}' is a directory", hint="use fs_list for folders")
+        if not stat.S_ISREG(st.st_mode):
+            raise bad_request(f"'{path}' is not a regular file (device, FIFO or socket)")
         size = st.st_size
-        with open(path, "rb") as f:
+        with open_regular(path) as f:
             head = f.read(HEAD_BYTES)
             encoding, binary = detect_encoding(head)
             if binary:
@@ -212,6 +245,8 @@ def read_lines(path: Path, start_line: int, max_lines: int, max_bytes: int, *, l
                 n = 0
                 buf = ""
                 while len(selected) <= max_lines:
+                    if check is not None:
+                        check()
                     chunk = stream.read(1 << 16)
                     parts: List[str]
                     if not chunk:
@@ -237,15 +272,19 @@ def read_lines(path: Path, start_line: int, max_lines: int, max_bytes: int, *, l
     used = 0
     cut = 0
     for i, ln in enumerate(selected):
-        shown, was_cut = _cut_line(display_text(ln))
+        shown, was_cut, m = _cut_line(display_text(ln), mask)
+        masked = masked or m
         if line_numbers:
             shown = f"{start_line + i:6d}\t{shown}"
         b = len(shown.encode("utf-8"))
         if used + b > max_bytes:
             if not out:   # one line larger than max_bytes: cut it (never return nothing)
                 raw = shown.encode("utf-8")[:max_bytes]
-                shown = raw.decode("utf-8", "ignore")
-                out.append(shown)
+                kept = raw.decode("utf-8", "ignore")
+                if mask is not None:   # the caller picks max_bytes: mask a secret cut by this edge (§5.13 v8)
+                    kept, m = mask(kept, shown[len(kept):])
+                    masked = masked or m
+                out.append(kept)
                 cut += 1
             more = True
             break
@@ -256,9 +295,12 @@ def read_lines(path: Path, start_line: int, max_lines: int, max_bytes: int, *, l
     next_start: Optional[int] = end_line + 1 if (more or len(out) < len(selected)) else None
     if total is not None and next_start is not None and next_start > total:
         next_start = None
-    return {"content": "".join(out), "start_line": start_line, "end_line": end_line, "total_lines": total,
-            "next_start_line": next_start, "size": size, "version": version, "encoding": enc_name,
-            "long_lines_cut": cut}
+    res = {"content": "".join(out), "start_line": start_line, "end_line": end_line, "total_lines": total,
+           "next_start_line": next_start, "size": size, "version": version, "encoding": enc_name,
+           "long_lines_cut": cut}
+    if masked:
+        res["masked"] = True
+    return res
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -342,10 +384,11 @@ def snippet(text: str, line: int, new_lines: int, context: int = 3) -> str:
 
 def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
     """(unbounded quantifier count, problems) from a light tokenizer: groups followed by an unbounded quantifier
-    (``*``, ``+``, ``{n,}``) must not contain a quantifier or ``|``; back-references are refused."""
+    (``*``, ``+``, ``{n,}``), or repeated more than MAX_GROUP_REPEAT times in all (bounded counts of nested groups
+    multiply), must not contain a quantifier or ``|``; back-references and verbose mode (``x`` flag) are refused."""
     problems: List[str] = []
     unbounded = 0
-    stack: List[Dict[str, Any]] = []          # open groups: {"inner_q": bool, "alt": bool}
+    stack: List[Dict[str, Any]] = []          # open groups: {"inner_q": bool, "alt": bool, "mult": repeat count}
     i, n = 0, len(pattern)
     prev_atom_end = False                     # an atom precedes (so a quantifier char quantifies it)
     last_quant = False
@@ -383,7 +426,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
                 j = pattern.find(")", i)
                 i = n if j < 0 else j + 1
                 continue
-            stack.append({"inner_q": False, "alt": False})
+            stack.append({"inner_q": False, "alt": False, "mult": 1})
             i += 1
             if i < n and pattern[i] == "?":       # (?:  (?P<n>  (?=  (?!  (?<=  (?i) …: skip the marker
                 i += 1
@@ -395,22 +438,27 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
                 elif i < n and pattern[i] in ":=!>":
                     i += 1
                 else:
+                    j = i
                     while i < n and (pattern[i].isalpha() or pattern[i] == "-"):
                         i += 1
+                    if "x" in pattern[j:i]:      # verbose: whitespace and '#' change what the engine sees
+                        problems.append("verbose")
                     if i < n and pattern[i] == ":":
                         i += 1
             prev_atom_end, last_quant = False, False
             continue
         if c == ")":
-            g = stack.pop() if stack else {"inner_q": False, "alt": False}
+            g = stack.pop() if stack else {"inner_q": False, "alt": False, "mult": 1}
             i += 1
             # quantifier after the group?
-            q_unbounded, q_any, j = _read_quant(pattern, i)
+            q_unbounded, q_any, j, upper = _read_quant(pattern, i)
+            mult = g["mult"]
             if q_any:
+                mult = mult * upper if not q_unbounded else REPEAT_INF
                 if q_unbounded:
                     unbounded += 1
-                    if g["inner_q"] or g["alt"]:
-                        problems.append("nested quantifier")
+                if (q_unbounded or mult > MAX_GROUP_REPEAT) and (g["inner_q"] or g["alt"]):
+                    problems.append("nested quantifier")
                 mark_quant()
                 i = j
                 last_quant = True
@@ -420,6 +468,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
             if stack:
                 stack[-1]["inner_q"] = stack[-1]["inner_q"] or g["inner_q"]
                 stack[-1]["alt"] = stack[-1]["alt"] or g["alt"]
+                stack[-1]["mult"] = max(stack[-1]["mult"], min(mult, REPEAT_INF))
             prev_atom_end = True
             continue
         if c == "|":
@@ -429,7 +478,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
             prev_atom_end, last_quant = False, False
             continue
         if c in "*+?{" and prev_atom_end and not last_quant:
-            q_unbounded, q_any, j = _read_quant(pattern, i)
+            q_unbounded, q_any, j, _upper = _read_quant(pattern, i)
             if q_any:
                 if q_unbounded:
                     unbounded += 1
@@ -442,27 +491,35 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
     return unbounded, problems
 
 
-def _read_quant(p: str, i: int) -> Tuple[bool, bool, int]:
-    """(unbounded, is_quantifier, end index) of a quantifier at p[i] (incl. a lazy/possessive suffix)."""
+REPEAT_INF = 1 << 30
+
+
+def _read_quant(p: str, i: int) -> Tuple[bool, bool, int, int]:
+    """(unbounded, is_quantifier, end index, upper bound) of a quantifier at p[i] (incl. a lazy/possessive
+    suffix); the upper bound is REPEAT_INF when unbounded."""
     n = len(p)
     if i >= n:
-        return False, False, i
+        return False, False, i, 1
     c = p[i]
     if c in "*+":
-        unb, j = True, i + 1
+        unb, j, upper = True, i + 1, REPEAT_INF
     elif c == "?":
-        unb, j = False, i + 1
+        unb, j, upper = False, i + 1, 1
     elif c == "{":
         m = re.match(r"\{(\d*)(,?)(\d*)\}", p[i:])
         if not m or (not m.group(1) and not m.group(3)):
-            return False, False, i
+            return False, False, i, 1
         unb = bool(m.group(2)) and not m.group(3)
+        if unb:
+            upper = REPEAT_INF
+        else:
+            upper = min(REPEAT_INF, int(m.group(3) or m.group(1)))
         j = i + m.end()
     else:
-        return False, False, i
+        return False, False, i, 1
     if j < n and p[j] in "?+":
         j += 1
-    return unb, True, j
+    return unb, True, j, upper
 
 
 def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN) -> "re.Pattern[str]":
@@ -477,6 +534,8 @@ def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN) -> "re.Pattern[st
     unbounded, problems = _scan_regex(pattern)
     if "back-reference" in problems:
         raise bad_request("regex back-references are not allowed", hint=hint)
+    if "verbose" in problems:
+        raise bad_request("regex verbose mode ((?x)) is not allowed", hint=hint)
     if "nested quantifier" in problems:
         raise bad_request("a repeated group may not contain a quantifier or '|' (catastrophic backtracking)",
                           hint=hint)
@@ -486,6 +545,8 @@ def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN) -> "re.Pattern[st
         rx = re.compile(pattern)
     except (re.error, OverflowError, RecursionError) as e:
         raise bad_request(f"invalid regex: {e}", hint=hint)
+    if rx.flags & re.VERBOSE:      # belt and braces: the scan above must have seen every flag group
+        raise bad_request("regex verbose mode ((?x)) is not allowed", hint=hint)
     return rx
 
 
@@ -519,16 +580,22 @@ def entry_allowed(guard: Any, path: str) -> bool:
 
 
 def walk(root: Path, *, depth: int, include_hidden: bool, guard: "EffectivePolicy",
-         deadline: float, skip_dirs: Iterable[str] = ()) -> Iterator[os.DirEntry]:
+         deadline: float, skip_dirs: Iterable[str] = (), state: Optional[Dict[str, Any]] = None
+         ) -> Iterator[os.DirEntry]:
     """Breadth-first walk to ``depth`` (1 = direct children). Skips denied entries and never descends into them,
     nor into symbolic links (they are yielded, unresolved) or ``skip_dirs`` names (§5.4 step 9). Stops quietly
-    when ``time.monotonic()`` passes ``deadline``."""
+    when ``time.monotonic()`` passes ``deadline``; then ``state["truncated"]`` is set to True (callers that must not
+    report partial work as complete check it)."""
     skip = set(skip_dirs)
+    if state is not None:
+        state["truncated"] = False
     level = [str(root)]
     for d in range(1, max(1, int(depth)) + 1):
         nxt: List[str] = []
         for folder in level:
             if time.monotonic() > deadline:
+                if state is not None:
+                    state["truncated"] = True
                 return
             try:
                 with os.scandir(long_path(Path(folder))) as it:
@@ -537,6 +604,8 @@ def walk(root: Path, *, depth: int, include_hidden: bool, guard: "EffectivePolic
                 continue
             for e in entries:
                 if time.monotonic() > deadline:
+                    if state is not None:
+                        state["truncated"] = True
                     return
                 if not include_hidden and is_hidden(e):
                     continue
@@ -668,4 +737,4 @@ def json_depth_ok(obj: Any, limit: int = 64) -> bool:
 
 __all__ = ["check_regex", "detect_encoding", "read_lines", "apply_edit", "closest_window", "walk", "is_hidden",
            "long_path", "PartTracker", "os_errors", "decode_bytes", "encode_text", "split_lines", "snippet",
-           "normalize_newlines", "entry_allowed", "display_text", "binary_error", "json_depth_ok"]
+           "normalize_newlines", "entry_allowed", "display_text", "binary_error", "json_depth_ok", "open_regular"]

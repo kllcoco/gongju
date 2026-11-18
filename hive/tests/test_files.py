@@ -246,6 +246,7 @@ class TestSearchList(FilesCase):
         r = self.call("fs.search", {"pattern": "*.txt", "path": "proj", "names_only": True})
         self.assertEqual(self.files(r), {"proj/sub/b.txt"})
         self.assertIsNone(r["matches"][0]["line"])
+        self.assertEqual((r["matches"][0]["before"], r["matches"][0]["after"]), ([], []))   # §9.7 row shape
         r = self.call("fs.search", {"pattern": "o", "path": "proj", "max_results": 1})
         self.assertEqual((len(r["matches"]), r["truncated"], r["reason"]), (1, True, "max_results"))
         r = self.call("fs.search", {"pattern": "bar", "path": "proj/sub/b.txt"})
@@ -378,6 +379,13 @@ class TestStatChunks(FilesCase):
         self.assertFalse(self.fh.p("up/g.bin").exists())
         e = self.err("fs.write_chunk", {"path": "up/h.bin", "data": b64[0], "offset": 0, "total_size": 10 ** 17})
         self.assertEqual(e.code, "too_large")
+        if POSIX:   # overwrite keeps the replaced file's mode bits (note 78); new files get 0644
+            os.chmod(self.fh.p("up/f.bin"), 0o750)
+            self.call("fs.write_chunk", {"path": "up/f.bin", "data": b64[0], "offset": 0, "overwrite": True,
+                                         "final": True})
+            self.assertEqual(os.stat(self.fh.p("up/f.bin")).st_mode & 0o777, 0o750)
+            self.call("fs.write_chunk", {"path": "up/new.bin", "data": b64[0], "offset": 0, "final": True})
+            self.assertEqual(os.stat(self.fh.p("up/new.bin")).st_mode & 0o777, 0o644)
 
     def test_part_prune(self):
         tr = self.rt.parts

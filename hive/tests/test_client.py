@@ -68,7 +68,10 @@ class TestTargetAndClient(unittest.TestCase):
     def test_target_basics(self):
         t = self.f.client.target
         self.assertIsInstance(t, Target)
-        self.assertEqual(t.kind, "hub")                          # learned from whoami.server.role
+        self.assertEqual(t.kind, "unknown")                      # a plain attribute: reading it sends nothing
+        self.assertEqual(self.f.stub.requests, [])
+        self.assertEqual(t.resolve_kind(), "hub")                # learned from whoami.server.role
+        self.assertEqual(t.kind, "hub")
         self.assertEqual([n["name"] for n in t.nodes()], ["a", "b"])
         self.assertEqual(t.actions("pod a")[0]["q"], "/v1/actions?node=pod%20a")
         self.assertEqual(t.actions()[0]["q"], "/v1/actions")
@@ -78,10 +81,46 @@ class TestTargetAndClient(unittest.TestCase):
         unreachable = HttpTarget(f"http://127.0.0.1:{helpers.free_port()}", "hv_x")
         with mock.patch("hive.transport.time.sleep"):
             self.assertEqual(unreachable.kind, "unknown")
+            self.assertEqual(unreachable.resolve_kind(), "unknown")
+        # a failed probe is remembered: no network for KIND_RETRY_SECONDS
+        with mock.patch.object(unreachable.transport, "request", side_effect=AssertionError("no request")):
+            self.assertEqual(unreachable.resolve_kind(), "unknown")
         self.assertEqual(HttpTarget("http://127.0.0.1:1", kind="node").kind, "node")
         self.assertEqual(object.__new__(HttpTarget).kind, "unknown")
         with self.assertRaises(HiveError):
             HttpTarget(HttpTransport("http://127.0.0.1:1"), "hv_x")
+
+    def test_isinstance_sends_nothing(self):
+        # Python 3.9-3.11 runtime Protocol checks call hasattr(t, "kind"): that must not be network I/O
+        t = HttpTarget(self.f.stub.url, "hv_x")
+        with mock.patch.object(t.transport, "request", side_effect=AssertionError("no request")):
+            self.assertIsInstance(t, Target)
+            self.assertTrue(hasattr(t, "kind"))
+        self.assertEqual(self.f.stub.requests, [])
+
+    def test_long_call_timeout_reaches_socket(self):
+        # §21.2 "Client.call shell.run timeout=200 against a stub answering after 150 s" (scaled): the call-level
+        # timeout goes into the body, catalog.deadline turns it into the socket timeout (200 + 25), so the
+        # constructor timeout (0.5 s) does not cut the call off
+        from hive import transport as tp
+        with helpers.StubHTTPServer() as stub:
+            stub.add("POST", "/v1/call", 200, {"ok": True, "result": {"exit_code": 0, "state": "exited"}},
+                     delay=1.5)
+            c = Client(HttpTarget(stub.url, "hv_tok", timeout=0.5))
+            seen: List[Any] = []
+            real = tp.HttpTransport.call_socket_timeout
+
+            def spy(self_, body, timeout=None):
+                r = real(self_, body, timeout)
+                seen.append((body.get("timeout"), r))
+                return r
+            with mock.patch.object(tp.HttpTransport, "call_socket_timeout", spy):
+                r = c.call("shell.run", {"command": "x"}, timeout=200)
+            self.assertEqual(r["exit_code"], 0)
+            self.assertEqual(seen, [(200, (225.0, True))])
+            self.assertEqual(c.target.transport.call_socket_timeout(
+                {"action": "shell.run", "params": {"command": "x"}, "timeout": 200})[0], 225.0)
+            c.close()
 
     def test_call_body(self):
         self.f.handlers["node.info"] = lambda p: {"name": "desk", "masked": True}
@@ -128,6 +167,14 @@ class TestTargetAndClient(unittest.TestCase):
         for bad in ("/tmp/x", "local:", "bad name:/x", ":x"):
             with self.subTest(bad=bad), self.assertRaises(HiveError):
                 split_location(bad)
+        # a Windows drive path is not node "c" / "d"
+        for drive in ("C:\\data\\x.bin", "d:/backup/out.bin", "D:\\backup\\out.bin"):
+            with self.subTest(drive=drive), self.assertRaises(HiveError) as cm:
+                split_location(drive)
+            self.assertEqual(cm.exception.code, "bad_request")
+            self.assertIn("local:", cm.exception.hint)
+        self.assertEqual(split_location("cx:/x"), ("cx", "/x"))
+        self.assertEqual(split_location("c:rel"), ("c", "rel"))
 
 
 class TestHandles(unittest.TestCase):
@@ -272,7 +319,7 @@ class TestRealNode(unittest.TestCase):
         cls.rt.test_stop()
 
     def test_identity_nodes_actions(self):
-        c = self.client
+        self.assertEqual(c.target.resolve_kind(), "node")
         self.assertEqual(c.target.kind, "node")
         self.assertEqual(c.whoami()["identity"]["kind"], "agent")
         rows = c.nodes()
@@ -374,12 +421,29 @@ class TestConnect(unittest.TestCase):
                 # explicit args come first
                 self.assertEqual(connect(token="hv_arg").target.transport._token, "hv_arg")
                 self.assertEqual(connect("home").target.transport._token, "hv_home")
-                c = connect("https://127.0.0.1:7999")
-                self.assertEqual(c.target.transport._token, "hv_env")
-                self.assertEqual(c.target.transport.tls_pin, "sha256:" + "aa" * 32)  # same URL as HIVE_URL
+                c = connect("https://127.0.0.1:7999/")
+                self.assertEqual(c.target.transport._token, "hv_env")                 # same URL as HIVE_URL
+                self.assertEqual(c.target.transport.tls_pin, "sha256:" + "aa" * 32)
                 c = connect("https://127.0.0.1:8000", default_node="x", timeout=5)
                 self.assertIsNone(c.target.transport.tls_pin)                       # pin is for HIVE_URL only
+                self.assertIsNone(c.target.transport._token)                        # so is the token (C2, §5.1)
                 self.assertEqual((c.default_node, c.target.transport.timeout), ("x", 5.0))
+                self.assertEqual(connect("http://127.0.0.1:8000", token="hv_arg").target.transport._token, "hv_arg")
+        # without HIVE_URL the env token is not bound to a host: an explicit URL uses it
+        with mock.patch.dict(os.environ, {"HIVE_TOKEN": "hv_env"}):
+            self.assertEqual(connect("http://127.0.0.1:8000").target.transport._token, "hv_env")
+
+    def test_env_url_ignores_broken_client_json(self):
+        (self.home / "client.json").write_text('{"version": 1, "connec')
+        with mock.patch.dict(os.environ, {"HIVE_URL": "http://127.0.0.1:7701", "HIVE_TOKEN": "hv_env"}):
+            for c in (connect(), Client.from_config()):
+                self.assertEqual((c.target.url, c.target.transport._token), ("http://127.0.0.1:7701", "hv_env"))
+                self.assertIsNone(c.config)
+            with self.assertRaises(HiveError):
+                connect("home")                     # a named connection still needs a readable client.json
+        with self.assertRaises(HiveError) as cm:
+            connect()                               # without HIVE_URL the broken file is an error
+        self.assertEqual(cm.exception.code, "bad_request")
 
     def test_connection_fields(self):
         raw = {"version": 1, "default": "lan", "connections": {

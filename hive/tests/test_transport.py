@@ -275,7 +275,7 @@ class TestParsing(unittest.TestCase):
         t = HttpTransport("http://[::1]:7701")
         self.assertEqual((t.host, t.url), ("::1", "http://[::1]:7701"))
         for bad in ("ftp://x", "http://user:pw@host", "http://h/?q=1", "", "http://", "127.0.0.1:7701",
-                    "http://h:99999"):
+                    "http://h:99999", "http://h:7701/my hub", "http://h:7701/caf\u00e9", "http://h:7701/a\x7fb"):
             with self.subTest(bad=bad), self.assertRaises(HiveError) as cm:
                 HttpTransport(bad)
             self.assertEqual(cm.exception.code, "bad_request")
@@ -297,11 +297,14 @@ class TestParsing(unittest.TestCase):
         for bad in ("hv_ a", "hv_x\r\nX: y", ""):
             with self.assertRaises(HiveError):
                 HttpTransport("http://127.0.0.1:1", bad)
-        for bad in ("socks5://127.0.0.1:1080", "https://127.0.0.1:8443", "pac"):
+        for bad in ("socks5://127.0.0.1:1080", "https://127.0.0.1:8443", "pac", "http://127.0.0.1",
+                    "http://127.0.0.1:7890/path", "http://127.0.0.1:7890/?x=1", "http://127.0.0.1:7890#f"):
             with self.subTest(proxy=bad), self.assertRaises(HiveError) as cm:
                 HttpTransport("http://127.0.0.1:1", proxy=bad)
             self.assertEqual(cm.exception.code, "bad_request")
         self.assertEqual(HttpTransport("http://127.0.0.1:1", proxy="OFF").proxy, "off")
+        for good in ("http://127.0.0.1:7890", "http://127.0.0.1:7890/", "http://u:p@wsl-host:7890"):
+            self.assertEqual(HttpTransport("http://127.0.0.1:1", proxy=good).proxy, good)
         self.assertEqual(HttpTransport("http://127.0.0.1:1", proxy=None).proxy, "auto")
         with self.assertRaises(HiveError):
             HttpTransport("http://127.0.0.1:1", timeout=0)
@@ -345,6 +348,12 @@ class TestParsing(unittest.TestCase):
         self.assertFalse(plaintext_ok("hub.example.com", ["192.168.1.2", "93.184.216.34"]))
         self.assertFalse(plaintext_ok("hub.example.com", ["198.18.0.3"]))
         self.assertFalse(plaintext_ok("hub.example.com", None))
+        # link-local addresses next to a private one (mDNS hosts publish fe80::) do not count; alone they do not pass
+        self.assertTrue(plaintext_ok("desk.local", ["fe80::1", "192.168.1.5"]))
+        self.assertTrue(plaintext_ok("mypc.local", ["169.254.7.7", "10.0.0.5"]))
+        self.assertFalse(plaintext_ok("desk.local", ["fe80::1"]))
+        self.assertFalse(plaintext_ok("hub.example.com", ["fe80::1", "93.184.216.34"]))
+        self.assertFalse(plaintext_ok("hub.example.com", ["169.254.169.254", "192.168.1.5"]))   # metadata != link-local
 
     def test_cert_none_only_on_pin_path(self):
         # §22.3 rule 11 (a): CERT_NONE in transport.py only inside _pin_context (the pin-verification path)
@@ -460,6 +469,77 @@ class TestFailureModes(unittest.TestCase):
             with self.assertRaises(HiveError) as cm:
                 t.request("GET", "/v1/whoami")
         self.assertEqual((cm.exception.details["reason"], cm.exception.details["maybe_executed"]), ("dns", False))
+
+    def test_dns_failure_with_token_is_not_a_c1_refusal(self):
+        # split-horizon name, temporary DNS failure: unavailable reason dns (retried), not policy_denied
+        t = HttpTransport("http://nas.home.example.com:7701", TOKEN)
+        with mock.patch.object(transport, "resolve_host", return_value=None) as rh, \
+                mock.patch.object(transport.time, "sleep"):
+            with self.assertRaises(HiveError) as cm:
+                t.request("GET", "/v1/whoami")
+        e = cm.exception
+        self.assertEqual((e.code, e.details["reason"], e.details["maybe_executed"]), ("unavailable", "dns", False))
+        self.assertTrue(e.retryable)
+        self.assertEqual(rh.call_count, 3)          # 1 + 2 retries
+        # a name that resolves to a public address is still refused by C1
+        with mock.patch.object(transport, "resolve_host", return_value=["93.184.216.34"]):
+            with self.assertRaises(HiveError) as cm:
+                t.request("GET", "/v1/whoami")
+        self.assertEqual((cm.exception.code, cm.exception.details["rule"]), ("policy_denied", "plaintext_credentials"))
+
+    def test_invalid_request_paths_send_nothing(self):
+        t = HttpTransport("http://127.0.0.1:1", TOKEN)
+        with mock.patch.object(t, "_open", side_effect=AssertionError("no connection expected")):
+            for bad in ("/v1/a b", "/v1/caf\u00e9", "/v1/a\x00", "/v1/a\x7f", "v1/x", "/v1/x#f", "/v1/\r\nX: y"):
+                with self.subTest(path=bad), self.assertRaises(HiveError) as cm:
+                    t.request("GET", bad)
+                self.assertEqual(cm.exception.code, "bad_request")
+
+    def test_large_responses(self):
+        # Content-Length above the limit: refused from the header, the body is never read
+        def huge(s, c):
+            s.read_request(c)
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                      + str(transport.MAX_RESPONSE_BYTES + 1).encode() + b"\r\n\r\n{")
+            time.sleep(2)
+        srv = RawServer(huge)
+        t = HttpTransport(srv.url, TOKEN, timeout=10)
+        t0 = time.monotonic()
+        with mock.patch.object(transport.http.client.HTTPResponse, "read",
+                               side_effect=AssertionError("body must not be read")):
+            with self.assertRaises(HiveError) as cm:
+                t.request("GET", "/v1/nodes")
+        self.assertEqual(cm.exception.code, "internal")
+        self.assertIn("exceeds", cm.exception.message)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        srv.close()
+
+        # chunked bodies are read in READ_CHUNK steps (never read(MAX_RESPONSE_BYTES + 1)) and capped
+        def chunked(s, c):
+            while s.read_request(c):
+                body = json.dumps({"ok": True, "result": {"x": "y" * 3000}}).encode()
+                parts = [body[i:i + 1000] for i in range(0, len(body), 1000)]
+                c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+                          + b"".join(b"%x\r\n%s\r\n" % (len(x), x) for x in parts) + b"0\r\n\r\n")
+        srv = RawServer(chunked)
+        t = HttpTransport(srv.url, TOKEN)
+        amounts: List[Any] = []
+        real_read = transport.http.client.HTTPResponse.read
+
+        def spy(self, amt=None):
+            amounts.append(amt)
+            return real_read(self, amt)
+        with mock.patch.object(transport.http.client.HTTPResponse, "read", spy):
+            self.assertEqual(len(t.request("GET", "/v1/nodes")["x"]), 3000)
+            self.assertTrue(amounts)
+            self.assertTrue(all(a is not None and a <= transport.READ_CHUNK for a in amounts), amounts)
+            with mock.patch.object(transport, "MAX_RESPONSE_BYTES", 1500), \
+                    mock.patch.object(transport, "READ_CHUNK", 512):
+                with self.assertRaises(HiveError) as cm:
+                    t.request("GET", "/v1/nodes")
+            self.assertIn("exceeds", cm.exception.message)
+        t.close()
+        srv.close()
 
     def test_lost_after_send_is_not_retried(self):
         # the server reads the whole request and closes without answering
@@ -696,6 +776,30 @@ class TestTls(unittest.TestCase):
             self.assertEqual(cm.exception.details["reason"], "tls_pin")
             self.assertNotIn(TOKEN.encode(), bytes(proxy.relayed))
         self.assertEqual(len(s.requests), 1)
+
+    def test_explicit_proxy_resolved_through_netproxy(self):
+        # §15.1/§11.4: an explicit URL goes through load_proxy_settings(explicit=…) (v4 wsl-host substitution); the
+        # substituted URL reaches open_tunnel, and proxy_for/bypass are not consulted (explicit forces the proxy)
+        proxy = ConnectProxy()
+        self.addCleanup(proxy.close)
+        tunnels: List[str] = []
+
+        def tunnel(proxy_url, host, port, *, timeout):
+            tunnels.append(proxy_url)
+            return fake_open_tunnel(proxy_url, host, port, timeout=timeout)
+        settings = netproxy.ProxySettings(proxy.url, proxy.url, ("localhost",), "config")
+        with helpers.StubHTTPServer() as stub, \
+                mock.patch.object(netproxy, "load_proxy_settings", return_value=settings) as lps, \
+                mock.patch.object(netproxy, "proxy_for", side_effect=AssertionError("not consulted")), \
+                mock.patch.object(netproxy, "open_tunnel", tunnel):
+            stub.add("GET", "/v1/whoami", *ok_env({"x": 3}))
+            t = HttpTransport(stub.url, TOKEN, proxy="http://wsl-host:7890")
+            self.assertEqual(t.request("GET", "/v1/whoami"), {"x": 3})
+            t.close()
+        args, kwargs = lps.call_args
+        self.assertEqual(kwargs.get("explicit"), "http://wsl-host:7890")
+        self.assertEqual(tunnels, [proxy.url])
+        self.assertEqual(len(proxy.lines), 1)
 
     def test_http_through_proxy_uses_connect(self):
         proxy = ConnectProxy()

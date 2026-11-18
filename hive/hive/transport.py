@@ -44,6 +44,10 @@ _RETRY_REASONS = ("connect", "dns", "proxy")
 _PIN_RE = re.compile(r"^[0-9a-f]{64}\Z")
 _TOKEN_RE = re.compile(r"^[\x21-\x7e]{1,4096}\Z")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,128}\Z")
+# request-target characters: printable ASCII without space (http.client's _contains_disallowed_url_pchar_re plus
+# non-ASCII, which http.client cannot encode); '#' is never part of a request-target
+_PATH_RE = re.compile(r"^[\x21-\x7e]*\Z")
+READ_CHUNK = 1 << 20            # bodies of unknown length are read in 1 MiB steps (never read(MAX_RESPONSE_BYTES))
 
 _warned_lock = threading.Lock()
 _warned_hosts: set = set()
@@ -100,15 +104,19 @@ def plaintext_ok(host: str, ips: Optional[Sequence[str]]) -> bool:
     """Rule C1: may a credential go over plain http:// to this target (loopback or private/tailnet only)?
 
     An IP literal is judged by its category; a name by its locally resolved addresses (all must be loopback/private;
-    a fake-ip answer means the traffic leaves through a proxy TUN, so it does not count). An unresolvable name is
-    accepted only when it is a local name (no dot, .lan, .local, …) or a tailnet ``*.ts.net`` name.
+    a fake-ip answer means the traffic leaves through a proxy TUN, so it does not count). Link-local addresses
+    (fe80::/10, 169.254/16 without the metadata address) are ignored when the name also resolves to a loopback/private
+    address: mDNS hosts publish both, and link-local traffic cannot leave the link. An unresolvable name is accepted
+    only when it is a local name (no dot, .lan, .local, …) or a tailnet ``*.ts.net`` name.
     """
     if is_loopback_host(host):
         return True
     if _is_ip(host):
         return _category(host) in ("loopback", "private")
     if ips:
-        return all(_category(ip) in ("loopback", "private") for ip in ips)
+        cats = [_category(ip) for ip in ips]
+        routable = [c for c in cats if c != "linklocal"]
+        return bool(routable) and all(c in ("loopback", "private") for c in routable)
     return is_local_name(host) or host.lower().rstrip(".").endswith(".ts.net")
 
 
@@ -228,6 +236,9 @@ class HttpTransport:
         if not host:
             raise bad_request(f"URL {raw!r} has no host")
         port = port or (443 if scheme == "https" else 80)
+        if not _PATH_RE.match(u.path):
+            raise bad_request(f"invalid URL {raw!r}: the path contains spaces, control or non-ASCII characters",
+                              hint="percent-encode the path (e.g. %20 for a space)")
         prefix = u.path.rstrip("/")
         shown = f"[{host}]" if ":" in host else host
         return {"scheme": scheme, "host": host, "port": port, "prefix": prefix,
@@ -235,6 +246,8 @@ class HttpTransport:
 
     @staticmethod
     def _check_proxy(proxy: Optional[str]) -> str:
+        """Cheap early syntax check (§11.4: only ``http://[user:pass@]host:port[/]``); the URL itself is resolved
+        through ``netproxy.load_proxy_settings(explicit=…)`` on every new connection (``wsl-host``, 60 s cache)."""
         if proxy is not None and not isinstance(proxy, str):
             raise bad_request("proxy must be 'auto', 'off' or an http:// URL")
         p = (proxy or "auto").strip()
@@ -246,11 +259,12 @@ class HttpTransport:
                                    "e.g. http://127.0.0.1:7890 (socks/PAC/https proxies are not)")
         try:
             u = urlsplit(p)
-            u.port
+            port = u.port
         except ValueError as e:
             raise bad_request(f"invalid proxy URL {_redact(p)!r}: {e}")
-        if not u.hostname:
-            raise bad_request(f"invalid proxy URL {_redact(p)!r}")
+        if not u.hostname or port is None or u.path not in ("", "/") or u.query or u.fragment or "#" in p:
+            raise bad_request(f"invalid proxy URL {_redact(p)!r}",
+                              hint="expected http://[user:pass@]host:port, e.g. http://127.0.0.1:7890")
         return p
 
     def _ssl_context(self) -> ssl.SSLContext:
@@ -310,8 +324,9 @@ class HttpTransport:
         method = str(method or "").upper()
         if not re.match(r"^[A-Z]{3,7}\Z", method):
             raise bad_request(f"invalid HTTP method {method!r}")
-        if not isinstance(path, str) or not path.startswith("/") or any(c in path for c in "\r\n\t #"):
-            raise bad_request(f"invalid request path {path!r}")
+        if not isinstance(path, str) or not path.startswith("/") or not _PATH_RE.match(path) or "#" in path:
+            raise bad_request(f"invalid request path {path!r}",
+                              hint="percent-encode spaces, control and non-ASCII characters")
         payload: Optional[bytes] = None
         if body is not None or method in ("POST", "PUT", "PATCH"):
             try:
@@ -405,11 +420,16 @@ class HttpTransport:
                     if self.offline_hint and e.code == "unavailable" and e.details.get("reason") in _RETRY_REASONS:
                         e.hint = self.offline_hint
                     raise
+            too_big = False
+            data = b""
             try:
                 conn.sock.settimeout(sock_timeout)
                 conn.request(method, path, body=payload, headers=hdrs)
                 resp = conn.getresponse()
-                data = resp.read(MAX_RESPONSE_BYTES + 1)
+                if resp.length is not None and resp.length > MAX_RESPONSE_BYTES:
+                    too_big = True           # refused from Content-Length, before reading the body
+                else:
+                    data = _read_body(resp)
             except socket.timeout:
                 self._discard(conn)
                 raise timeout_error(f"no response from {self.url} within {sock_timeout:.0f} s",
@@ -424,7 +444,7 @@ class HttpTransport:
                                   maybe_executed=mutating,
                                   hint=("the call may have run; check before repeating it" if mutating
                                         else "the request can be repeated"))
-            if len(data) > MAX_RESPONSE_BYTES:
+            if too_big or len(data) > MAX_RESPONSE_BYTES:
                 self._discard(conn)
                 raise internal(f"response from {self.url} exceeds {MAX_RESPONSE_BYTES} bytes")
             headers = _Headers(resp.getheaders())
@@ -459,10 +479,15 @@ class HttpTransport:
         """(proxy URL or None for direct, locally resolved addresses or None) for a new connection (§11.4, §14.4)."""
         if self.proxy == "off":
             return None, resolve_host(self.host, self.port)
-        if self.proxy != "auto":
-            # an explicit per-connection proxy URL forces the proxy for every target (§14.4)
-            return self.proxy, resolve_host(self.host, self.port)
         from . import netproxy  # function-level (§11.4: WP5 imports netproxy at function level)
+        if self.proxy != "auto":
+            # an explicit per-connection proxy URL forces the proxy for every target, also private ones (§14.4), so
+            # proxy_for/bypass are not consulted; the URL still goes through §11.4 (strict syntax, v4 `wsl-host`
+            # substitution, 60 s cache) and the substituted URL is the one used
+            settings = netproxy.load_proxy_settings(None, os.environ, explicit=self.proxy)
+            url = settings.https if self.scheme == "https" else settings.http
+            # the P0 netproxy stub returns no proxy for anything: keep the (syntax-checked) explicit URL then
+            return (url or self.proxy), resolve_host(self.host, self.port)
         hive_proxy = os.environ.get("HIVE_PROXY") or None
         net = {"proxy": hive_proxy, "no_proxy": [], "use_system_proxy": True, "ca_file": None}
         settings = netproxy.load_proxy_settings(net, os.environ)
@@ -474,6 +499,10 @@ class HttpTransport:
     def _open(self, sock_timeout: float) -> _Conn:
         ctimeout = max(0.1, min(CONNECT_TIMEOUT, sock_timeout))
         proxy, ips = self.proxy_route()
+        if proxy is None and not ips:
+            # a failed lookup on a direct route is a (retried) connect-phase failure, not a C1 refusal (§6.5)
+            raise unavailable(f"cannot resolve {self.host}", reason="dns", maybe_executed=False,
+                              hint="check the host name (DNS / MagicDNS) in the URL")
         if self.scheme == "http" and self._token and not plaintext_ok(self.host, ips):
             raise denied(f"refusing to send the token over plain http:// to {self.host}",
                          hint="use https:// (with tls_pin or ca_file), a Tailscale/LAN address, or loopback",
@@ -549,6 +578,23 @@ def _pin_context() -> ssl.SSLContext:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE     # §22.3 rule 11 (a): the pin-verification path; the pin is checked in _tls
     return ctx
+
+
+def _read_body(resp: http.client.HTTPResponse) -> bytes:
+    """The response body without a huge ``read(amt)`` (Python < 3.12 allocates a zeroed buffer of ``amt`` bytes).
+
+    A known length (already checked against MAX_RESPONSE_BYTES) is read at once; otherwise (chunked, close-delimited)
+    in READ_CHUNK steps until EOF or until MAX_RESPONSE_BYTES is passed (the caller refuses the response then).
+    """
+    if resp.length is not None:
+        return resp.read()
+    buf = bytearray()
+    while len(buf) <= MAX_RESPONSE_BYTES:
+        chunk = resp.read(READ_CHUNK)
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
 
 
 def _dropped(sock: Any) -> bool:

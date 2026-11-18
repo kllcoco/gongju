@@ -153,5 +153,89 @@ class TestPartTracker(unittest.TestCase):
         self.assertEqual(helpers.util.read_json(d / "state" / "parts.json")["parts"], {})
 
 
+class TestReviewFixes(unittest.TestCase):
+    """WP3a review fixes: verbose/bounded-nested regexes, walk truncation flag, read_lines check/mask/FIFO."""
+
+    def setUp(self) -> None:
+        self.d = Path(tempfile.mkdtemp(prefix="hivefs-")).resolve()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.d, ignore_errors=True))
+
+    def test_regex_verbose_and_bounded_nesting(self):
+        for bad in ("(?x) ( a + ) + $", "(?x)#[\n(a+)+$\n]", "(?ix)a", "(?x:a b)", "(a?){22}a{22}",
+                    "((a?){5}){5}", "(a|b){11}", "(?:a+){3,40}"):
+            with self.subTest(pattern=bad):
+                with self.assertRaises(HiveError) as cm:
+                    fsops.check_regex(bad)
+                self.assertEqual(cm.exception.code, "bad_request")
+        for ok in ("(?i)abc", "(?i:x)", r"(\d{1,3}\.){3}\d{1,3}", "(?:ab|cd){3}", "(ab){100}", "x{1000}",
+                   "((a?){2}){5}"):
+            with self.subTest(pattern=ok):
+                self.assertIsNotNone(fsops.check_regex(ok))
+
+    def test_walk_reports_truncation(self):
+        for i in range(3):
+            (self.d / f"f{i}").write_text("x")
+        pol = helpers.FakeEffectivePolicy(workdir=self.d)
+        st: dict = {}
+        self.assertEqual(list(fsops.walk(self.d, depth=2, include_hidden=True, guard=pol, deadline=0, state=st)), [])
+        self.assertTrue(st["truncated"])
+        st = {}
+        self.assertEqual(len(list(fsops.walk(self.d, depth=2, include_hidden=True, guard=pol,
+                                             deadline=time.monotonic() + 10, state=st))), 3)
+        self.assertFalse(st["truncated"])
+
+    def test_read_lines_check_called_while_streaming(self):
+        p = self.d / "big.txt"
+        p.write_text("x" * 100 + "\n" + ("y" * 70000 + "\n") * 4, encoding="utf-8")
+        calls = []
+
+        def check() -> None:
+            calls.append(1)
+            if len(calls) >= 2:
+                raise HiveError("timeout", "deadline", {"maybe_executed": False})
+        old = fsops.WHOLE_FILE_MAX
+        fsops.WHOLE_FILE_MAX = 100
+        try:
+            with self.assertRaises(HiveError) as cm:
+                fsops.read_lines(p, 10 ** 9, 10, 65536, check=check)
+        finally:
+            fsops.WHOLE_FILE_MAX = old
+        self.assertEqual(cm.exception.code, "timeout")
+
+    def test_read_lines_masks_cut_edges(self):
+        secret = "SECRETVALUE-0123456789"
+
+        def mask(kept: str, rest: str):
+            both = kept + rest[:len(secret) - 1]
+            i = both.find(secret)
+            if i < 0 or i >= len(kept) or i + len(secret) <= len(kept):
+                return kept, False
+            return kept[:i] + "«secret:S»", True
+        p = self.d / "one.txt"
+        p.write_text("a" * 1990 + secret + "tail\n", encoding="utf-8")
+        r = fsops.read_lines(p, 1, 10, 65536, mask=mask)
+        self.assertNotIn(secret[:10], r["content"])
+        self.assertIn("«secret:S»…[+", r["content"])
+        self.assertTrue(r["masked"])
+        q = self.d / "two.txt"
+        q.write_text("b" * 1020 + secret + "\n", encoding="utf-8")
+        r = fsops.read_lines(q, 1, 10, 1030, mask=mask)
+        self.assertEqual(r["content"], "b" * 1020 + "«secret:S»")
+        self.assertTrue(r["masked"])
+        r = fsops.read_lines(q, 1, 10, 1030)
+        self.assertNotIn("masked", r)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs")
+    def test_fifo_refused_without_blocking(self):
+        f = self.d / "pipe"
+        os.mkfifo(str(f))
+        t0 = time.monotonic()
+        for fn in (lambda: fsops.read_lines(f, 1, 10, 65536), lambda: fsops.open_regular(f)):
+            with self.assertRaises(HiveError) as cm:
+                fn()
+            self.assertEqual(cm.exception.code, "bad_request")
+        self.assertLess(time.monotonic() - t0, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

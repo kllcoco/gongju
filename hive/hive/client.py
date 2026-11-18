@@ -28,6 +28,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 LOCAL_CONNECTION = "this-pc"          # D45: connect("local") uses the agent token connection, never "this-pc-owner"
 LOCAL_HINT = "start it: hive node run (or hive service install node)"
+KIND_RETRY_SECONDS = 30.0             # resolve_kind(): a failed whoami probe is not repeated for this long
 JOB_FINAL = ("exited", "failed", "killed", "timeout", "lost")
 
 
@@ -61,7 +62,15 @@ class Target(Protocol):
 
 
 class HttpTarget(Target):
-    """Target over HttpTransport (§15.2); ``kind`` ("hub" | "node") comes from ``whoami.server.role``."""
+    """Target over HttpTransport (§15.2); ``kind`` ("hub" | "node") comes from ``whoami.server.role``.
+
+    ``kind`` is a plain attribute (``"unknown"`` until known) so attribute access and ``isinstance(t, Target)`` (Python
+    3.9-3.11 call ``hasattr`` on Protocol data members) never touch the network; ``whoami()`` updates it and
+    ``resolve_kind()`` asks the server on purpose.
+    """
+
+    kind: str = "unknown"
+    _kind_failed_at: Optional[float] = None
 
     def __init__(self, transport: Union["HttpTransport", str], token: Optional[str] = None, *,
                  kind: Optional[str] = None, connection: Optional[str] = None, **transport_kw: Any):
@@ -72,27 +81,29 @@ class HttpTarget(Target):
             raise bad_request("token and transport options are given to the HttpTransport, not to HttpTarget")
         self.transport: HttpTransport = transport
         self.connection = connection
-        self._kind: Optional[str] = kind if kind in ("hub", "node") else None
+        self.kind = kind if kind in ("hub", "node") else "unknown"
         self._whoami: Optional[dict] = None
+        self._kind_failed_at = None
 
     @property
     def url(self) -> str:
         """Base URL of the server."""
         return self.transport.url
 
-    @property
-    def kind(self) -> str:  # type: ignore[override]
-        """``"hub"`` or ``"node"`` (one ``GET /v1/whoami`` on first use; ``"unknown"`` while unreachable)."""
-        k = getattr(self, "_kind", None)
-        if k:
-            return k
-        if getattr(self, "transport", None) is None:
+    def resolve_kind(self) -> str:
+        """``kind``, learned with one ``GET /v1/whoami`` while unknown; ``"unknown"`` when that fails (a failed probe
+        is not repeated for KIND_RETRY_SECONDS, so polling callers do not block on an unreachable server)."""
+        if self.kind in ("hub", "node"):
+            return self.kind
+        failed = self._kind_failed_at
+        if failed is not None and time.monotonic() - failed < KIND_RETRY_SECONDS:
             return "unknown"
         try:
             self.whoami()
         except HiveError:
+            self._kind_failed_at = time.monotonic()
             return "unknown"
-        return getattr(self, "_kind", None) or "unknown"
+        return self.kind
 
     def call(self, action: str, params: Optional[dict], *, node: Optional[str] = None,
              timeout: Optional[float] = None, request_id: Optional[str] = None,
@@ -128,7 +139,8 @@ class HttpTarget(Target):
             raise internal(f"unexpected whoami result from {self.url}")
         role = (r.get("server") or {}).get("role") if isinstance(r.get("server"), dict) else None
         if role in ("hub", "node"):
-            self._kind = role
+            self.kind = role
+        self._kind_failed_at = None
         self._whoami = r
         return r
 
@@ -256,6 +268,10 @@ def split_location(spec: str) -> Tuple[str, str]:
         raise bad_request(f"location {spec!r} needs a prefix", hint='use "local:PATH" or "NODE:PATH"')
     where, path = spec.split(":", 1)
     w = where.strip().lower()
+    if len(where) == 1 and where.isascii() and where.isalpha() and path[:1] in ("\\", "/"):
+        # "C:\\data\\f.bin" is a Windows drive path, not node "c"
+        raise bad_request(f"location {spec!r} looks like a Windows drive path",
+                          hint=f'local paths need the local: prefix, e.g. "local:{spec}"')
     if not path or not (w == "local" or w == "self" or valid_name(w)):
         raise bad_request(f"invalid location {spec!r}", hint='use "local:PATH" or "NODE:PATH"')
     return w, path
@@ -572,7 +588,7 @@ def _named(cfg: "ClientConfig", name: str, token: Optional[str], overrides: Dict
     return client
 
 
-def _from_env(cfg: "ClientConfig", token: Optional[str], overrides: Dict[str, Any]) -> Client:
+def _from_env(cfg: Optional["ClientConfig"], token: Optional[str], overrides: Dict[str, Any]) -> Client:
     from .config import Connection
     env = dict(os.environ)
     conn = Connection(url=env["HIVE_URL"].strip(), tls_pin=env.get("HIVE_TLS_PIN") or None)
@@ -585,11 +601,17 @@ def _from_env(cfg: "ClientConfig", token: Optional[str], overrides: Dict[str, An
 
 def _from_config(path: Optional[str], connection: Optional[str], overrides: Dict[str, Any],
                  token: Optional[str] = None) -> Client:
+    if not connection and os.environ.get("HIVE_URL", "").strip():
+        # HIVE_URL comes before HIVE_CONNECTION/default (§14.4): an unreadable client.json must not break env-only
+        # setups (pods, CI); it is loaded tolerantly, like for an explicit URL
+        try:
+            cfg: Optional["ClientConfig"] = _load_cfg(path)
+        except HiveError:
+            cfg = None
+        return _from_env(cfg, token, overrides)
     cfg = _load_cfg(path)
     if connection:
         return _named(cfg, connection, token, overrides)
-    if os.environ.get("HIVE_URL", "").strip():
-        return _from_env(cfg, token, overrides)
     name = os.environ.get("HIVE_CONNECTION", "").strip() or cfg.default
     if not name:
         raise not_found("no Hive connection configured",
@@ -599,19 +621,22 @@ def _from_config(path: Optional[str], connection: Optional[str], overrides: Dict
 
 
 def _from_url(url: str, token: Optional[str], overrides: Dict[str, Any], config_path: Optional[str]) -> Client:
-    """An explicit URL: token = the argument, else HIVE_TOKEN / HIVE_TOKEN_FILE; HIVE_TLS_PIN only for HIVE_URL itself."""
+    """An explicit URL: token = the argument, else HIVE_TOKEN / HIVE_TOKEN_FILE only when HIVE_URL is unset or names
+    this same URL (the env credential stays bound to its host, §5.1/C2); HIVE_TLS_PIN only for HIVE_URL itself."""
     from .config import Connection
     from .transport import HttpTransport
     env = dict(os.environ)
-    tok = token if token is not None else _env_token(env)
-    pin = None
     env_url = env.get("HIVE_URL", "").strip()
-    if env_url and env.get("HIVE_TLS_PIN"):
+    same = False
+    if env_url:
         try:
-            if HttpTransport._parse_url(env_url)["url"] == HttpTransport._parse_url(url)["url"]:
-                pin = env["HIVE_TLS_PIN"]
+            same = HttpTransport._parse_url(env_url)["url"] == HttpTransport._parse_url(url)["url"]
         except HiveError:
-            pin = None
+            same = False
+    tok = token
+    if tok is None and (not env_url or same):
+        tok = _env_token(env)
+    pin = env["HIVE_TLS_PIN"] if (same and env.get("HIVE_TLS_PIN")) else None
     target = _target_for(Connection(url=url, tls_pin=pin), None, tok, None, overrides)
     client = Client(target, default_node=_default_node(None, overrides))
     try:
