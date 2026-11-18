@@ -156,7 +156,7 @@ def read_log(run_dir: Path, logs: Dict[str, str], finished: Any, secrets: Any = 
     if data and start > 0 and util.IS_WINDOWS:
         # Phase 2 review: a range that starts inside an ANSI code page double-byte character skips its trail byte
         ctx_n = min(256, start)
-        k = textlog.dbcs_skip(textlog.read_at(log_path, start - ctx_n, ctx_n), data)
+        k = textlog.dbcs_skip(textlog.read_at(log_path, start - ctx_n, ctx_n), data, aligned_start=ctx_n == start)
         data, start = data[k:], start + k
     _text, consumed = textlog.decode_chunk(data)
     data = data[:consumed]

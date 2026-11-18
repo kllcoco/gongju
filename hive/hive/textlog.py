@@ -364,11 +364,12 @@ def decode_chunk(b: bytes) -> Tuple[str, int]:
     return util.decode_text(b[:consumed]), consumed
 
 
-def dbcs_skip(before: bytes, data: bytes) -> int:
+def dbcs_skip(before: bytes, data: bytes, *, aligned_start: bool = False) -> int:
     """1 when ``data`` starts on the trail byte of a double-byte (GBK/ANSI code page) character whose lead byte is the
     last byte of ``before`` (the bytes preceding ``data`` in the log), else 0. Windows only, and only for text that is
     not UTF-8 (Phase 2 review: a tail cut at an arbitrary byte). Walks forward from the last byte below 0x40 in
-    ``before`` (never a trail byte, so a character boundary)."""
+    ``before`` (never a trail byte, so a character boundary), or from the start of ``before`` when
+    ``aligned_start`` (it begins at the start of the log)."""
     if not util.IS_WINDOWS or not data or not before:
         return 0
     try:
@@ -381,7 +382,7 @@ def dbcs_skip(before: bytes, data: bytes) -> int:
         if before[i] < 0x40:
             start = i
             break
-    if start < 0:
+    if start < 0 and not aligned_start:
         return 0
     pos = start + 1
     n = len(before)

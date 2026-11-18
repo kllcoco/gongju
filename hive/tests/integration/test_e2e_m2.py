@@ -490,9 +490,22 @@ class TestE2EM2(unittest.TestCase):
         self.assertTrue(any(r.get("action") == "shell.run" and r.get("agent") == "claude" for r in prow),
                         prow[-3:])
 
+    @staticmethod
+    def _remove_llm(c: Any, node: str) -> bool:
+        from hive.errors import HiveError
+        try:
+            c.node(node).call("service.remove", {"name": "llm", "wait": 20})
+        except HiveError as e:
+            if e.code != "not_found":
+                raise
+        return True
+
     def _shutdown(self, c: Any) -> None:
         for node in ("desk", "pod-a"):
-            c.node(node).call("service.remove", {"name": "llm", "wait": 20})
+            # Phase 2 review: after the hub/pod restarts a link can still be reconnecting under load; wait until
+            # both are online and retry a call that could not connect (a remove that already ran -> not_found)
+            self.wait_online(node)
+            wait_for(lambda n=node: self._remove_llm(c, n), 90, interval=1.0, what=f"service.remove llm on {node}")
         c.close()
         r = self.pod_cli("node", "stop")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

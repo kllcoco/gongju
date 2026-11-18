@@ -66,7 +66,8 @@ host, port = u.hostname, u.port or (443 if u.scheme == "https" else 80)
 def plain_ok(h):
     # §5.9 rule C1 (as relay.check_hub_url): plaintext only to a loopback/private/tailnet address
     import ipaddress
-    cgnat = ipaddress.ip_network("100.64.0.0/10")
+    nets = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10",
+                                              "fc00::/7")]
 
     def ip_ok(a):
         try:
@@ -75,11 +76,7 @@ def plain_ok(h):
             return False
         if getattr(ip, "ipv4_mapped", None):
             ip = ip.ipv4_mapped
-        if ip.is_loopback or (ip.version == 4 and ip in cgnat):
-            return True
-        if ip.version == 6 and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
-            return True
-        return ip.is_private and not ip.is_link_local and not ip.is_unspecified and not ip.is_reserved
+        return ip.is_loopback or any(ip.version == n.version and ip in n for n in nets)
     h = h.strip("[]")
     if h.lower() in ("localhost",) or ip_ok(h):
         return True

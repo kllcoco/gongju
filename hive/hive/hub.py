@@ -1008,6 +1008,14 @@ class Hub:
                 if not self._inflight:
                     break
             time.sleep(0.05)
+        # Phase 2 review: a probe or call still running when the links were first stopped may have opened a new
+        # keep-alive connection; join the hub threads (prober, reaper) and close the transports once more
+        for t in list(getattr(self, "_threads", [])):
+            if t is not threading.current_thread():
+                t.join(5)
+        self._threads = [t for t in getattr(self, "_threads", []) if t.is_alive()]
+        for link in self.links.values():
+            link.stop()
         if self._started:
             self._audit_event("lifecycle", self.name, {"event": "stop", "exit_code": self.exit_code})
         self._started = False

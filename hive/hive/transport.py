@@ -178,6 +178,14 @@ class _Conn(http.client.HTTPConnection):
     def connect(self) -> None:             # pragma: no cover - auto_open=0 means http.client never calls it
         raise http.client.NotConnected("connection closed")
 
+    def __del__(self) -> None:
+        # Phase 2 review: the keep-alive connection of a finished thread (thread-local) closes its socket when it
+        # is dropped, instead of leaving the fd to the GC
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            pass
+
 
 class HttpTransport:
     """Client transport to a node or hub (§15.1)."""
@@ -419,6 +427,14 @@ class HttpTransport:
             except Exception:  # noqa: BLE001 - best effort
                 pass
         self._local = threading.local()
+
+    def __del__(self) -> None:
+        # Phase 2 review: a dropped transport closes its keep-alive sockets (no fd left to the GC)
+        try:
+            for c in list(self._conns):
+                c.close()
+        except Exception:  # noqa: BLE001 - interpreter shutdown, half-built object
+            pass
 
     # ------------------------------------------------------------------ request helpers
 
