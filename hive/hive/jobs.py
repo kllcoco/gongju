@@ -66,6 +66,27 @@ def display_command(argv_or_cmdline: Union[List[str], str], limit: int = 200) ->
     return text[:limit]
 
 
+def job_owner(identity: Any) -> Optional[str]:
+    """The ``owner`` a job record stores for ``identity`` (``name/agent`` when an agent name is set)."""
+    return getattr(identity, "display_name", None) or getattr(identity, "name", None)
+
+
+def sees_all_jobs(identity: Any) -> bool:
+    """v8.1 (external review): owner/system identities and identities with an ungated shell see and stop every job;
+    an approval-gated identity or one without ``exec`` (readonly/files roles, hub/relay calls flagged exec_gated)
+    sees and stops only the jobs it started (``owner`` equal to its ``job_owner``). Services stay shared."""
+    if identity is None:
+        return True
+    if getattr(identity, "kind", "") in ("owner", "system", "node"):
+        return True
+    from .auth import exec_gated
+    try:
+        gated = bool(getattr(identity, "exec_gated", False)) or exec_gated(identity, identity.require_approval)
+    except Exception:  # noqa: BLE001 - unknown identity shape: the narrow view
+        gated = True
+    return not gated
+
+
 def keep_awake_warnings(keep_awake: bool) -> List[str]:
     """The v7 keep_awake warning on Linux (incl. WSL) for job.start / service.define results, else []."""
     if keep_awake and not util.IS_WINDOWS and not util.IS_MAC:
@@ -584,11 +605,14 @@ class JobManager:
                     pass
 
     # ------------------------------------------------------------------------------------------- views
-    def _rec(self, job_id: str) -> Dict[str, Any]:
+    def _rec(self, job_id: str, owner: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
             rec = self._jobs.get(job_id)
+            if rec is not None and owner is not None and rec.get("owner") != owner:
+                rec = None      # v8.1: another identity's job looks exactly like an unknown one
             if rec is None:
-                recent = sorted(self._jobs.values(), key=lambda r: r.get("created_at") or "", reverse=True)[:5]
+                recent = sorted((r for r in self._jobs.values() if owner is None or r.get("owner") == owner),
+                                key=lambda r: r.get("created_at") or "", reverse=True)[:5]
                 ids = [r["job_id"] for r in recent]
         if rec is None:
             raise not_found(f"job '{job_id}' not found",
@@ -649,10 +673,15 @@ class JobManager:
         self._poll_job(job_id)
         return self.info(job_id, tail_lines)
 
-    def list(self, state: str = "all", limit: int = 20, include_shell: bool = False) -> dict:
-        """job.list rows, newest first."""
+    def check_visible(self, job_id: str, owner: Optional[str]) -> None:
+        """``not_found`` (like an unknown id) when ``owner`` is given and the job belongs to someone else (v8.1)."""
+        self._rec(job_id, owner)
+
+    def list(self, state: str = "all", limit: int = 20, include_shell: bool = False,
+             owner: Optional[str] = None) -> dict:
+        """job.list rows, newest first (only ``owner``'s jobs when given, v8.1)."""
         with self._lock:
-            recs = [dict(r) for r in self._jobs.values()]
+            recs = [dict(r) for r in self._jobs.values() if owner is None or r.get("owner") == owner]
         rows = []
         for r in sorted(recs, key=lambda x: x.get("created_at") or "", reverse=True):
             if r.get("kind") == "shell" and not include_shell:
@@ -865,4 +894,4 @@ class JobManager:
 
 
 __all__ = ["JobManager", "display_command", "read_log", "FINAL", "ExecPlan", "prepare_command", "is_wsl_exe",
-           "keep_awake_warnings", "KEEP_AWAKE_WARNING"]
+           "keep_awake_warnings", "KEEP_AWAKE_WARNING", "job_owner", "sees_all_jobs"]

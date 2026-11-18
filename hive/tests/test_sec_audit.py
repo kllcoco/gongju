@@ -7,7 +7,7 @@ import os
 import unittest
 
 from hive import presets, proctree
-from tests.wp2util import CAUTIOUS, Node
+from tests.wp2util import CAUTIOUS, OPERATOR, OWNER, PY, Node, ident
 
 HAS_BASH = proctree.shell_path("bash") is not None
 POSIX = os.name != "nt"
@@ -98,6 +98,49 @@ class TestReviewCwd(unittest.TestCase):
             self.assertNotIn("echo benign", "\n".join(rv["lines"]))
             self.assertIn("not bound to their content (may change after approval): setup.sh (cwd may change)",
                           rv["lines"][0])
+
+
+class TestJobVisibility(unittest.TestCase):
+    """Audit finding 5: job output and control were open to every token."""
+
+    def test_gated_and_readonly_see_only_their_own_jobs(self):
+        ro = ident(("read",), name="ro")
+        with Node() as n:
+            own = n.ok("job.start", {"argv": [PY, "-c", "print('OWNER-PRIVATE-OUTPUT')"]}, identity=OWNER)["job_id"]
+            env = n.run_approved("job.start", {"argv": [PY, "-c", "import time; print('CAUTIOUS-OUT'); time.sleep(30)"]})
+            self.assertTrue(env["ok"], env)
+            mine = env["result"]["job_id"]
+            self.assertTrue(n.rt.jobs.wait_final(own, 15))
+            for who in (ro, CAUTIOUS):
+                with self.subTest(who=who.name):
+                    ids = [j["job_id"] for j in n.ok("job.list", {}, identity=who)["jobs"]]
+                    self.assertNotIn(own, ids)
+                    for action in ("job.logs", "job.status"):
+                        e = n.err(action, {"job_id": own}, identity=who)
+                        self.assertEqual(e["code"], "not_found")
+                        self.assertNotIn(own, e.get("hint") or "")
+            self.assertEqual(n.err("job.stop", {"job_id": own}, identity=CAUTIOUS)["code"], "not_found")
+            # the cautious agent's own job: visible to it, not to the readonly token
+            self.assertIn(mine, [j["job_id"] for j in n.ok("job.list", {}, identity=CAUTIOUS)["jobs"]])
+            self.assertIn("CAUTIOUS-OUT", str(n.ok("job.logs", {"job_id": mine, "wait": 5}, identity=CAUTIOUS)))
+            self.assertNotIn(mine, [j["job_id"] for j in n.ok("job.list", {}, identity=ro)["jobs"]])
+            self.assertEqual(n.err("job.logs", {"job_id": mine}, identity=ro)["code"], "not_found")
+            # owner and an ungated operator keep seeing (and stopping) every job
+            for who in (OWNER, OPERATOR):
+                ids = [j["job_id"] for j in n.ok("job.list", {}, identity=who)["jobs"]]
+                self.assertTrue({own, mine} <= set(ids), (who.name, ids))
+            self.assertIn("OWNER-PRIVATE-OUTPUT", str(n.ok("job.logs", {"job_id": own}, identity=OPERATOR)))
+            n.ok("job.stop", {"job_id": mine, "force": True}, identity=OPERATOR)
+
+    def test_sees_all_jobs_rule(self):
+        from hive.jobs import sees_all_jobs
+        self.assertTrue(sees_all_jobs(OWNER))
+        self.assertTrue(sees_all_jobs(OPERATOR))
+        self.assertFalse(sees_all_jobs(CAUTIOUS))
+        self.assertFalse(sees_all_jobs(ident(("read",), name="ro")))
+        self.assertFalse(sees_all_jobs(ident(("read", "write"), name="files")))
+        self.assertFalse(sees_all_jobs(ident(name="hub", kind="hub", via="hub", exec_gated=True)))
+        self.assertTrue(sees_all_jobs(ident(name="hub", kind="hub", via="hub")))
 
 
 if __name__ == "__main__":

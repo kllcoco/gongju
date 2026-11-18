@@ -4,11 +4,17 @@ Handlers register with ``@handler(name)`` from ``hive.actions`` and never import
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ..errors import bad_request, cancelled
-from ..jobs import keep_awake_warnings, prepare_command
+from ..jobs import job_owner, keep_awake_warnings, prepare_command, sees_all_jobs
 from . import ActionContext, handler
+
+
+def _only(ctx: ActionContext) -> Optional[str]:
+    """v8.1: the owner filter of job.status/logs/list/stop (None: every job; see ``jobs.sees_all_jobs``)."""
+    return None if sees_all_jobs(ctx.identity) else job_owner(ctx.identity)
+
 
 @handler("job.start")
 def job_start(ctx: ActionContext, p: dict) -> dict:
@@ -52,6 +58,7 @@ def _bounded_wait(ctx: ActionContext, wait: float) -> float:
 def job_status(ctx: ActionContext, p: dict) -> dict:
     """JobInfo, optionally waiting for the job to end."""
     jm = ctx.rt.jobs
+    jm.check_visible(p["job_id"], _only(ctx))
     wait = _bounded_wait(ctx, p.get("wait") or 0)
     if wait > 0:
         jm.wait_final(p["job_id"], wait, ctx.cancel)
@@ -63,6 +70,7 @@ def job_status(ctx: ActionContext, p: dict) -> dict:
 @handler("job.logs")
 def job_logs(ctx: ActionContext, p: dict) -> dict:
     """A range of a job's log (by offset, or the tail)."""
+    ctx.rt.jobs.check_visible(p["job_id"], _only(ctx))
     return ctx.rt.jobs.logs(p["job_id"], offset=p.get("offset"), tail_lines=int(p.get("tail_lines", 100)),
                             max_bytes=int(p.get("max_bytes", 32768)), wait=_bounded_wait(ctx, p.get("wait") or 0),
                             stream=p.get("stream") or "output", raw=bool(p.get("raw")), cancel=ctx.cancel)
@@ -72,12 +80,13 @@ def job_logs(ctx: ActionContext, p: dict) -> dict:
 def job_list(ctx: ActionContext, p: dict) -> dict:
     """Jobs, newest first."""
     return ctx.rt.jobs.list(state=p.get("state") or "all", limit=int(p.get("limit", 20)),
-                            include_shell=bool(p.get("include_shell")))
+                            include_shell=bool(p.get("include_shell")), owner=_only(ctx))
 
 
 @handler("job.stop")
 def job_stop(ctx: ActionContext, p: dict) -> dict:
     """Stop a job (graceful through the shim, hard after grace)."""
+    ctx.rt.jobs.check_visible(p["job_id"], _only(ctx))
     info = ctx.rt.jobs.stop(p["job_id"], force=bool(p.get("force")), grace=float(p.get("grace", 10)))
     ctx.audit_extra.update(job_id=p["job_id"], exit_code=info.get("exit_code"))
     return info
