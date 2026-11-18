@@ -31,7 +31,9 @@ PLACEHOLDER_RE = re.compile(r"«secret:([A-Za-z_][A-Za-z0-9_]{0,127})»")
 SEARCH_SKIP = (".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", "site-packages")
 LIST_CAP = 100_000
 COPY_CAP = 100_000
-REGEX_LINE_CAP = 2048
+REGEX_LINE_CAP = 1024                  # audit round 4: regex mode matches the first 1 KiB of a line
+REGEX_BATCH_CHARS = 1 << 20            # lines sent to the regex worker per exchange
+REGEX_BATCH_LINES = 8192
 TEXT_CAP = 500
 DEADLINE_MARGIN = 1.0
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -666,13 +668,69 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
     pattern = p["pattern"]
     literal, icase = bool(p.get("literal")), bool(p.get("ignore_case"))
     names_only = bool(p.get("names_only"))
-    rx = None
-    if not names_only and not literal:
-        fsops.check_regex(pattern)
-        rx = re.compile(pattern, re.IGNORECASE if icase else 0)
+    regex = not names_only and not literal
+    if regex:
+        fsops.check_regex(pattern, flags=re.IGNORECASE if icase else 0)
     needle = pattern.lower() if icase else pattern
     root = ctx.policy.resolve_path(p.get("path") or ".", must_exist=True)
     deadline = _deadline(ctx)
+    worker = _start_regex_worker(ctx, pattern, icase, deadline) if regex else None
+    try:
+        return _search_loop(ctx, p, root, pattern, needle, icase, names_only, worker, deadline, t0)
+    finally:
+        if worker is not None:
+            worker.close()
+
+
+def _start_regex_worker(ctx: ActionContext, pattern: str, icase: bool, deadline: float) -> Any:
+    """Audit round 4 (DoS): regex matching runs in a ``_regexworker`` child killed at the call deadline; the node
+    process never runs an agent regex."""
+    from .._regexworker import RegexWorker
+    try:
+        w = RegexWorker(pattern, re.IGNORECASE if icase else 0, deadline=deadline, cancel=ctx.cancel)
+    except OSError as e:
+        raise unsupported(f"could not start the regex search worker: {e}", hint="use literal=true")
+    if w.error is not None:
+        raise bad_request(f"invalid regex: {w.error}", hint="simplify or use literal=true")
+    return w
+
+
+class _WorkerStopped(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _regex_hits(worker: Any, lines: List[str]) -> Iterable[int]:
+    """Indices of matching lines (each matched on its first REGEX_LINE_CAP chars), in batches through the
+    worker; raises _WorkerStopped when the worker hit the deadline, was cancelled or died."""
+    start = 0
+    n = len(lines)
+    while start < n:
+        batch: List[str] = []
+        size = 0
+        while start + len(batch) < n and len(batch) < REGEX_BATCH_LINES and size < REGEX_BATCH_CHARS:
+            subject = lines[start + len(batch)][:REGEX_LINE_CAP]
+            batch.append(subject)
+            size += len(subject) + 8
+        hits = worker.search_lines(batch)
+        if hits is None:
+            raise _WorkerStopped("timeout" if worker.timed_out or worker.cancelled else "regex_worker_failed")
+        for i in hits:
+            yield start + i
+        start += len(batch)
+
+
+def _literal_hits(lines: List[str], needle: str, icase: bool, deadline: float) -> Iterable[int]:
+    for i, line in enumerate(lines):
+        if i % 2000 == 0 and time.monotonic() > deadline:
+            raise _WorkerStopped("timeout")
+        if needle in (line.lower() if icase else line):
+            yield i
+
+
+def _search_loop(ctx: ActionContext, p: dict, root: Path, pattern: str, needle: str, icase: bool,
+                 names_only: bool, worker: Any, deadline: float, t0: float) -> dict:
     max_results = int(p.get("max_results", 100))
     ctx_n = int(p.get("context", 0))
     max_file = int(float(p.get("max_file_mb", 10)) * (1 << 20))
@@ -721,29 +779,23 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
             text = whole_mask(text)
         lines = [fsops._strip_eol(x) for x in fsops.split_lines(text)]
         hit_here = False
-        for i, line in enumerate(lines):
-            if i % 2000 == 0 and time.monotonic() > deadline:
-                truncated, reason = True, "timeout"
-                break
-            cut = False
-            if rx is not None:
-                subject = line[:REGEX_LINE_CAP]
-                cut = len(line) > REGEX_LINE_CAP
-                found = rx.search(subject) is not None
-            else:
-                found = needle in (line.lower() if icase else line)
-            if not found:
-                continue
-            hit_here = True
-            row: Dict[str, Any] = {"file": str(fpath), "line": i + 1, "text": _cut(line, mask=mask),
-                                   "before": [_cut(x, mask=mask) for x in lines[max(0, i - ctx_n):i]] if ctx_n else [],
-                                   "after": [_cut(x, mask=mask) for x in lines[i + 1:i + 1 + ctx_n]] if ctx_n else []}
-            if cut:
-                row["cut"] = True
-            matches.append(row)
-            if len(matches) >= max_results:
-                truncated, reason = True, "max_results"
-                break
+        hits = _regex_hits(worker, lines) if worker is not None else _literal_hits(lines, needle, icase, deadline)
+        try:
+            for i in hits:
+                line = lines[i]
+                hit_here = True
+                row: Dict[str, Any] = {
+                    "file": str(fpath), "line": i + 1, "text": _cut(line, mask=mask),
+                    "before": [_cut(x, mask=mask) for x in lines[max(0, i - ctx_n):i]] if ctx_n else [],
+                    "after": [_cut(x, mask=mask) for x in lines[i + 1:i + 1 + ctx_n]] if ctx_n else []}
+                if worker is not None and len(line) > REGEX_LINE_CAP:
+                    row["cut"] = True
+                matches.append(row)
+                if len(matches) >= max_results:
+                    truncated, reason = True, "max_results"
+                    break
+        except _WorkerStopped as stop:
+            truncated, reason = True, stop.reason
         if hit_here:
             matched_files += 1
         if truncated:

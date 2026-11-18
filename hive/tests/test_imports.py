@@ -1,4 +1,4 @@
-"""Layout and review gates (§3, §22.3): 54 importable modules with § docstrings, stdlib only, import rules, greps."""
+"""Layout and review gates (§3, §22.3): 55 importable modules with § docstrings, stdlib only, import rules, greps."""
 from __future__ import annotations
 
 import ast
@@ -24,7 +24,7 @@ LAYOUT = [
     "hive.fsops", "hive.netutil", "hive.netproxy", "hive.hfhub", "hive._download", "hive.sysinfo", "hive.gpu",
     "hive.procinfo", "hive.wsl", "hive.install", "hive.doctor", "hive.transport", "hive.relay", "hive.hub",
     "hive.gateway", "hive.client", "hive.transfer", "hive.dist", "hive.tools", "hive.render", "hive.guides",
-    "hive.mcp", "hive.cli",
+    "hive.mcp", "hive.cli", "hive._regexworker",
 ]
 WP1 = ("config", "auth", "policy", "limits", "approvals", "audit", "secretstore", "httpserver", "node")
 
@@ -61,9 +61,9 @@ def _stdlib_names():
 
 
 class TestLayout(unittest.TestCase):
-    def test_54_modules(self):
+    def test_55_modules(self):
         found = [module_name(p) for p in py_files()]
-        self.assertEqual(len(found), 54)
+        self.assertEqual(len(found), 55)
         self.assertEqual(sorted(found), sorted(LAYOUT))
 
     def test_every_module_imports_with_docstring(self):
@@ -75,7 +75,7 @@ class TestLayout(unittest.TestCase):
                 if name != "hive":
                     self.assertRegex(doc, r"§\d+", name)
         names = [m.name for m in pkgutil.walk_packages(hive.__path__, "hive.")]
-        self.assertEqual(len(names) + 1, 54)
+        self.assertEqual(len(names) + 1, 55)
 
     def test_package_metadata(self):
         self.assertEqual(hive.__version__, "1.0.0")

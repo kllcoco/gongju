@@ -18,6 +18,7 @@ import shutil
 import site
 import sys
 import sysconfig
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -130,6 +131,9 @@ DEFAULT_EXEC_PATHS: Tuple[str, ...] = (
     "~/AppData/Roaming/VSCodium/User/**", "~/.config/Cursor/User/**", "~/Library/Application Support/Cursor/User/**",
     "~/AppData/Roaming/Cursor/User/**", "**/.git/config.worktree", "**/.git/worktrees/*/config.worktree",
     "~/.gradle/gradle.properties", "**/.npmrc",
+    # v8.1 (audit round 2, verification): Python bytecode (a planted tool.pyc or __pycache__/tool.<tag>.pyc runs in
+    # place of a bound tool.py) and a gitfile (.git as a file whose "gitdir:" points at a folder with its own config)
+    "**/__pycache__/**", "**/*.pyc", "**/.git",
 )
 
 DEFAULT_COMMAND_DENY: Tuple[str, ...] = (
@@ -317,6 +321,7 @@ class Policy:
         # deny lists
         self.deny = self._patterns(fs.get("deny") or (), remap_wsl=True)
         self.deny_write_cfg = self._patterns(fs.get("deny_write") or (), remap_wsl=True)
+        self._live_alts: Tuple[float, List[str]] = (-1e9, [])
         self.has_deny_write = bool(fs.get("deny_write"))
         # hard denies
         self.hard_deny_all: List[str] = []
@@ -461,6 +466,31 @@ class Policy:
             if alt not in out:
                 out.append(alt)
         return out
+
+    def live_deny_write(self) -> List[str]:
+        """``deny_write_cfg`` plus the real targets of literal prefixes that are symbolic links NOW (v8.1, audit round
+        2 verification): ``_norm_pattern`` resolves them once at start, but a dotfile manager (stow, rcm, dotbot) can
+        link ``~/.bashrc`` or ``~/.config/systemd`` after that. Recomputed at most every 2 s."""
+        t, alts = self._live_alts
+        now = time.monotonic()
+        if now - t > 2.0:
+            alts = []
+            for pat in self.deny_write_cfg:
+                if pat.startswith("**"):
+                    continue
+                lit = _literal_prefix(pat)
+                if not lit:
+                    continue
+                try:
+                    real = self._cf(path_key(os.path.realpath(lit), casefold=False))
+                except (OSError, ValueError):
+                    continue
+                if real != lit:
+                    alt = _escape_glob(real) + pat[len(lit):]
+                    if alt not in alts and alt not in self.deny_write_cfg:
+                        alts.append(alt)
+            self._live_alts = (now, alts)
+        return list(self.deny_write_cfg) + alts
 
     def _patterns(self, items: Iterable[str], remap_wsl: bool = False) -> List[str]:
         out: List[str] = []
@@ -851,7 +881,58 @@ class EffectivePolicy:
                 continue
         return out
 
-    def _deny_reason(self, key: str, real: str, *, write: bool) -> Optional[HiveError]:
+    def _hop_keys(self, named: str) -> List[str]:
+        """Keys of the path as named, lexically normalized, and of each form it takes while its symbolic links are
+        followed one hop at a time (v8.1, audit round 2 verification): exec paths are matched against all of them,
+        so ``~/.bashrc -> dotfiles/bashrc`` or ``~/.config/systemd -> ../dotfiles/config/systemd`` is denied when
+        written through the link as well as at its target."""
+        try:
+            s = os.path.abspath(named)
+        except (TypeError, ValueError):
+            return []
+        forms = [os.path.normpath(s)]
+        parts = Path(s).parts
+        if not parts:
+            return []
+        cur = parts[0]
+        for i in range(1, len(parts)):
+            nxt = os.path.join(cur, parts[i])
+            rest = parts[i + 1:]
+            hops = 0
+            while hops < 40 and os.path.islink(nxt):
+                hops += 1
+                forms.append(os.path.normpath(os.path.join(nxt, *rest)))
+                try:
+                    tgt = os.readlink(nxt)
+                except OSError:
+                    break
+                nxt = os.path.normpath(os.path.join(os.path.dirname(nxt), tgt))
+                forms.append(os.path.normpath(os.path.join(nxt, *rest)))
+            cur = os.path.realpath(nxt)
+        out: List[str] = []
+        for f in forms:
+            k = self.p._key_real(f)
+            if k not in out:
+                out.append(k)
+        return out
+
+    @staticmethod
+    def _bare_repo_shape(real: str) -> bool:
+        """Writing ``config`` beside a ``HEAD`` (or ``HEAD`` beside a ``config``) makes the folder look like a bare
+        git repository; git run inside it reads that config (core.fsmonitor, hooksPath: commands)."""
+        base = os.path.basename(real.rstrip("/\\"))
+        if IS_WINDOWS or IS_MAC:
+            other = {"config": "HEAD", "head": "config"}.get(base.casefold())
+        else:
+            other = {"config": "HEAD", "HEAD": "config"}.get(base)
+        if other is None:
+            return False
+        try:
+            return os.path.lexists(os.path.join(os.path.dirname(real), other))
+        except (OSError, ValueError):
+            return False
+
+    def _deny_reason(self, key: str, real: str, *, write: bool, named: Optional[str] = None) -> Optional[HiveError]:
         if match_deny(self.p.hard_deny_all, key) or ".hive" in [c.casefold() for c in key.split("/")]:
             return denied(f"path '{real}' is internal to Hive", rule="hive_internal",
                           hint="Hive's own data, config, tokens and secrets cannot be read or changed through "
@@ -866,8 +947,10 @@ class EffectivePolicy:
                           rule="hive_internal", hint="Hive's code and Python installation are never writable through "
                                                      "actions. " + SECRET_HINT)
         if self._gated:
-            if self.p.has_deny_write and (match_deny(self.p.deny_write_cfg, key) or match_deny(self.p.path_deny, key)
-                                          or self._venv_bin(real)):
+            keys = [key] + [k for k in (self._hop_keys(named) if named else []) if k != key]
+            pats = self.p.live_deny_write() if self.p.has_deny_write else []
+            if self.p.has_deny_write and (any(match_deny(pats, k) or match_deny(self.p.path_deny, k) for k in keys)
+                                          or self._venv_bin(real) or self._bare_repo_shape(real)):
                 return denied(f"path '{real}' can make code run later (autostart, shell profile, hooks, PATH)",
                               rule="exec_path", hint=EXEC_PATH_HINT)
             if match_deny(self._service_code_patterns(), key):
@@ -921,7 +1004,7 @@ class EffectivePolicy:
         if root is None or (write and root.mode != "rw"):
             raise self._roots_error(real, write)
         # 7. denies (deny wins over roots)
-        err = self._deny_reason(key, real, write=write)  # includes held files of approved calls (gated writes)
+        err = self._deny_reason(key, real, write=write, named=s)  # incl. held files of approved calls (gated writes)
         if err is not None:
             raise err
         # 8. subtree
@@ -944,7 +1027,7 @@ class EffectivePolicy:
             pats += list(self.p.hard_deny_write)
             if self._gated:
                 if self.p.has_deny_write:
-                    pats += list(self.p.deny_write_cfg) + list(self.p.path_deny)
+                    pats += self.p.live_deny_write() + list(self.p.path_deny)
                 pats += self._service_code_patterns()
         return pats
 

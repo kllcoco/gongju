@@ -94,25 +94,54 @@ class Headers(dict):
         return isinstance(key, str) and dict.__contains__(self, key.lower())
 
 
-# audit round 4: the depth pre-scan runs at C speed (it was a pure-Python byte loop, ~2 s per 48 MiB body).
-# Strings are cut out (an unterminated one runs to the end, so the scan stays linear), brackets mapped to ( and ).
-_JSON_STR_RE = re.compile(rb'"[^"\\]*(?:\\.[^"\\]*)*(?:"|\\?\Z)', re.S)
-_JSON_NON_BRACKETS = bytes(range(256)).translate(None, b"[]{}")
+# audit round 4: the depth pre-scan runs at C speed (it was a pure-Python byte loop, ~2 s per 48 MiB body). Escapes
+# are dropped (backslash pairs, then backslash-quote: left to right, exactly as JSON pairs them), everything but
+# brackets and quotes is deleted, brackets become ( and ), then the strings are cut out.
+_JSON_KEEP_DELETE = bytes(range(256)).translate(None, b'[]{}"')
 _JSON_BRACKETS = bytes.maketrans(b"[{]}", b"(())")
+_JSON_QUOTED_RE = re.compile(rb'"[^"]*(?:"|\Z)')
 _JSON_RUN_RE = re.compile(rb"\(+|\)+")
+
+
+def _json_strip_strings(s: bytes) -> bytes:
+    """Remove quoted segments from a sequence of ``()"`` (an unterminated one runs to the end)."""
+    s = s.replace(b'""', b"")         # an empty string, or two strings with nothing between them: drop or merge
+    q = s.count(b'"')
+    if q == 0:
+        return s
+    if q > 4096:
+        return _JSON_QUOTED_RE.sub(b"", s)
+    out: List[bytes] = []
+    i = 0
+    while True:
+        a = s.find(b'"', i)
+        if a < 0:
+            out.append(s[i:])
+            break
+        out.append(s[i:a])
+        b = s.find(b'"', a + 1)
+        if b < 0:
+            break
+        i = b + 1
+    return b"".join(out)
 
 
 def json_depth_ok(data: bytes, limit: int = MAX_JSON_DEPTH) -> bool:
     """Bracket-depth pre-scan (strings skipped); False when nesting exceeds ``limit``.
 
-    Never True for a body whose parse would nest deeper than ``limit`` (unbalanced brackets, i.e. invalid JSON, may
-    give False where the parse fails anyway). Each ``()``-removal pass lowers the deepest point by exactly one; the
-    rest is the maximum prefix sum over bracket runs (itertools.accumulate)."""
+    Never True for a body whose parse would nest deeper than ``limit`` (invalid JSON, e.g. unbalanced brackets or a
+    backslash outside a string, may give False where the parse fails anyway). Each ``()``-removal pass lowers the
+    deepest point by at most one; the rest is the exact maximum prefix sum over bracket runs (itertools.accumulate).
+    About 0.1 s per 48 MiB of ordinary JSON, ~1.3 s for adversarial bracket soup (whose json.loads costs more)."""
     data = bytes(data)
     if data.count(b"[") + data.count(b"{") <= limit:
         return True
-    s = _JSON_STR_RE.sub(b"", data) if b'"' in data else data
-    s = s.translate(_JSON_BRACKETS, _JSON_NON_BRACKETS)
+    s = data
+    if b"\\" in s:
+        s = s.replace(b"\\\\", b"").replace(b'\\"', b"")
+    s = s.translate(_JSON_BRACKETS, _JSON_KEEP_DELETE)
+    if b'"' in s:
+        s = _json_strip_strings(s)
     passes = 0
     while True:
         if s.count(b"(") <= limit - passes:

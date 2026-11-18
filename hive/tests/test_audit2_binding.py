@@ -119,7 +119,8 @@ class TestScriptOperand(unittest.TestCase):
             self.assertIn(p, words)
             self.assertIn(p, quiet)        # bound as missing without a header item each
         words = plan("python -m pkg.sub")[0]
-        self.assertEqual([w for w in words if w.startswith("./")], ["./pkg.py", "./pkg/__init__.py", "./pkg/sub.py"])
+        self.assertEqual([w for w in words if w.startswith("./")], ["./pkg.py", "./pkg/__init__.py", "./pkg/sub.py",
+                                                                     "./pkg.pyc", "./pkg/__init__.pyc", "./pkg/sub.pyc"])
         for cmd in ("python -I -m tool", "python -P -m tool", "python -Im tool"):   # cwd not on sys.path
             with self.subTest(cmd=cmd):
                 self.assertFalse([w for w in plan(cmd)[0] if w.startswith("./")])

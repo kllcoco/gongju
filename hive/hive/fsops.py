@@ -522,10 +522,141 @@ def _read_quant(p: str, i: int) -> Tuple[bool, bool, int, int]:
     return unb, True, j, upper
 
 
-def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN) -> "re.Pattern[str]":
+# Audit round 4: a sample alphabet stands in for character sets when comparing what two quantified atoms can
+# consume (ASCII + Latin-1 + a few case-folding / Unicode-category representatives)
+_SAMPLE = "".join(chr(i) for i in range(256)) + "ſİıKé中٣ 　Ａ"
+_CAT_RX = {}
+
+
+def _sre_parser() -> Any:
+    p = getattr(re, "_parser", None)          # 3.11+: sre_parse is deprecated (and warns) in favour of re._parser
+    if p is None:  # pragma: no cover - Python < 3.11
+        import sre_parse as p                 # type: ignore[no-redef]
+    return p
+
+
+def _charset(items: Any, icase: bool, dotall: bool, P: Any) -> frozenset:
+    """Sample chars an atom (LITERAL / NOT_LITERAL / ANY / IN, or any subpattern: the union of its leaves) can
+    consume; a conservative over-approximation for anything else."""
+    out = set()
+    for op, av in items:
+        name = str(op)
+        if name == "LITERAL":
+            out.add(chr(av))
+        elif name == "NOT_LITERAL":
+            out.update(c for c in _SAMPLE if c != chr(av))
+        elif name == "ANY":
+            out.update(c for c in _SAMPLE if dotall or c != "\n")
+        elif name == "IN":
+            neg = any(str(o) == "NEGATE" for o, _a in av)
+            members = set()
+            for o, a in av:
+                on = str(o)
+                if on == "LITERAL":
+                    members.add(chr(a))
+                elif on == "RANGE":
+                    members.update(c for c in _SAMPLE if a[0] <= ord(c) <= a[1])
+                elif on == "CATEGORY":
+                    cat = str(a)
+                    rx = _CAT_RX.get(cat)
+                    if rx is None:
+                        src = {"CATEGORY_DIGIT": r"\d", "CATEGORY_NOT_DIGIT": r"\D", "CATEGORY_SPACE": r"\s",
+                               "CATEGORY_NOT_SPACE": r"\S", "CATEGORY_WORD": r"\w",
+                               "CATEGORY_NOT_WORD": r"\W"}.get(cat, r"[\s\S]")
+                        rx = _CAT_RX[cat] = re.compile(src)
+                    members.update(c for c in _SAMPLE if rx.match(c))
+            out.update(c for c in _SAMPLE if (c in members) != neg)
+        elif name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+            out |= _charset(av[2], icase, dotall, P)
+        elif name in ("SUBPATTERN", "ATOMIC_GROUP"):
+            out |= _charset(av[-1] if name == "SUBPATTERN" else av, icase, dotall, P)
+        elif name == "BRANCH":
+            for alt in av[1]:
+                out |= _charset(alt, icase, dotall, P)
+        elif name in ("AT", "ASSERT", "ASSERT_NOT"):
+            continue
+        else:
+            out.update(_SAMPLE)
+    if icase:
+        out |= {c.lower() for c in out} | {c.upper() for c in out}
+        out &= set(_SAMPLE)
+    return frozenset(out)
+
+
+def _overlap_problem(pattern: str, flags: int = 0) -> Optional[str]:
+    r"""Audit round 4: polynomial backtracking without nested quantifiers. Two unbounded quantifiers over
+    overlapping characters with only optional items between (``A*A*``, ``\w+\d+``, ``.*\s*``) are refused, and so
+    is a chain of three unbounded quantifiers whose characters overlap, joined only by atoms all of them can
+    consume (``.*a.*a.*c``): both make ``search`` cubic or worse on one line. Returns a message or None."""
+    P = _sre_parser()
+    try:
+        tree = P.parse(pattern, flags)
+    except Exception:  # noqa: BLE001 - re.compile reports the syntax error
+        return None
+    state = getattr(tree, "state", None) or getattr(tree, "pattern", None)
+    gflags = int(getattr(state, "flags", flags) or 0)
+    icase, dotall = bool(gflags & re.IGNORECASE), bool(gflags & re.DOTALL)
+    maxrep = getattr(P, "MAXREPEAT", None)
+
+    def walk(items: Any, st: Dict[str, Any]) -> Optional[str]:
+        for op, av in items:
+            name = str(op)
+            if name in ("AT", "ASSERT", "ASSERT_NOT"):
+                continue
+            if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+                lo, hi, body = av
+                inner = walk(body, {"inter": None, "count": 0, "adjacent": False})
+                if inner:
+                    return inner
+                cs = _charset(body, icase, dotall, P)
+                if hi == maxrep or hi >= REPEAT_INF:
+                    if st["inter"] is not None and st["inter"] & cs:
+                        if st["adjacent"]:
+                            return "adjacent unbounded quantifiers over overlapping characters"
+                        st["count"] += 1
+                        st["inter"] = st["inter"] & cs
+                        if st["count"] >= 3:
+                            return "three unbounded quantifiers over overlapping characters"
+                    else:
+                        st["inter"], st["count"] = cs, 1
+                    st["adjacent"] = True
+                    continue
+                if lo == 0:
+                    continue                  # optional: whatever is on both sides stays adjacent
+                atom = cs
+            elif name == "SUBPATTERN":
+                err = walk(av[-1], st)
+                if err:
+                    return err
+                continue
+            elif name in ("LITERAL", "NOT_LITERAL", "ANY", "IN"):
+                atom = _charset([(op, av)], icase, dotall, P)
+            elif name == "BRANCH":
+                for alt in av[1]:
+                    err = walk(alt, dict(st))
+                    if err:
+                        return err
+                st.update(inter=None, count=0, adjacent=False)
+                continue
+            else:
+                st.update(inter=None, count=0, adjacent=False)
+                continue
+            if st["inter"] is not None and st["inter"] & atom:
+                st["inter"] = st["inter"] & atom
+                st["adjacent"] = False
+            else:
+                st.update(inter=None, count=0, adjacent=False)
+        return None
+
+    return walk(tree, {"inter": None, "count": 0, "adjacent": False})
+
+
+def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN, flags: int = 0) -> "re.Pattern[str]":
     """Compile an agent-supplied regex after the §9.7 safety rules; ``bad_request`` hint "simplify or use
     literal=true" when it is longer than ``max_len``, has a quantified group containing a quantifier or ``|``,
-    more than 4 unbounded quantifiers, or a back-reference."""
+    more than 4 unbounded quantifiers, a back-reference, or (audit round 4) adjacent unbounded quantifiers over
+    overlapping characters / a chain of three of them (``_overlap_problem``). Agent regexes still only ever run
+    in the ``_regexworker`` child (fs.search, ready_pattern): these rules are defence in depth."""
     if not isinstance(pattern, str):
         raise bad_request("pattern must be a string")
     hint = "simplify or use literal=true"
@@ -541,8 +672,11 @@ def check_regex(pattern: str, *, max_len: int = REGEX_MAX_LEN) -> "re.Pattern[st
                           hint=hint)
     if unbounded > MAX_UNBOUNDED:
         raise bad_request(f"regex has {unbounded} unbounded quantifiers (max {MAX_UNBOUNDED})", hint=hint)
+    overlap = _overlap_problem(pattern, flags)
+    if overlap:
+        raise bad_request(f"regex has {overlap} (catastrophic backtracking)", hint=hint)
     try:
-        rx = re.compile(pattern)
+        rx = re.compile(pattern, flags)
     except (re.error, OverflowError, RecursionError) as e:
         raise bad_request(f"invalid regex: {e}", hint=hint)
     if rx.flags & re.VERBOSE:      # belt and braces: the scan above must have seen every flag group

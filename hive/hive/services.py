@@ -42,6 +42,8 @@ NO_HEALTH_ALIVE_S = 3.0
 SHORT_RUN_S = 60.0
 MAX_BACKOFF_S = 300.0
 STOP_EXTRA_S = 7.0
+READY_LINE_CAP = 1024               # audit round 4: ready_pattern matches the first 1 KiB of each new log line
+READY_MATCH_S = 5.0                 # ... in the _regexworker child, killed after this long
 DOCKER_RECHECK_S = 15.0
 DOCKER_WAIT_MAX_S = 600.0
 CONTAINER_CACHE_S = 10.0
@@ -1305,16 +1307,36 @@ class ServiceManager:
             return
         try:
             from .fsops import check_regex
-            rx = check_regex(str(pat))
+            check_regex(str(pat))
         except HiveError:
             return
         r = textlog.read_range(self._run_dir(name) / "output.log", off, 1 << 20, None)
+        with self._lock:
+            if rs.get("_ready_seen") == (gen, r["next_offset"]):
+                return                          # no new output since the last check
         text = util.decode_text(r["data"])
         with self._lock:
             if rs.get("_gen") == gen:
                 rs["_ready_offset"] = max(off, r["next_offset"] - 256)
-        if rx.search(text):
+                rs["_ready_seen"] = (gen, r["next_offset"])
+        if self._ready_match(str(pat), text):
             self._apply_health(name, gen, True, None, None)
+
+    @staticmethod
+    def _ready_match(pattern: str, text: str) -> bool:
+        """Audit round 4 (DoS): ``ready_pattern`` is matched per log line (first 1 KiB of each) in the
+        ``_regexworker`` child with a 5 s limit, never in the node process (no match when it fails)."""
+        from ._regexworker import RegexWorker
+        lines = [ln[:READY_LINE_CAP] for ln in text.splitlines()]
+        if not lines:
+            return False
+        try:
+            with RegexWorker(pattern, 0, deadline=time.monotonic() + READY_MATCH_S) as w:
+                hits = w.search_lines(lines)
+        except OSError as e:
+            log.warning("ready_pattern worker could not start: %s", e)
+            return False
+        return bool(hits)
 
     # ------------------------------------------------------------------------------------------- deletion
     def _delete(self, name: str, *, delete_logs: bool) -> None:

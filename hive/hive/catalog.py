@@ -823,7 +823,7 @@ def _specs() -> List[ActionSpec]:
                                         "text": _any("Matched line or null."),
                                         "before": _a(_s("Line."), "Context before."),
                                         "after": _a(_s("Line."), "Context after."),
-                                        "cut": _b("Match within the first 2 KiB of a longer line.")}), "Matches."),
+                                        "cut": _b("Match within the first 1 KiB of a longer line.")}), "Matches."),
                      "files_scanned": _i("Files scanned."), "files_matched": _i("Files with matches."),
                      "truncated": _b("Stopped early."), "reason": _any("Why it stopped (timeout, max_results) or null."),
                      "elapsed_s": _n("Seconds.")}, ("matches", "files_scanned", "files_matched", "truncated")),
