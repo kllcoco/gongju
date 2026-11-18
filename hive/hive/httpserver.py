@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-from .errors import CODES, HiveError, bad_request, forbidden, internal, rate_limited, unavailable
+from .errors import CODES, HiveError, bad_request, forbidden, internal, rate_limited, too_large, unavailable
 from .util import IS_WINDOWS, ip_category, is_loopback_host, new_id
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -103,45 +103,82 @@ _JSON_QUOTED_RE = re.compile(rb'"[^"]*(?:"|\Z)')
 _JSON_RUN_RE = re.compile(rb"\(+|\)+")
 
 
-def _json_strip_strings(s: bytes) -> bytes:
-    """Remove quoted segments from a sequence of ``()"`` (an unterminated one runs to the end)."""
-    s = s.replace(b'""', b"")         # an empty string, or two strings with nothing between them: drop or merge
-    q = s.count(b'"')
-    if q == 0:
-        return s
-    if q > 4096:
-        return _JSON_QUOTED_RE.sub(b"", s)
-    out: List[bytes] = []
-    i = 0
-    while True:
-        a = s.find(b'"', i)
-        if a < 0:
-            out.append(s[i:])
-            break
-        out.append(s[i:a])
-        b = s.find(b'"', a + 1)
-        if b < 0:
-            break
-        i = b + 1
-    return b"".join(out)
+JSON_SLICE = 1 << 20
+MAX_JSON_CONTAINERS = 1 << 18          # arrays + objects per request body (verification round 4)
+MAX_RELAY_JSON_CONTAINERS = 1 << 20    # relay results (listings) may hold more
+
+
+def _json_bracket_seq(data: bytes, max_open: Optional[int]) -> Optional[bytes]:
+    """The brackets outside strings as a ``()`` sequence, or None when it holds more than ``max_open`` opening
+    brackets (or more than twice that in all).
+
+    Verification round 4 (DoS): built in JSON_SLICE pieces with the string / escape state carried across, so no
+    single C call (translate, the quoted-segment sub) runs over a whole 48 MiB body holding the GIL; one '"[' body
+    froze the server for 1.6 s. Escapes: backslash pairs dropped, then backslash-quote, left to right as JSON pairs
+    them; a lone backslash at the end of a piece pairs with the next one."""
+    parts: List[bytes] = []
+    total = opened = 0
+    carry = b""
+    in_str = False
+    cap_all = None if max_open is None else 2 * max_open + 2 * MAX_JSON_DEPTH
+    view = memoryview(data)
+    for i in range(0, len(data), JSON_SLICE):
+        piece = carry + bytes(view[i:i + JSON_SLICE])
+        carry = b""
+        if b"\\" in piece:
+            piece = piece.replace(b"\\\\", b"")
+            if piece.endswith(b"\\"):
+                carry, piece = b"\\", piece[:-1]
+            piece = piece.replace(b'\\"', b"")
+        piece = piece.translate(_JSON_BRACKETS, _JSON_KEEP_DELETE)
+        if in_str:
+            j = piece.find(b'"')
+            if j < 0:
+                continue
+            piece, in_str = piece[j + 1:], False
+        if b'"' in piece:
+            if piece.count(b'"') % 2:
+                piece, in_str = piece[:piece.rfind(b'"')], True
+            piece = _JSON_QUOTED_RE.sub(b"", piece)
+        opened += piece.count(b"(")
+        total += len(piece)
+        if max_open is not None and (opened > max_open or (cap_all is not None and total > cap_all)):
+            return None
+        parts.append(piece)
+    return b"".join(parts)
+
+
+def json_body_problem(data: bytes, limit: int = MAX_JSON_DEPTH,
+                      max_containers: Optional[int] = MAX_JSON_CONTAINERS) -> Optional[str]:
+    """None, "deep" (nesting over ``limit``) or "containers" (more than ``max_containers`` arrays/objects outside
+    strings): checked before ``json.loads``, whose output is ~24x a body of empty containers (verification round
+    4: 40 x 48 MiB '[],' bodies drove a hub to 13 GB)."""
+    data = bytes(data)
+    naive = data.count(b"[") + data.count(b"{")
+    if naive <= limit and (max_containers is None or naive <= max_containers):
+        return None
+    s = _json_bracket_seq(data, max_containers)
+    if s is None:
+        return "containers"
+    return None if _depth_ok(s, limit) else "deep"
 
 
 def json_depth_ok(data: bytes, limit: int = MAX_JSON_DEPTH) -> bool:
     """Bracket-depth pre-scan (strings skipped); False when nesting exceeds ``limit``.
 
     Never True for a body whose parse would nest deeper than ``limit`` (invalid JSON, e.g. unbalanced brackets or a
-    backslash outside a string, may give False where the parse fails anyway). Each ``()``-removal pass lowers the
-    deepest point by at most one; the rest is the exact maximum prefix sum over bracket runs (itertools.accumulate).
-    About 0.1 s per 48 MiB of ordinary JSON, ~1.3 s for adversarial bracket soup (whose json.loads costs more)."""
+    backslash outside a string, may give False where the parse fails anyway)."""
     data = bytes(data)
     if data.count(b"[") + data.count(b"{") <= limit:
         return True
-    s = data
-    if b"\\" in s:
-        s = s.replace(b"\\\\", b"").replace(b'\\"', b"")
-    s = s.translate(_JSON_BRACKETS, _JSON_KEEP_DELETE)
-    if b'"' in s:
-        s = _json_strip_strings(s)
+    s = _json_bracket_seq(data, None)
+    assert s is not None
+    return _depth_ok(s, limit)
+
+
+def _depth_ok(s: bytes, limit: int) -> bool:
+    """Depth of a ``()`` sequence at most ``limit``. Each ``()``-removal pass lowers the deepest point by at most
+    one; the rest is the exact maximum prefix sum over bracket runs (itertools.accumulate)."""
     passes = 0
     while True:
         if s.count(b"(") <= limit - passes:
@@ -166,6 +203,16 @@ def json_depth_ok(data: bytes, limit: int = MAX_JSON_DEPTH) -> bool:
     return max(itertools.accumulate(runs)) <= limit - passes
 
 
+def check_json_body(data: bytes, max_containers: Optional[int] = MAX_JSON_CONTAINERS) -> None:
+    """bad_request "JSON nested too deeply" / too_large (more than ``max_containers`` arrays and objects)."""
+    problem = json_body_problem(data, MAX_JSON_DEPTH, max_containers)
+    if problem == "deep":
+        raise bad_request("JSON nested too deeply")
+    if problem == "containers":
+        raise too_large(f"JSON body holds more than {max_containers} arrays/objects",
+                        hint="send fewer items per request")
+
+
 @dataclass
 class Request:
     """One HTTP request as seen by a route handler (path params are in ``query`` under their names)."""
@@ -181,12 +228,12 @@ class Request:
     request_id: str = ""
     cancel: threading.Event = field(default_factory=threading.Event)
 
-    def json(self) -> Any:
-        """Body as JSON; bad_request on invalid JSON or nesting deeper than 64."""
+    def json(self, max_containers: Optional[int] = MAX_JSON_CONTAINERS) -> Any:
+        """Body as JSON; bad_request on invalid JSON or nesting deeper than 64, too_large with more than
+        ``max_containers`` arrays/objects (checked before parsing)."""
         if not self.body:
             return None
-        if not json_depth_ok(self.body):
-            raise bad_request("JSON nested too deeply")
+        check_json_body(self.body, max_containers)
         try:
             return json.loads(self.body.decode("utf-8"))
         except RecursionError:
@@ -1375,4 +1422,5 @@ class _Conn:
             raise _Closed()
 
 
-__all__ = ["AUTH_MODES", "ROUTE_MODES", "Request", "ApiServer", "Headers", "json_depth_ok", "tailscale_info"]
+__all__ = ["AUTH_MODES", "ROUTE_MODES", "Request", "ApiServer", "Headers", "json_depth_ok", "check_json_body",
+           "json_body_problem", "tailscale_info"]

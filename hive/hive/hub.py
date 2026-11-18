@@ -1907,7 +1907,8 @@ def build_server(hub: Hub) -> "ApiServer":
         return {"bound": True, "pending": pending, "refused": None}
 
     def _relay_body(req: "Request") -> Tuple[RelayLink, dict]:
-        body = req.json()
+        from .httpserver import MAX_RELAY_JSON_CONTAINERS
+        body = req.json(max_containers=MAX_RELAY_JSON_CONTAINERS)   # verification round 4: capped before parsing
         if not isinstance(body, dict):
             raise bad_request("body must be a JSON object")
         ident = req.identity

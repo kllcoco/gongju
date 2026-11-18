@@ -262,6 +262,8 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
         model: Any = None
         stream = False
         if req.method == "POST":
+            from .httpserver import check_json_body
+            check_json_body(body)        # verification round 4: depth / container cap before json.loads
             try:
                 obj = json.loads(body.decode("utf-8")) if body else None
             except (UnicodeDecodeError, ValueError, RecursionError):

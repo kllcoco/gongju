@@ -696,9 +696,12 @@ def http_handler(core_factory: Callable[..., McpCore], *, sessions: Optional[Htt
             return _http_json(400, _err(None, INVALID_REQUEST, f"unsupported MCP-Protocol-Version {pv[:40]!r}; "
                                                                f"supported: {', '.join(SUPPORTED_VERSIONS)}"))
         body = req.body or b""
-        from .httpserver import json_depth_ok
-        if not json_depth_ok(body):
+        from .httpserver import json_body_problem
+        problem = json_body_problem(body)
+        if problem == "deep":
             return _http_json(400, _err(None, INVALID_REQUEST, "JSON nested too deeply"))
+        if problem == "containers":     # verification round 4: refused before json.loads (memory amplification)
+            return _http_json(413, _err(None, INVALID_REQUEST, "JSON body holds too many arrays/objects"))
         try:
             msg = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):

@@ -398,6 +398,10 @@ class TestBodiesBeforeRead(unittest.TestCase):
             self.release.set()
             self.assertIn(b"200 OK", _read_response(first))
             self.assertIn(b"200 OK", _read_response(o))
+        for _ in range(100):         # the server thread releases its share just after writing the response
+            if self.s.api.body_budget.used == 0:
+                break
+            time.sleep(0.02)
         self.assertEqual(self.s.api.body_budget.used, 0)
 
     def test_pre_body_short_circuit(self):
