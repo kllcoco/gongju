@@ -40,6 +40,8 @@ CACHE_TTL = 600.0
 MAX_PAGES = 20
 MAX_PAGE_BYTES = 16 << 20
 MAX_ENTRIES = 200_000                  # audit round 4: listing entries in all (a hostile mirror cannot exhaust memory)
+CONTAINERS_PER_ENTRY = 4               # verification round 4: JSON arrays/objects per listing entry, checked before
+MAX_PATH_CHARS = 4096                  # parsing; entries with longer paths are skipped
 CACHE_MAX_ENTRIES = 20_000             # only listings up to this many files are cached (64 of them at most)
 TOO_MANY_HINT = ("the repository lists too many files to pull with model.pull (include/exclude only filter the "
                  "listing); download the files you need with net.download, or ask the owner")
@@ -161,9 +163,18 @@ def clear_cache() -> None:
         _cache.clear()
 
 
-def _json(r: "netutil.HttpResult", what: str) -> Any:
+def _json(r: "netutil.HttpResult", what: str, max_containers: Optional[int] = None, repo: str = "") -> Any:
     if r.truncated:
         raise too_large(f"{what} is larger than {MAX_PAGE_BYTES >> 20} MiB", hint="use include to narrow the files")
+    if max_containers is not None:
+        # verification round 4: a 16 MiB page of '{}' parsed to +360 MiB before the entry count was checked
+        from .httpserver import json_body_problem
+        problem = json_body_problem(r.body, 64, max(16, max_containers))
+        if problem == "containers":
+            raise _too_many(repo)
+        if problem == "deep":
+            raise unavailable(f"{what}: the server sent JSON nested too deeply", reason="upstream",
+                              maybe_executed=False, status=r.status)
     try:
         return json.loads(r.body.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -242,7 +253,7 @@ def _hf_list(endpoint: str, repo: str, repo_type: str, revision: str, guard: Any
         r = _request(url, guard, auth, end)
         if r.status != 200:
             raise _hf_error(r, repo, endpoint)
-        page = _json(r, "file listing")
+        page = _json(r, "file listing", CONTAINERS_PER_ENTRY * (MAX_ENTRIES - seen) + 16, repo)
         if not isinstance(page, list):
             raise unavailable("the file listing is not a list", reason="upstream", maybe_executed=False)
         seen += len(page)
@@ -255,7 +266,8 @@ def _hf_list(endpoint: str, repo: str, repo_type: str, revision: str, guard: Any
             lfs = e.get("lfs") if isinstance(e.get("lfs"), dict) else None
             if lfs is not None and isinstance(lfs.get("size"), int):
                 size = lfs["size"]
-            if not isinstance(path, str) or not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            if not isinstance(path, str) or not isinstance(size, int) or isinstance(size, bool) or size < 0 \
+                    or len(path) > MAX_PATH_CHARS:
                 continue
             sha256 = None
             git_sha1 = None
@@ -294,7 +306,7 @@ def _ms_list(endpoint: str, repo: str, revision: str, guard: Any, auth: Optional
              end: float) -> Tuple[str, List[RepoFile]]:
     url = (f"{endpoint}/api/v1/models/{repo}/repo/files?Revision={quote(revision, safe='')}&Recursive=true")
     r = _request(url, guard, auth, end)
-    data = _json(r, "file listing") if r.status == 200 else None
+    data = _json(r, "file listing", CONTAINERS_PER_ENTRY * MAX_ENTRIES + 16, repo) if r.status == 200 else None
     if r.status != 200 or not isinstance(data, dict) or data.get("Success") is False \
             or data.get("Code") not in (None, 200):
         if r.status == 200 and not isinstance(data, dict):
@@ -312,7 +324,8 @@ def _ms_list(endpoint: str, repo: str, revision: str, guard: Any, auth: Optional
         if not isinstance(e, dict) or e.get("Type") not in ("blob", "file"):
             continue
         path, size = e.get("Path"), e.get("Size")
-        if not isinstance(path, str) or not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        if not isinstance(path, str) or not isinstance(size, int) or isinstance(size, bool) or size < 0 \
+                or len(path) > MAX_PATH_CHARS:
             continue
         sha = str(e.get("Sha256") or "").lower()
         files.append(RepoFile(path=path, size=int(size), sha256=sha if SHA256_RE.match(sha) else None,

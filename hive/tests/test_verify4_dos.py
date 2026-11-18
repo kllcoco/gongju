@@ -179,6 +179,46 @@ class TestListenBacklog(unittest.TestCase):
                 c.close()
 
 
+class TestHfListingPrecount(unittest.TestCase):
+    def setUp(self):
+        from hive import hfhub
+        self.hf = hfhub
+        hfhub.clear_cache()
+        self.addCleanup(hfhub.clear_cache)
+
+    def run_list(self, page_body: bytes, source: str = "huggingface"):
+        from types import SimpleNamespace
+
+        def req(url, guard, auth, end):
+            body = json.dumps({"sha": "a" * 40}).encode() if "/revision/" in url else page_body
+            return SimpleNamespace(status=200, body=body, headers={}, truncated=False)
+        with mock.patch.object(self.hf, "_request", req), \
+                mock.patch.object(self.hf.json, "loads", wraps=json.loads) as loads:
+            try:
+                return self.hf.list_repo(source, "https://hf.test", "org/repo", "model", "main", guard=None,
+                                         auth=None, deadline=time.monotonic() + 30), loads
+            except HiveError as e:
+                return e, loads
+
+    def test_container_soup_refused_unparsed(self):
+        body = b"[" + b"{}," * ((16 << 20) // 3 - 1) + b"{}]"            # 16 MiB of '{}'
+        t0 = time.monotonic()
+        e, loads = self.run_list(body)
+        self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(e.code, "too_large")
+        self.assertEqual(loads.call_count, 1)                           # only the revision info was parsed
+        ms = json.dumps({"Code": 200, "Data": {"Files": [{}] * 900_000}}).encode()
+        e, _l = self.run_list(ms, "modelscope")
+        self.assertEqual(e.code, "too_large")
+
+    def test_long_paths_skipped(self):
+        page = [{"type": "file", "path": "p" * 5000, "size": 1, "oid": "b" * 40},
+                {"type": "file", "path": "ok.bin", "size": 1, "oid": "b" * 40,
+                 "lfs": {"oid": "c" * 64, "size": 1, "pointerSize": 120}}]
+        (sha, files), _l = self.run_list(json.dumps(page).encode())
+        self.assertEqual([f.path for f in files], ["ok.bin"])
+
+
 class TestHubBodies(_HubMcp):
     def test_mcp_and_call_refuse_container_soup(self):
         body = b"[" + b"[]," * (1 << 20) + b"[]]"
