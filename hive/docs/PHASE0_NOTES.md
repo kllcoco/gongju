@@ -2278,3 +2278,6 @@ FA-C4. **`mcp-config --remove`:** `--remove --write` is a usage error (exit 2, n
     config says "nothing to remove: <path> does not exist" (not "no "hive" entry in <path>").
 FA-check. Full suite after these fixes: 1557 tests, OK (13 skipped) on Python 3.13 and 3.9, run while a real node
     listened on 127.0.0.1:7701 and a real hub on 127.0.0.1:7700 (their request logs: no contact from any test).
+FA-check (after FA-C1..C4). Full suite: 1561 tests, OK (13 skipped) on Python 3.13 and 3.9, run while logging
+    listeners held 127.0.0.1:7700 and 127.0.0.1:7701 (no request from any test); `test_e2e_m3_pull` in 3 parallel
+    loops: 12 of 12 runs passed.
