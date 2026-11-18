@@ -573,6 +573,8 @@ class ServiceManager:
         for i, name in enumerate(names):
             if i and self._stop.wait(AUTOSTART_STAGGER_S):
                 return
+            if self._stop.is_set():     # QA L1: never spawn once shutdown() began
+                return
             try:
                 self._system_spawn(name, count_restart=False)
             except Exception:  # noqa: BLE001
@@ -582,6 +584,19 @@ class ServiceManager:
         """Stop the supervisor; services keep running unless ``services.stop_on_exit`` (then the shim stop
         sequence runs, so stop_command runs too)."""
         cfg = getattr(getattr(getattr(self.rt, "config", None), "policy", None), "services", None) or {}
+        # QA L1: stop spawning first: the staggered autostart (and supervisor restarts) end before the stop-on-exit
+        # pass, so a service the autostart was spawning is stopped too instead of starting after it
+        self._stop.set()
+        at = getattr(self, "_autostart_thread", None)
+        if at is not None:
+            at.join(10)
+            self._autostart_thread = None
+        end = time.monotonic() + 10.0     # ... and so do supervisor restarts already handed to the pool
+        while time.monotonic() < end:
+            with self._lock:
+                if not any(k.startswith("spawn:") for k in self._busy):
+                    break
+                self._cond.wait(0.05)
         if cfg.get("stop_on_exit"):
             waits = []
             for name in list(self._rs):
@@ -595,15 +610,10 @@ class ServiceManager:
             end = time.monotonic() + min(30.0, max(waits or [0]))
             while time.monotonic() < end and any(self._alive(n) for n in list(self._rs)):
                 time.sleep(0.2)
-        self._stop.set()
         t = self._thread
         if t is not None:
             t.join(3)
         self._thread = None
-        at = getattr(self, "_autostart_thread", None)
-        if at is not None:       # Phase 2 review: a staggered autostart never spawns after the shutdown
-            at.join(5)
-            self._autostart_thread = None
         with self._lock:
             proctree.adopt_popens([rs.get("_popen") for rs in self._rs.values() if rs.get("_popen") is not None])
         if self._pool is not None:
@@ -1503,9 +1513,14 @@ class ServiceManager:
             if rs is None:
                 return True
             st, hl = rs.get("state"), rs.get("health")
+            pending = st == "stopped" and rs.get("desired") == "running" and not rs.get("_manual")
         if st == "running" and hl in ("healthy", "none"):
             return True
         if st == "running" and hl == "unknown" and rs.get("adopted"):
+            return False
+        if pending and self._started and not self._stop.is_set():
+            # QA F2: queued for the (staggered) boot-time autostart or a supervisor spawn: not settled yet, so
+            # service.status wait=N right after a node start reports the started service, not "stopped"
             return False
         return st in ("failed", "stopped", "backoff")
 

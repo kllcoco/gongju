@@ -459,12 +459,13 @@ class JobManager:
         try:
             h = proctree.spawn_shim(spec, rd)
         except Exception as e:  # noqa: BLE001 - never leave a "starting" record without a shim behind
+            self._release_hold(jid)     # QA F1: released before the final state is visible
             with self._lock:
                 rec.update(state="failed", error=e.message if isinstance(e, HiveError) else str(e)[:500],
                            ended_at=util.iso_utc())
-                self._cond.notify_all()
             self._save(rec)
-            self._release_hold(jid)
+            with self._lock:
+                self._cond.notify_all()
             raise
         with self._lock:
             rec.update(shim_pid=h.shim_pid, shim_ctime=h.shim_ctime)
@@ -595,6 +596,10 @@ class JobManager:
                 elif upd.get("state") != "killed" and not upd.get("error"):
                     if upd.get("exit_code") not in (0, None) or upd.get("state") == "lost":
                         upd["error"] = textlog.last_line(self._main_log(jid, rec)) or "download failed"
+            # QA F1: the job's process is gone, so its approved files are released BEFORE the final state is
+            # published; a waiter woken by the final state (wait_final, a yielded shell.run) never finds the file
+            # still held. wait_final/wait also wait out _finalizing, so the record is saved by then too.
+            self._release_hold(jid)
             with self._lock:
                 if rec.get("state") == "starting" and upd.get("state") != "failed" and rec.get("started_at") is None:
                     rec["started_at"] = rec.get("created_at")
@@ -602,9 +607,7 @@ class JobManager:
                 popen = self._popen.pop(jid, None)
                 if popen is not None and popen.poll() is None:
                     self._orphans.append(popen)    # the shim is finishing after exit.json: reaped by the reaper
-                self._cond.notify_all()
             self._save(rec)
-            self._release_hold(jid)
         finally:
             with self._lock:
                 self._finalizing.discard(jid)
@@ -727,7 +730,7 @@ class JobManager:
         while True:
             self._poll_job(job_id)
             with self._lock:
-                if self._jobs[job_id].get("state") in FINAL:
+                if self._jobs[job_id].get("state") in FINAL and job_id not in self._finalizing:
                     return True
                 left = end - time.monotonic()
                 if left <= 0 or (cancel is not None and cancel.is_set()):
@@ -752,7 +755,7 @@ class JobManager:
         while True:
             self._poll_job(job_id)
             with self._lock:
-                if self._jobs[job_id].get("state") in FINAL:
+                if self._jobs[job_id].get("state") in FINAL and job_id not in self._finalizing:
                     break
                 left = end - time.monotonic()
                 if left <= 0 or (cancel is not None and cancel.is_set()):

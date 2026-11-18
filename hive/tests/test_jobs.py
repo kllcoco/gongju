@@ -251,6 +251,40 @@ class TestJobManager(JobCase):
         self.assertTrue(self.rt.jobs.wait_final(info["job_id"], 10))
         holds.release.assert_called_once_with("ho_test")
 
+    def test_hold_released_before_final_state_is_published(self):
+        """QA F1: _finalize published the final state (waking wait_final) before releasing the hold, so a waiter
+        could find the approved file still held. A blocked record write makes the window deterministic."""
+        holds = mock.Mock()
+        holds.paths.return_value = ["/w/run.sh"]
+        self.rt.holds = holds
+        jm = self.rt.jobs
+        ctx = helpers.make_ctx("job.start", runtime=self.rt)
+        ctx.hold = "ho_f1"
+        gate = self.rt.workdir / "g"
+        info = jm.start_job(ctx, kind="job", argv_or_cmdline=[PY, "-c", f"import os,time\nwhile not "
+                            f"os.path.exists({str(gate)!r}): time.sleep(0.05)"], shell="none",
+                            cwd=self.rt.workdir, env=dict(os.environ), stdin=None, name=None, timeout=0,
+                            merge_stderr=True, log_max_bytes=1 << 20)
+        jid = info["job_id"]
+        in_save, go = threading.Event(), threading.Event()
+        real_save = jm._save
+
+        def slow_save(rec):
+            if rec.get("job_id") == jid and rec.get("state") in jobs.FINAL and not in_save.is_set():
+                in_save.set()
+                go.wait(10)
+            real_save(rec)
+        self.addCleanup(go.set)
+        with mock.patch.object(jm, "_save", slow_save):
+            gate.write_text("x")
+            self.assertTrue(in_save.wait(15))          # the finalizer is writing the final record
+            holds.release.assert_called_once_with("ho_f1")     # ... and the file is already released
+            self.assertFalse(jm.wait_final(jid, 0.2))  # waiters wait until the record is saved too
+            go.set()
+            self.assertTrue(jm.wait_final(jid, 10))
+        holds.release.assert_called_once_with("ho_f1")
+        self.assertIn(util.read_json(jm.run_dir(jid) / "job.json")["state"], jobs.FINAL)
+
     def test_prune(self):
         info, _ = self.start_job([PY, "-c", "pass"])
         info2, _ = self.start_job([PY, "-c", "pass"], kind="shell")
