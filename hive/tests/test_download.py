@@ -145,6 +145,22 @@ class TestOpenDownload(DownloadCase):
             netutil.open_download(f"http://127.0.0.1:{helpers.free_port()}/x", guard=guard())
         self.assertEqual((cm.exception.details["reason"], cm.exception.details["maybe_executed"]), ("connect", False))
 
+    def test_close_unread_stream_closes_connection(self):
+        """Review fix: closing the chunk iterator without reading it (non-2xx answers) closes the connection."""
+        closed: List[Any] = []
+        real_close = netutil._Conn.close
+
+        def spy(conn: Any) -> None:
+            closed.append(conn)
+            real_close(conn)
+        with mock.patch.object(netutil._Conn, "close", spy):
+            status, _h, _f, chunks = netutil.open_download(self.srv.url + "/missing", guard=guard())
+            self.assertEqual(status, 404)
+            self.assertEqual(closed, [])
+            chunks.close()
+            self.assertEqual(len(closed), 1)
+            self.assertIsNone(closed[0].sock)
+
     def test_through_connect_proxy(self):
         self.srv.add_file("/f.bin", DATA)
         px_settings = None
@@ -503,6 +519,36 @@ class TestNetDownloadHandler(unittest.TestCase):
             self.assertEqual(st["exit_code"], 5, st)
             self.assertIn("denied", st["error"] or "")
             self.assertFalse((node.home / ".kube" / "config").exists())
+
+    def test_audit_route_dns(self):
+        """Review fix (§5.4 NetGuard rule 8): net.download records route and dns in audit extra."""
+        with helpers.StubHTTPServer() as srv, wp2util.Node() as node:
+            srv._httpd.handle_error = lambda *a: None
+            srv.add_file("/a.bin", DATA[:10])
+            r = node.ok("net.download", {"url": srv.url + "/a.bin", "path": str(node.home / "a.bin")})
+            node.ok("job.status", {"job_id": r["job_id"], "wait": 30})
+            extra = node.rt.audit.tail(10, action="net.download")[-1]["extra"]
+            self.assertEqual((extra["route"], extra["dns"], extra["job_id"]), ("direct", "local", r["job_id"]))
+
+    def test_venv_bin_folder_refused_for_gated_identity(self):
+        """Review fix (§5.4 PathGuard step 7, v7): a server-named download into ``<venv>/bin`` is refused for a
+        gated identity like fs.write of a file there; the operator may still do it."""
+        with helpers.StubHTTPServer() as srv, wp2util.Node() as node:
+            srv._httpd.handle_error = lambda *a: None
+            srv.add("GET", "/t", 200, b"#!/bin/sh\n", {"Content-Disposition": 'attachment; filename="pytest"'})
+            venv = node.home / "proj" / "venv"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            e = node.err("fs.write", {"path": str(venv / "bin" / "pytest"), "content": "x"},
+                         identity=wp2util.CAUTIOUS)
+            self.assertEqual((e["code"], e["details"]["rule"]), ("policy_denied", "exec_path"))
+            e = node.err("net.download", {"url": srv.url + "/t", "path": str(venv / "bin")},
+                         identity=wp2util.CAUTIOUS)
+            self.assertEqual((e["code"], e["details"]["rule"]), ("policy_denied", "exec_path"))
+            self.assertEqual(os.listdir(str(venv / "bin")), [])
+            r = node.ok("net.download", {"url": srv.url + "/t", "path": str(venv / "bin")})
+            st = node.ok("job.status", {"job_id": r["job_id"], "wait": 30})
+            self.assertEqual(st["exit_code"], 0, st)
 
     def test_handler_refusals(self):
         with wp2util.Node() as node:

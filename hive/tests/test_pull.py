@@ -3,6 +3,7 @@ NodeRuntime (jobs) and in-process ``_download.run`` where DNS must be stubbed (C
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -119,6 +120,46 @@ class TestPlan(PullCase):
         self.assertEqual(sorted(r["skipped_invalid"]), ["bad:name.json", "con.txt"])
         self.assertNotIn("con.txt", [f["path"] for f in r["files"]])
 
+    def test_hive_names_and_case_duplicates(self):
+        """Review fix: repo files named like Hive's manifest/lock or ``*.hive-part``, or with a segment the
+        filesystem cannot hold, are skipped_invalid; names that collide after casefolding are skipped_unsafe."""
+        files = dict(FILES)
+        files[".hive-pull.json"] = b"{}"
+        files[".hive-pull.lock"] = b"x"
+        files["config.json.hive-part"] = b"x"
+        files["sub/" + "模型" * 42 + ".bin"] = b"x"         # 252 bytes + .hive-part > NAME_MAX
+        files["readme.md"] = b"# lower\n"
+        self.hf.repos[REPO] = Repo(files)
+        r = self.pull(dry_run=True)
+        self.assertEqual(sorted(r["skipped_invalid"]), sorted([".hive-pull.json", ".hive-pull.lock",
+                                                               "config.json.hive-part", "sub/" + "模型" * 42 + ".bin"]))
+        self.assertIn("readme.md", [f["path"] for f in r["files"]])       # case-sensitive here: two files
+        from hive import policy as policy_mod
+        real_key = policy_mod.EffectivePolicy.path_key
+
+        def folded(self_: Any, path: Any, *, follow: bool = True) -> str:
+            return real_key(self_, path, follow=follow).casefold()
+        with mock.patch.object(policy_mod.EffectivePolicy, "path_key", folded):
+            r = self.pull(dry_run=True)
+        names = [f["path"] for f in r["files"]]
+        self.assertEqual(sum(1 for n in names if n.casefold() == "readme.md"), 1)
+        self.assertIn("would be skipped (unsafe destination)", r["note"])
+
+    def test_symlinked_lock_refused(self):
+        """Review fix: model.pull refuses a target whose .hive-pull.lock / .hive-pull.json is a symbolic link."""
+        t = self.models / "org--model"
+        t.mkdir(parents=True)
+        victim = self.node.home / "victim.txt"
+        victim.write_text("precious")
+        for name in (".hive-pull.lock", ".hive-pull.json"):
+            with self.subTest(name=name):
+                os.symlink(str(victim), str(t / name))
+                e = self.pull_err(overwrite=True)
+                self.assertEqual(e["code"], "conflict")
+                self.assertIn("symbolic link", e["message"])
+                os.unlink(str(t / name))
+        self.assertEqual(victim.read_text(), "precious")
+
     def test_errors(self):
         e = self.pull_err(repo="org/nope", dry_run=True)
         self.assertEqual(e["code"], "not_found")
@@ -215,6 +256,8 @@ class TestPullJobs(PullCase):
         self.assertEqual((man["repo"], man["commit"], man["source"]), (REPO, self.hf.repos[REPO].commit,
                                                                        "huggingface"))
         self.assertIsNotNone(man["completed_at"])
+        extra = self.node.rt.audit.tail(10, action="model.pull")[-1]["extra"]      # §5.4 NetGuard rule 8
+        self.assertEqual((extra["route"], extra["dns"], extra["job_id"]), ("direct", "local", r["job_id"]))
         self.assertEqual(man["files"]["model-00001-of-00002.safetensors"]["hash"],
                          "sha256:" + hashlib.sha256(BIG).hexdigest())
         self.assertEqual(man["files"]["config.json"]["hash"], "sha1:" + git_sha1(FILES["config.json"]))
@@ -469,11 +512,69 @@ class TestChildPull(unittest.TestCase):
             other = util.FileLock(str(self.tmp / "t" / ".hive-pull.lock"))
             self.assertTrue(other.acquire(note="j_other"))
             try:
-                with RunDir():
+                with RunDir(), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
                     code = _download.run(self.spec(hf, guard()))
             finally:
                 other.release()
             self.assertEqual(code, 6)
+            self.assertEqual(out.getvalue().strip().splitlines()[-1], "error: another pull into this folder is running")
+            self.assertFalse([q for q in hf.requests if q["kind"] == "file"])
+
+    def test_same_size_other_content_conflict(self):
+        """W6 / §21.2: an existing file outside the manifest with the listed size but another hash fails that file
+        (overwrite=false) and is left untouched."""
+        with HFStub({REPO: Repo(FILES)}) as hf:
+            t = self.tmp / "t"
+            t.mkdir()
+            other = bytes(b ^ 0x20 for b in FILES["config.json"])
+            (t / "config.json").write_bytes(other)
+            with RunDir(), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                code = _download.run(self.spec(hf, guard()))
+            self.assertEqual(code, 1)
+            last = out.getvalue().strip().splitlines()[-1]
+            self.assertTrue(last.startswith("error: 1 file(s) failed: config.json"), last)
+            self.assertIn("config.json exists with other content (use overwrite=true)", last)
+            self.assertEqual((t / "config.json").read_bytes(), other)
+            with RunDir():
+                code = _download.run(self.spec(hf, guard(), overwrite=True))
+            self.assertEqual((code, (t / "config.json").read_bytes()), (0, FILES["config.json"]))
+
+    def test_dest_creates_nothing_behind_a_symlink(self):
+        """Review fix (§11.3): no folder is created through a component planted as a symlink to the outside."""
+        t = self.tmp / "t"
+        t.mkdir()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        os.symlink(str(outside), str(t / "tok"))
+        with HFStub({REPO: Repo(FILES)}) as hf:
+            puller = _download.Puller(self.spec(hf, guard()), guard(), None, threading.Event())
+        self.assertIsNone(puller._dest("tok/sub/deeper/x.json"))
+        self.assertIsNone(puller._dest("tok/x.json"))
+        self.assertEqual(os.listdir(str(outside)), [])
+        d = puller._dest("a/b/c.json")
+        self.assertEqual(d, Path(os.path.realpath(str(t))) / "a" / "b" / "c.json")
+        self.assertTrue((t / "a" / "b").is_dir())
+        # Hive's own names are never a destination
+        for rel in (".hive-pull.json", ".hive-pull.lock", "x.bin.hive-part"):
+            self.assertIsNone(puller._dest(rel), rel)
+
+    def test_symlinked_lock_or_manifest_refused(self):
+        """Review fix: a symlinked .hive-pull.lock / .hive-pull.json is refused before anything is written."""
+        with HFStub({REPO: Repo(FILES)}) as hf:
+            t = self.tmp / "t"
+            t.mkdir()
+            victim = self.tmp / "victim.txt"
+            for name in (".hive-pull.lock", ".hive-pull.json"):
+                with self.subTest(name=name):
+                    victim.write_text("precious")
+                    os.symlink(str(victim), str(t / name))
+                    with RunDir(), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                        code = _download.run(self.spec(hf, guard()))
+                    self.assertEqual(code, 1)
+                    self.assertIn("is a symbolic link", out.getvalue())
+                    self.assertEqual(victim.read_text(), "precious")
+                    self.assertTrue(os.path.islink(str(t / name)))
+                    os.unlink(str(t / name))
             self.assertFalse([q for q in hf.requests if q["kind"] == "file"])
 
     def test_through_connect_proxy(self):
@@ -506,9 +607,6 @@ class TestChildPull(unittest.TestCase):
             self.assertFalse((self.tmp / "t" / ".hive-pull.lock").exists())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 @unittest.skipUnless(os.environ.get("HIVE_LIVE_NET") == "1", "live network check (set HIVE_LIVE_NET=1)")
 class TestLiveListing(unittest.TestCase):
@@ -532,3 +630,7 @@ class TestLiveListing(unittest.TestCase):
                                         deadline=time.monotonic() + 60)
         self.assertRegex(commit, r"^[0-9a-f]{40}$")
         self.assertTrue(any(f.path == "config.json" and f.sha256 for f in files))
+
+
+if __name__ == "__main__":
+    unittest.main()
