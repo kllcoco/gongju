@@ -423,7 +423,9 @@ def _sleep(seconds: float, stop: threading.Event) -> None:
 def _disposition_name(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
-    m = re.search(r"filename\*\s*=\s*([^']*)'[^']*'([^;]+)", value, re.IGNORECASE)
+    # audit round 4: charset and language are bounded and stop at ';' (``[^']*`` rescanned the header from every
+    # "filename*=", quadratic on a hostile 64 KiB header)
+    m = re.search(r"filename\*\s*=\s*([^';]{0,64})'[^';]{0,64}'([^;]+)", value, re.IGNORECASE)
     if m:
         try:
             return unquote(m.group(2).strip().strip('"'), encoding=(m.group(1) or "utf-8").strip() or "utf-8",

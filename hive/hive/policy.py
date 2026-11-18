@@ -168,6 +168,19 @@ WRITE_METHODS_SAFE = ("GET", "HEAD", "OPTIONS")
 OPENAI_SUFFIXES = ("/models", "/chat/completions", "/completions", "/embeddings")
 _HIVE_CMD_RE = re.compile(r"(?i)(-m\s+hive\b|hive\.pyz|[\\/]hive(\.exe)?\b|\bhive(\.exe)?\b)[^\n]*?\b"
                           r"(node|hub|mcp|_shim|_download)\b")
+# audit round 4 (DoS): _HIVE_CMD_RE.search re-scanned the rest of the line from every "hive" (a local process with a
+# 100 KB "hive hive …" argv took 20+ s in check_kill); _is_hive_cmd answers the same question in linear time
+_HIVE_START_RE = re.compile(r"(?i)-m\s+hive\b|hive\.pyz|[\\/]hive(\.exe)?\b|\bhive(\.exe)?\b")
+_HIVE_ROLE_RE = re.compile(r"(?i)\b(node|hub|mcp|_shim|_download)\b")
+
+
+def _is_hive_cmd(text: str) -> bool:
+    """A Hive start token followed later on the same line by node/hub/mcp/_shim/_download (``_HIVE_CMD_RE``)."""
+    for line in text.split("\n"):
+        m = _HIVE_START_RE.search(line)
+        if m is not None and _HIVE_ROLE_RE.search(line, m.end()) is not None:
+            return True
+    return False
 MAX_WALK = 100000
 SECRET_HINT = "Do not try to work around node policy; ask the user."
 EXEC_PATH_HINT = "writing this file would make it run code later; ask the owner"
@@ -1300,7 +1313,7 @@ class EffectivePolicy:
             raise denied(f"process {pid} ({info.get('name')}) is protected", rule="kill_protect", hint=SECRET_HINT)
         cmd = info.get("cmdline")
         text = " ".join(str(c) for c in cmd) if isinstance(cmd, list) else str(cmd or "")
-        if text and _HIVE_CMD_RE.search(text):
+        if text and _is_hive_cmd(text):
             raise denied(f"process {pid} is a Hive process", rule="kill_protect",
                          hint="use hive node stop, job_stop or service_control")
         if pid in self._special_pids():

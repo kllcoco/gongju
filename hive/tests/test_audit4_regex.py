@@ -87,6 +87,15 @@ class TestLinearRedaction(unittest.TestCase):
         for s in ("<" * 65536, "<" + "a" * 65536 + ">; rel=next"):
             with Timed(self, "hfhub.LINK_NEXT_RE", 0.5):
                 hfhub.LINK_NEXT_RE.search(s)
+        from hive import _download, policy
+        for s in ("hive " * (MB // 5), "/hive " * (MB // 6), "-m hive " * (MB // 8), "-m" + " " * MB):
+            with self.subTest(cmd=s[:6]), Timed(self, "policy._is_hive_cmd", 0.5):
+                self.assertFalse(policy._is_hive_cmd(s))
+        self.assertTrue(policy._is_hive_cmd("x\n/usr/bin/python3 -m hive node run --config c"))
+        self.assertFalse(policy._is_hive_cmd("hive\nnode"))
+        with Timed(self, "_download._disposition_name", 0.5):
+            _download._disposition_name("filename*=" * 6500)
+        self.assertEqual(_download._disposition_name("attachment; filename*=UTF-8''na%C3%AFve.txt"), "naïve.txt")
         self.assertTrue(presets.text_may_change_cwd("a;\n  $X"))
         self.assertTrue(presets.text_may_change_cwd("x\n. ./env"))
         self.assertEqual(hfhub.LINK_NEXT_RE.search('<https://h/x?p=2>; rel="next"').group(1), "https://h/x?p=2")
