@@ -1402,3 +1402,53 @@ M2-7. **M2 observations (no change made):**
       M2 tests start nodes before the hub.
     - `hive join` without `--pod` keeps the node listener on the default `127.0.0.1:7701`; two joined nodes on one
       machine (tests running in parallel) collide, so the tests move it to a free port.
+
+## M3 integration (lead, §22.1 step 6)
+
+(Items numbered M3-1… . Tests in `tests/integration/`: `test_e2e_m3_pull.py` (model.pull), `test_e2e_m3_netproxy.py`
+(netproxy routes + fake-ip), `test_e2e_m3_docker.py` (docker preset), `test_m3_wsl.py` (WSL keepalive, unit level
+on a real NodeRuntime), `test_e2e_m3_tools.py` (every `full` tool + the counts); helpers `m3util.py`
+(`NodeDaemon`: `hive init node` + `hive node run` under m2util's restart-on-75 `Supervisor`; `McpSession`; a test-only
+fake-DNS `sitecustomize`).)
+
+M3-1. **CONTRACT-REQUEST (M3 → WP3 `netutil.py`, behaviour fix):** an absolute-form (plain `http://`) request through
+    the proxy that the proxy answered with 407 was mapped to `unavailable` reason `proxy_auth` only when no
+    `Proxy-Authorization` had been sent; with configured but refused credentials (`http://user:wrong@…`) the agent got
+    the proxy's 407 as if it were the target's HTTP response (`net.http` ok:true status 407, a download failing with
+    "HTTP 407"). Now every 407 on such a hop is `proxy_auth` ("the proxy refused the credentials in network.proxy"),
+    like `open_tunnel` for CONNECT (§11.4).
+M3-2. **CONTRACT-REQUEST (M3 → WP1 `node.py`, behaviour fix):** `node.panic` (run offline by `hive node panic`)
+    resolved `docker` and services' stop commands on the CLI process's fail-safe trusted PATH (§10.1: PATH minus
+    home/cwd/temp + fixed dirs) instead of the node's (`exec.path_prepend` + PATH minus rw roots, §5.4), so a docker CLI
+    reachable only through `path_prepend` (or a PATH dir the fail-safe default drops) was not found and labelled
+    containers kept running (`containers: 0`). New private helper `_offline_trusted_path(cfg, data_dir)` builds the
+    node `Policy` (as `doctor` does) and calls `proctree.set_trusted_path(policy.trusted_path)` before
+    `services.panic_offline`; failures keep the default. The PATH is still the CLI's own environment (the owner's
+    shell), as for every offline command.
+M3-3. **CONTRACT-REQUEST (M3 → WP1 `config.py`, schema fix):** `wsl.keepalive[].command` was validated as a string,
+    but §20.7 step 6 gives it as an argv list (`["/bin/sh","-lc","exec $HOME/.hive/node/run-node.sh"]`, run by
+    `wsl.exe --exec` without a shell) and `wsl.Keepalive._argv` only uses a list: the documented form was rejected at
+    load and a string was silently replaced by `/bin/sleep infinity`. Now `command` is `null` or an array of 1–64
+    non-empty strings (≤ 4096 chars each). `init node --wsl-keepalive` still writes `command: null`.
+M3-4. **Interpretations in the tests (no code change):**
+    - Fake-ip end to end: the node and its `_download` children get a test `sitecustomize` on `PYTHONPATH` (kept by
+      `self_env()`) that answers `getaddrinfo` for listed names only (`HIVE_TEST_FAKE_DNS`); names resolving only to
+      `198.18.0.0/15` go through the proxy **by hostname** (absolute-form for http, `CONNECT name:443` for https); a
+      literal fake-ip and a fake-ip + private mix are refused; a gated (`--cautious`) token's POST to an all-fakeip
+      name → `loopback_write` (rule 5c) while its GET passes and an operator token's POST is proxied by name.
+    - `hive node token add` on a `standard` node does not default to `--cautious` (only on a cautious node, §19 v8);
+      the tests pass `--cautious` explicitly.
+    - The docker E2E uses a stateful fake `docker` (container table, `run` serving an OpenAI stub on the published
+      `127.0.0.1` port, `stop`/`rm -f`/`inspect`/`ps --filter label=`/`top`) on a trusted PATH dir outside every root.
+      `hive node panic` runs with the node's PATH (the owner's shell normally has it).
+    - WSL keepalive: `NodeRuntime.start()` runs with `hive.node.IS_WINDOWS` patched and `wsl.wsl_exe` → a fake POSIX
+      `wsl.exe`; `node.info.wsl` is checked with `hive.actions.node.IS_WINDOWS` patched and `wsl.list_distros` mocked.
+    - The disk-space precheck uses a stub listing that reports 1 PiB for one file (no `shutil.disk_usage` patch in a
+      daemon); the bytes are never requested.
+    - "Every tool": `proc_kill` kills a process the test started (not managed, not an ancestor of the node);
+      `fs_transfer` uses a `local:` file under `~/Hive` (client.json `local_files.roots` default).
+M3-5. **Counts verified end to end:** 38 actions (37 node-scope rows on the node's `GET /v1/actions` + `hub.nodes`);
+    tool profiles 10 / 28 / 31 with exactly the §17.2 names through `tools/list` of stdio MCP sessions
+    (`--profile minimal|standard|full`, default standard, `--prefix hv_`) and through the hub's `/mcp?profile=`
+    (direct link to the node daemon); 4 export formats × 3 profiles through `GET /v1/tools` (§17.7 shapes; `gemini` →
+    400); 3 MCP protocol versions (`title` only from 2025-06-18; an unknown version gets a supported one).

@@ -178,7 +178,8 @@ class TestE2EM3Pull(unittest.TestCase):
         self.assertEqual(e.details.get("job_id"), jid)
         st = self.node.call("job.status", {"job_id": jid})
         self.assertEqual(st["kind"], "pull")
-        prog = st["progress"]
+        prog = wait_for(lambda: self.node.call("job.status", {"job_id": jid}).get("progress"), 20,
+                        what="pull progress")
         for k in ("done", "total", "percent", "files_done", "files_total", "current"):
             self.assertIn(k, prog)
         self.assertEqual(prog["files_total"], 4)
