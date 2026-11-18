@@ -1206,3 +1206,88 @@ R4-7. **doctor (amends K8/K9):** wsl mirrored + `listen.host "tailscale"` shows 
     `trusted_proxies` is set (main-port forwarding records `proxy:<peer>` with or without XFF); the Windows
     permission fix is `icacls "<path>" /inheritance:r /grant:r "*<user SID>:F" /grant:r "*S-1-5-18:F"`
     (`doctor.win_fix_perm`, `(OI)(CI)F` for folders; §20.5 item 12).
+
+## WP6b hand-off (hub /mcp, remaining CLI, pyproject, examples)
+
+(Items numbered S1… so they cannot collide with the notes of parallel packages.)
+
+S1. **CONTRACT-REQUEST (WP6b → WP6a test `tests/test_cli.py`):** `test_version_and_wp6b` no longer expects "not
+    available yet (WP6b)": `hive gateway url a b` with no hub config on the machine exits 2 with "no hub config". The
+    `WP6B` dispatch list in `cli.main` is gone.
+S2. **Additive names (WP6b):**
+    - mcp: `http_handler(core_factory, *, sessions=None, default_profile="standard", call_wait=None)` returns the raw
+      route function (with a `sessions` attribute); `core_factory(identity, request, *, profile, wait_budget) ->
+      McpCore`; an optional `McpCore.rebind(identity, request)` attribute is called on every request (§18.5 "rebound to
+      the freshly authenticated Identity"); `HttpSessions` (`create/acquire/release/drop/close_all`, injectable clock),
+      `HttpSession`, constants `SESSION_IDLE` (3600), `SESSIONS_PER_TOKEN` (16), `SESSIONS_TOTAL` (256), `HTTP_WORKERS`
+      (4 pool threads per session).
+    - tools: `register_agent_routes(..., mcp=True)` builds the session core (server-hosted Toolkit over the target, so
+      `local:` is refused and `fs_transfer` uses a hub-process TransferManager; `watch=False`), registers `POST` and
+      `DELETE /mcp` (mode raw) and sets `server.mcp_sessions` (tests/diagnostics).
+    - cli: `hive hub add-node … --host H` and `hive hub rotate-token … --via/--host` (passed to
+      `dist.add_node_instructions(host=)`, R5b-6); `hive approvals approve … --yes`; test seams `cli._now`/`cli._sleep`
+      (the `restart-node --outdated` waits, `audit tail --follow`).
+S3. **/mcp interpretations (§18.5):**
+    - Only `POST` and `DELETE` are registered, so `GET /mcp` gets the router's 405 (before authentication).
+    - Status codes: `initialize` → 200 + `Mcp-Session-Id`; a notification or a client response → 202 with an empty body;
+      a request without `Mcp-Session-Id` (other than initialize) → 400 JSON-RPC `-32600`; an unknown, expired, evicted or
+      other token's session → 404 JSON-RPC `-32001` "unknown session"; malformed JSON → 400 `-32700`; a batch or a
+      non-object → 400 `-32600`; an unsupported `MCP-Protocol-Version` → 400; a bad `profile`/`wait_budget` query on
+      initialize → 400 `-32602`. Every response body is `application/json`. POSTs need `Content-Type: application/json`
+      (the ApiServer rule; 415 otherwise); Origin/Host checks are the ApiServer's.
+    - `profile`/`wait_budget` are read on `initialize` only and fixed for the session (`wait_budget` clamped to
+      [10, 280]; absent → §17.4 order without stdio: `HIVE_WAIT_BUDGET` of the hub process, else 45).
+    - Session limits evict the least recently used session (per token at 16, in total at 256); evicted/expired sessions
+      are closed (in-flight calls cancelled, their pool stopped).
+    - `tools/call` runs on the session's pool and the POST waits for its result (cap `max(300, 3 × wait_budget + 60)` s,
+      then `-32603` and the call is cancelled). A `notifications/cancelled` for it (another POST) makes the waiting POST
+      answer `-32800` "request cancelled" (HTTP needs an answer; stdio sends none). `tools/list` refreshes the Toolkit
+      first, since `list_changed` is not delivered over HTTP.
+S4. **CLI interpretations (§19):**
+    - `join`: the code comes from the argument, `-` (stdin) or `HIVE_JOIN` (a code on argv prints a ps/history
+      warning). Before writing, the hub is checked with `relay.relay_transport(...)` `GET /v1/health` **without a token**
+      (system CAs or the join pin; `relay.proxy` = `--relay-proxy` / `HIVE_RELAY_PROXY`): a pin or plaintext-policy
+      refusal aborts, an unreachable hub only prints a warning. On a new config the consent is rewritten to
+      `{"by":"join","at",…,"text":"consent given by join code"}` and `HIVE_HF_ENDPOINT` is written to `models.hf_endpoint`;
+      `--proxy` defaults to `HIVE_PROXY`. `--install` uses the watchdog method on pods, `auto` elsewhere.
+    - `hub add-node --relay` builds the printed block (join codes, pyz sha256 of `dist.build_pyz()`) before writing the
+      entry, so a `bad_request` (no reachable hub address) leaves nothing behind; `--direct --generate` stores the token
+      in the hub config and prints only `hive node token add hub-<hub> --kind hub --sha256 …`.
+    - `hub rotate-token NAME` also covers direct nodes (new hub token; the node-side revoke/add lines are printed) and
+      agent/models tokens (new token printed); the owner token is refused ("hive init hub --force").
+    - `hub ack-node`: preview via the owner route, y/N (`--yes`), bind with the shown `pending_sha256`; with the hub down
+      (connect refused) it edits `relay_ids.json` under `hub.lock` with the same refusal rule (`bound_seen_at` later than
+      the attempt).
+    - `hub add-agent` prints the token once, the hub URL for other machines (tailnet IP, LAN hostname for a wildcard
+      bind, the listen host, `public_url`; 127.0.0.1 only as a last resort) in an `init client … --default` line, the
+      `mcp-config` hints, a `claude mcp add --transport http` line only when an https base exists, and the T5 warning
+      when the role has exec, no approvals are required and its node globs match a hub-machine node (loopback /
+      own-hostname / own-tailnet direct URL, or tag `wsl-host:<hub hostname>`; same rule as doctor K8).
+    - `gateway token add` defaults to `--hub` when a hub config exists here; hub globs must be `node/service`, node
+      globs plain service names. `gateway url` prints, per base, the "Provider … Base URL …/v1 …" line and the
+      `/v1`-less line; bases: tailnet IP (+ MagicDNS alternative) for a `"tailscale"` hub, the LAN hostname for a
+      wildcard bind, the listen host otherwise, `public_url`, and (on the hub machine) 127.0.0.1 and host.docker.internal;
+      `--connection C` uses that connection's URL; `--node` this node's own port; `--token-file` lists the served model
+      ids from `GET …/v1/models` (first base on this machine).
+    - `approvals`: list/grants/revoke run against `this-pc-owner` and/or `hub-local` (whichever exist in client.json, or
+      the one `--node`/`--hub` names); a daemon that does not answer prints "node not running"/"hub not running".
+      `approve`/`deny` look the id up (`include_done=1`) in both places, print the review `lines` (escaped, paged by 40
+      on a TTY) and ask y/N (`--yes` skips); `--for` takes `Nm`/`Nh` → `grant_minutes`.
+    - `mcp-config`: `whoami` decides owner vs agent; when the server is unreachable, `this-pc-owner`/`hub-local` still
+      count as owner connections. `--write` merges `mcpServers.hive` into the Claude Desktop config
+      (`~/Library/Application Support/Claude/…`, `%APPDATA%\Claude\…`, `~/.config/Claude/…`) or `~/.cursor/mcp.json`,
+      keeping a `.bak`. `--remote` prints the HTTP form (with the connection's token and a warning).
+    - `doctor` (no kind: node if a node config exists, else hub, else client) exits 1 when any check fails; `audit tail`
+      reads the daily files locally (`--hub` or a hub-only machine → hub audit); `push`/`pull`/`logs` use the
+      `this-pc-owner` default like `call`/`sh`; `logs -f` polls with `wait: 10` and ends a job's stream once it is final.
+    - Exit codes stay `exit_code_for` (a `bad_request` from an action/library is 1; CLI usage errors are 2).
+S5. **pyproject.toml:** setuptools build, `name = "hive-agent"`, version from `hive.__version__`, no dependencies,
+    extra `full = ["psutil"]`, script `hive = hive.cli:main`, packages `hive`, `hive.actions` (verified with a venv
+    `pip install ./hive`; `hive --version` works). `.gitignore` already ignores `build/` and `*.egg-info/`.
+S6. **CI:** `.github/workflows/hive-tests.yml` at the repository root (WP6 per §3/§21; outside the `hive/` folder,
+    committed explicitly): ubuntu/windows/macos × 3.9/3.13 plus psutil on ubuntu/windows, `pip install -e ./hive`, the
+    unittest discover from `hive/`. Not exercised here.
+S7. **Open items (WP6b):** the README is a first version for the lead's review; Windows/macOS-only paths (Claude
+    Desktop config locations, `_console_command` on Windows) are written but only run here through mocks; `service
+    install` from a bare source checkout is refused by WP4's `check_launcher` (expected: install with pip first);
+    E2E M2 (hub + relay + join + `/mcp` with real processes) remains the lead's.

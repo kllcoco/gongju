@@ -1,0 +1,35 @@
+# Hive (蜂巢) test matrix (design §21): 3 OSes x Python 3.9/3.13, plus psutil runs on ubuntu and windows.
+name: hive-tests
+on:
+  push:
+    paths: ["hive/**", ".github/workflows/hive-tests.yml"]
+  pull_request:
+    paths: ["hive/**", ".github/workflows/hive-tests.yml"]
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+        psutil: [false]
+        include:
+          - {os: ubuntu-latest, python: "3.13", psutil: true}
+          - {os: windows-latest, python: "3.13", psutil: true}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./hive
+      - name: psutil
+        if: matrix.psutil
+        run: pip install psutil
+      - name: tests
+        working-directory: hive
+        run: python -m unittest discover -s tests -t .

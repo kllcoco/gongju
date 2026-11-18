@@ -128,6 +128,30 @@ class TestHubMcp(_HubMcp):
                          {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "nope"}}, sid=sid)
         self.assertEqual(b["error"]["code"], -32602)
 
+    @unittest.skipIf(os.name == "nt", "POSIX sleep")
+    def test_cancellation(self):
+        import threading
+        sid, _ = self.initialize()
+        box = {}
+
+        def call():
+            box["r"] = post(self.url, self.toks["agent"],
+                            {"jsonrpc": "2.0", "id": "long", "method": "tools/call",
+                             "params": {"name": "shell_run", "arguments": {"command": "sleep 20", "timeout": 60}}},
+                            sid=sid)
+        t = threading.Thread(target=call, daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        time.sleep(1.0)
+        st, _h, b = post(self.url, self.toks["agent"], {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                                        "params": {"requestId": "long"}}, sid=sid)
+        self.assertEqual(st, 202)
+        t.join(15)
+        self.assertFalse(t.is_alive())
+        st, _h, b = box["r"]
+        self.assertEqual((st, b["id"], b["error"]["code"]), (200, "long", -32800))
+        self.assertLess(time.monotonic() - t0, 15)
+
     def test_fs_transfer_local_refused(self):
         sid, _ = self.initialize()
         st, _h, b = post(self.url, self.toks["agent"],
