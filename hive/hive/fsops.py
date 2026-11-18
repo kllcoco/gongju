@@ -1029,4 +1029,5 @@ def json_depth_ok(obj: Any, limit: int = 64) -> bool:
 
 __all__ = ["check_regex", "detect_encoding", "read_lines", "apply_edit", "closest_window", "walk", "is_hidden",
            "long_path", "PartTracker", "os_errors", "decode_bytes", "encode_text", "split_lines", "snippet",
-           "normalize_newlines", "apply_edit_at", "LiteralSearch", "entry_allowed", "display_text", "binary_error", "json_depth_ok", "open_regular"]
+           "normalize_newlines", "apply_edit_at", "LiteralSearch", "entry_allowed", "display_text", "binary_error",
+           "json_depth_ok", "open_regular"]

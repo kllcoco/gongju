@@ -132,7 +132,8 @@ class TestJsonContainerCap(unittest.TestCase):
 class TestBoundedRepeats(unittest.TestCase):
     def test_large_ranges_count_as_unbounded(self):
         from hive import fsops
-        for bad in (r"a{0,300}a{0,300}a{0,300}c", r"a{0,65535}a{0,65535}c", r"[ab]{0,99}[ab]{0,99}[ab]{0,99}[ab]{0,99}c",
+        for bad in (r"a{0,300}a{0,300}a{0,300}c", r"a{0,65535}a{0,65535}c",
+                    r"[ab]{0,99}[ab]{0,99}[ab]{0,99}[ab]{0,99}c",
                     r"\w{0,99}\d{0,99}\w{0,99}\d{0,99}x", r".{0,199}.{0,199}.{0,199}!", r"(?:a{0,30}){0,10}c",
                     r"(?:a+){10}c", r"(?:a+){2}c", r"a{,300}a{,300}c", r"a{0,99}b{0,99}c{0,99}d{0,99}e{0,99}"):
             with self.subTest(pattern=bad):
