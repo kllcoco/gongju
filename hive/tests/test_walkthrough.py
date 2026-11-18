@@ -166,10 +166,14 @@ class TestForegroundNodeSurvivesConfigChange(unittest.TestCase):
         raw = json.loads(cp.read_text())
         raw["allow_root"] = True
         cp.write_text(json.dumps(raw))
-        pid, fd = pty.fork()
-        if pid == 0:  # pragma: no cover - child
-            os.chdir(str(home))
-            os.execvpe(hive[0], hive + ["node", "run"], env)
+        # a pty for stdin/stdout/stderr, spawned by subprocess (fork+exec in C): pty.fork() runs Python in the
+        # forked child of this multi-threaded test process (DeprecationWarning on 3.12+, a possible deadlock)
+        fd, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(hive + ["node", "run"], cwd=str(home), env=env, stdin=slave, stdout=slave,
+                                    stderr=slave, start_new_session=True)
+        finally:
+            os.close(slave)
         buf = bytearray()
 
         def pump(cond, timeout):
@@ -201,21 +205,13 @@ class TestForegroundNodeSurvivesConfigChange(unittest.TestCase):
                                stdin=subprocess.DEVNULL, timeout=60)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             end = time.monotonic() + 20
-            status = None
-            while time.monotonic() < end:
-                p, st = os.waitpid(pid, os.WNOHANG)
-                if p:
-                    status = st
-                    break
+            while time.monotonic() < end and proc.poll() is None:
                 pump(lambda: False, 0.2)
-            self.assertIsNotNone(status)
-            self.assertEqual(os.WEXITSTATUS(status), 0)                 # stop still ends it with 0
+            self.assertEqual(proc.poll(), 0)                            # stop still ends it with 0
         finally:
-            try:
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
-            except OSError:
-                pass
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(30)
             os.close(fd)
 
 
