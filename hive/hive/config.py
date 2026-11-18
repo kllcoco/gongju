@@ -430,7 +430,10 @@ NODE_SCHEMA = _o({
     "auth": _o({"tokens": _arr(_TOKEN_SCHEMA), "throttle": _THROTTLE}), "gateway": GATEWAY_SCHEMA,
     "network": NETWORK_SCHEMA, "models": MODELS_SCHEMA,
     "secrets": _o({"env_passthrough": _arr(_s(pattern=SECRET_NAME_PATTERN))}),
-    "wsl": _o({"keepalive": _arr(_o({"distro": _s(minLength=1, maxLength=128), "command": _s()},
+    # M3-3: `command` is an argv list (§20.7 step 6: ["/bin/sh","-lc","exec $HOME/.hive/node/run-node.sh"]); wsl.exe
+    # --exec runs it without a shell, and wsl.Keepalive only uses a list (a string was silently ignored)
+    "wsl": _o({"keepalive": _arr(_o({"distro": _s(minLength=1, maxLength=128),
+                                     "command": _arr(_s(minLength=1, maxLength=4096), minItems=1, maxItems=64)},
                                     required=("distro",)))}),
     "policy": POLICY_SCHEMA,
     "model_endpoints": _arr(_o({"name": _s(pattern=SERVICE_NAME_PATTERN), "base_url": _s(pattern=r"^https?://"),
