@@ -287,6 +287,8 @@ def _token_from_stdin(what: str = "token") -> str:
 
 
 def _read_token_arg(args: argparse.Namespace, out: Out) -> Optional[str]:
+    if getattr(args, "token", None) == "-":
+        return _token_from_stdin()
     if getattr(args, "token_env", None):
         v = os.environ.get(args.token_env, "").strip()
         if not v:
@@ -297,8 +299,6 @@ def _read_token_arg(args: argparse.Namespace, out: Out) -> Optional[str]:
             return Path(os.path.expanduser(args.token_file)).read_text(encoding="utf-8-sig").strip().splitlines()[0]
         except (OSError, IndexError) as e:
             raise CliError(f"cannot read token file {args.token_file}: {e}")
-    if getattr(args, "token", None) == "-":
-        return _token_from_stdin()
     if getattr(args, "token", None):
         sys.stderr.write(TOKEN_WARNING + "\n")
         return args.token
@@ -454,8 +454,9 @@ def _apply_local_node(cfg: Any, out: Out) -> None:
     name = getattr(cfg, "_local_node", None)
     if not name:
         return
-    out.line(f"local node registered with the hub as '{name}' (http://127.0.0.1, hub token added to the node "
-             "config)")
+    url = next((getattr(n, "url", None) for n in getattr(cfg, "nodes", []) or [] if getattr(n, "name", None) == name),
+               None) or "127.0.0.1"
+    out.line(f"local node registered with the hub as '{name}' ({url}; a hub token was added to the node config)")
     if name == "hubhost":
         out.line("  (named 'hubhost' because the node and the hub share this computer's name)")
     _restart_daemon("node", out)
@@ -1294,6 +1295,7 @@ def cmd_join(args: argparse.Namespace, out: Out) -> int:
 
 
 JOIN_VERIFY_S = 30.0      # v8.1: join --install waits this long for "relay registered" in the node log
+JOIN_FAIL_GRACE_S = 8.0   # … but stops this long after a start failure (a crash loop) was logged
 _START_FAIL = re.compile(r"(address already in use|address in use|only one usage of each socket address|"
                          r"node failed to start|node failed:|refusing to run)", re.I)
 
@@ -1328,6 +1330,7 @@ def _verify_joined(cfg: Any, marks: Dict[Path, int], out: Out) -> int:
     out.line(f"waiting up to {JOIN_VERIFY_S:g} s for the node to start and register with the hub…")
     end = time.monotonic() + JOIN_VERIFY_S
     fail = ""
+    failed_at: Optional[float] = None
     while True:
         text = "".join(_read_new(p, n) for p, n in marks.items())
         if "relay registered with" in text:
@@ -1336,7 +1339,9 @@ def _verify_joined(cfg: Any, marks: Dict[Path, int], out: Out) -> int:
         for line in text.splitlines():
             if _START_FAIL.search(line):
                 fail = line.strip()
-        if time.monotonic() >= end:
+                failed_at = failed_at or time.monotonic()
+        now = time.monotonic()
+        if now >= end or (failed_at is not None and now - failed_at > JOIN_FAIL_GRACE_S):
             break
         time.sleep(0.5)
     if fail:

@@ -392,6 +392,7 @@ class TestApprovalsCli(CliCase):
         code, out, err = run(["approvals", "approve", aid])            # no TTY and no --yes: nothing decided
         self.assertEqual(code, 2)
         self.assertIn("echo approved-$((1+1))", out)                    # the review is printed before y/N
+        self.assertIn(f"hive approvals approve {aid} --yes", out)       # v8.1: no TTY says how to decide
         code, out, err = run(["approvals", "approve", aid, "--yes", "--for", "30m"])
         self.assertEqual(code, 0, out + err)
         self.assertIn("approved", out)
