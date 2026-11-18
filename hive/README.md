@@ -86,7 +86,9 @@ mkdir -p ~/.local/bin && ln -sf ~/.venvs/hive/bin/hive ~/.local/bin/hive   # 以
 hive --version                            # 找不到就重新打开终端
 ```
 
-> 不要用 root 运行 Hive（节点会拒绝启动）。云 GPU 容器例外，见 [2.5](#25-runpod--autodl--vast云-gpu)。
+> 不要用 root 运行 Hive：节点会拒绝启动（`hive init node` 一开始就会提醒你）。原因是 Agent 能做的事等于运行 Hive 的那个用户能做的事，root 等于把整台电脑交出去。只有在“root 是唯一用户”的云 GPU 容器里才例外：`hive join` / `hive init node --pod` 会自动在配置里写 `"allow_root": true`，见 [2.5](#25-runpod--autodl--vast云-gpu)。
+>
+> `pip install ./hive` 会在 hive 文件夹里留下 `build/` 和 `hive_agent.egg-info/` 两个文件夹，这是正常的安装副产品（已写进 `.gitignore`），可以不管，也可以删掉。
 
 ### 2.3 macOS
 
@@ -170,6 +172,23 @@ hive init node          # 生成配置和口令；会问你是否同意，输入
 hive node run           # 前台运行（这个窗口别关）；之后可改成开机自启：hive service install node
 ```
 
+在脚本里或不是终端的地方运行（没法输入 yes）时，加 `--yes` 表示你已经同意：`hive init node --yes`。同样，`hive node panic`、`hive approvals approve ap_xxxx` / `hive approvals deny ap_xxxx` 也会先问 y/N，不在终端里时加 `--yes`。
+
+命令的输出是英文的，下面是 `hive init node` 和 `hive node run` 的典型输出，右边是中文解释：
+
+```text
+node 'desk' configured at /home/me/.hive/node/config.json (preset standard)   ← 节点名 desk（默认取电脑名），配置文件位置，策略档位
+listen: http://127.0.0.1:7701                                                 ← 只在本机 7701 端口监听
+tokens: …/tokens/this-pc.token (agent), …/tokens/this-pc-owner.token (owner)  ← 两个口令文件：给 Agent 用的、给你自己命令行用的
+next: hive node run   (foreground)   or   hive service install node            ← 下一步：前台运行，或装成开机自启
+
+Hive node 'desk' ACTIVE — remote agents may control this computer as user 'me' (preset: standard).   ← 节点已启动，Agent 能以 me 的身份操作这台电脑
+Listen: http://127.0.0.1:7701 (plaintext, 2 tokens)  Relay: off  Paused: no  Audit: …/node/audit      ← 监听地址、口令个数、没开中继、没暂停、审计日志目录
+restarting to apply new settings…                                            ← 你改了配置（例如加了口令），前台节点正在自动重启
+```
+
+前台运行（`hive node run` / `hive hub run` 开在终端窗口里）时，**改配置的命令会让它在同一个窗口里自动重启**并打印 `restarting to apply new settings…`，你什么都不用做；改配置的命令会打印 `applied (restarted …)`。节点没在运行时则打印 `will apply on next start`（下次启动生效）。
+
 再开一个终端：
 
 ```sh
@@ -190,7 +209,7 @@ hive mcp-config --client claude-desktop --write    # 把 Hive 写进 Claude Desk
 | `--proxy http://127.0.0.1:7890` | 指定 HTTP 代理（默认会自动探测） |
 | `--tailscale` | 监听本机的 Tailscale 地址（给别的电脑上的中枢直连用） |
 
-已经初始化过的节点，再执行 `hive init node` 加某个参数（例如 `hive init node --mirror cn`）只会修改这一项设置，口令不变；想全部重来用 `--force`（会生成新口令）。
+已经初始化过的节点，再执行 `hive init node` 加某个参数（例如 `hive init node --mirror cn`）只会修改这一项设置，口令不变；想全部重来用 `--force`（会生成新口令）。中枢也一样：`hive init hub --listen 127.0.0.1:7700`、`--tailscale`、`--public-url`、`--funnel`、`--with-local-node` 只改那一项。
 
 ---
 
@@ -237,6 +256,9 @@ hive service install hub
 - 要接 RunPod 这类**不在你 Tailscale 里**的云机器时，改成 `hive init hub --tailscale --with-local-node --funnel`，并按它的提示执行一次 `tailscale funnel --bg 7709`。Funnel 会给中枢一个带正规证书的公网地址 `https://<电脑名>.<你的 tailnet>.ts.net`（第一次用 Funnel 时 Tailscale 会给你一个网址，去后台点开启）。
 - `--with-local-node` 会提醒你：在中枢这台电脑上能执行命令的 Agent 等于拿到了中枢。给这台电脑上的 Agent 用 `--cautious` 口令（见 4.7）。
 - `hive hub status` 查看各节点是否在线。
+- 本机节点已经在运行（比如第 3 节开着的 `hive node run`）也没关系：`--with-local-node` 会把中枢的口令加进本机节点的配置，并**自动重启本机节点**让它生效，打印 `applied (restarted the node)`；节点没在运行就打印 `will apply on next start`。
+- **为什么本机节点在中枢里叫 `hubhost`**：节点和中枢默认都用电脑名当名字（比如都叫 `vm`）。为了在中枢的节点列表里不和中枢自己重名，本机节点在中枢里登记为 `hubhost`；如果你给节点起了别的名字（`hive init node --name desk`），中枢里就用 `desk`。`hive init hub` 会打印它用的名字，以后在中枢上操作本机就用这个名字，例如 `hive sh hubhost --connection hub-local -- nvidia-smi`。
+- 用了 `--tailscale` 但这台电脑上 Tailscale 还没装好或没登录时，`hive init hub` 会立刻提醒（不会失败），装好并 `tailscale up` 后再 `hive hub run`。
 
 ### 4.3 把家里其他电脑接进中枢
 
@@ -274,7 +296,7 @@ echo "<sha256>  hive.pyz" | sha256sum -c - || exit 1
 HIVE_HOME=/workspace/.hive python3 hive.pyz join --install
 ```
 
-把**它实际打印的内容**整段贴进 RunPod 的网页终端运行就行。之后：
+把**它实际打印的内容**整段贴进 RunPod 的网页终端运行就行。`join --install` 最后会等最多 30 秒，确认节点真的启动并连上了中枢才打印 `joined: …`；如果节点起不来（例如同一台电脑上已经有别的 Hive 节点占用了端口 `Address already in use`），它会直接告诉你原因和修法（中继节点不需要监听端口：`hive init node --no-listen`）。之后：
 
 - 在云机器的新终端里用 `/workspace/.hive/hive` 代替 `hive`，例如 `/workspace/.hive/hive node secret set HF_TOKEN`。
 - 模型和数据放 `/workspace`（pod 重启不丢）；pod 重启后只有设了 `autostart=true` 的模型服务会自动起来。
@@ -305,13 +327,13 @@ Agent 只能按名字使用它，永远看不到值；默认只会发给 hugging
 hive hub add-agent claude-desktop              # 会浏览网页、读陌生文件的 Agent 加 --cautious
 ```
 
-它会打印口令（只显示一次）和要在 **Agent 那台电脑**上执行的几步，大致是：
+它会打印口令（只显示一次）和要在 **Agent 那台电脑**上执行的一行命令，大致是：
 
 ```sh
-# 1. 把口令保存到 ~/.hive/tokens/home.token（一行，只有口令本身）
-# 2.
-hive init client --name home --url http://100.101.1.7:7700 --token-file ~/.hive/tokens/home.token --default
+hive init client --name home --url http://100.101.1.7:7700 --token - --default
 ```
+
+运行后它会提示你粘贴口令（输入时不显示），然后自己把口令存进 `~/.hive/tokens/home.token`，并设成只有你能读（0600）。也可以用管道传进去，例如 `cat 口令文件 | hive init client --name home --url http://100.101.1.7:7700 --token -`。不要把口令写在命令行里（会留在 shell 历史里）。
 
 `home` 是连接名（默认取中枢的名字），以它实际打印的为准。可以用 `--nodes 'desk,desk-wsl'` 限定这个口令能管哪几台电脑，`--role readonly|files|operator` 限定权限。
 
@@ -339,7 +361,7 @@ hive mcp-config --client claude-desktop --connection home --write
 
 ## 5. 把 AI 助手接上来（MCP）
 
-先确认 `client.json` 里有连接：本机节点是 `this-pc`（`hive init node` 自动加），中枢是你在 4.7 用 `hive init client` 加的名字。所有客户端都通过 `hive mcp-config` 生成配置，**口令不会写进客户端配置**（客户端运行 `hive mcp`，由它从 `~/.hive/tokens/` 读口令）。
+先确认 `client.json` 里有连接：本机节点是 `this-pc`（`hive init node` 自动加），中枢是你在 4.7 用 `hive init client` 加的名字。所有客户端都通过 `hive mcp-config` 生成配置，**口令不会写进客户端配置**（客户端运行 `hive mcp`，由它从 `~/.hive/tokens/` 读口令）。如果你用环境变量 `HIVE_HOME` 把数据目录放到了别处（第 12 节），`hive mcp-config` 会自动把 `HIVE_HOME` 写进配置的 `env`，客户端才能找到连接。
 
 ### Claude Desktop
 
@@ -348,7 +370,7 @@ hive mcp-config --client claude-desktop --connection home           # 只打印
 hive mcp-config --client claude-desktop --connection home --write   # 直接写进配置文件（保留你已有的其他 MCP 服务器）
 ```
 
-配置文件位置：Windows `%APPDATA%\Claude\claude_desktop_config.json`，macOS `~/Library/Application Support/Claude/claude_desktop_config.json`（`--write` 会先把原文件备份成 `.bak`）。改完要**完全退出**再打开 Claude Desktop。如果改了没效果（比如从应用商店安装的版本配置文件在别处），在 Claude Desktop 里打开 设置 → 开发者 → 编辑配置，把不加 `--write` 时打印的 `"hive"` 那一段粘到 `mcpServers` 里。
+配置文件位置：Windows `%APPDATA%\Claude\claude_desktop_config.json`，macOS `~/Library/Application Support/Claude/claude_desktop_config.json`，Linux `~/.config/Claude/claude_desktop_config.json`（`--write` 会先把原文件备份成 `.bak`）。改完要**完全退出**再打开 Claude Desktop。如果改了没效果（比如从应用商店安装的版本配置文件在别处），在 Claude Desktop 里打开 设置 → 开发者 → 编辑配置，把不加 `--write` 时打印的 `"hive"` 那一段粘到 `mcpServers` 里。
 
 ### Claude Code
 
@@ -374,13 +396,36 @@ hive mcp-config --client cursor --connection home --write    # 写进 ~/.cursor/
 - `hive tools export --format openai`（或 `anthropic`、`mcp`、`openai-responses`）导出工具定义给你自己的程序。
 - Python 客户端和示例：[examples/python_client.py](examples/python_client.py)、[examples/agent_anthropic.py](examples/agent_anthropic.py)（Claude 手写工具循环）、[examples/agent_openai.py](examples/agent_openai.py)（任何 OpenAI 兼容模型）、[examples/raw_http.sh](examples/raw_http.sh)、[examples/mcp/](examples/mcp/)。
 
-接好以后，Agent 会看到 28 个工具（标准档），例如 `nodes_list`（有哪些电脑）、`shell_run`（执行命令，超过约 40 秒自动转成后台任务）、`job_start` / `job_logs`、`fs_read` / `fs_write` / `fs_edit`、`service_define` / `service_start`（托管模型服务）、`model_pull`（下载整个模型仓库）、`guide`（Agent 自己看的使用指南，比如 `guide('windows')`、`guide('model-serving')`）。
+接好以后，Agent 会看到 28 个工具（标准档），例如 `nodes_list`（有哪些电脑）、`shell_run`（执行命令，超过约 40 秒自动转成后台任务）、`job_start` / `job_logs`、`fs_read` / `fs_write` / `fs_edit`、`service_define` / `service_control`（托管模型服务：定义、启动、停止、重启）、`model_pull`（下载整个模型仓库）、`guide`（Agent 自己看的使用指南，比如 `guide('windows')`、`guide('model-serving')`）。
 
 ---
 
 ## 6. 模型网关：在聊天软件里用你部署的模型
 
-假设 Agent 已经在 `desk-wsl` 上部署了一个名叫 `qwen` 的 vLLM 服务。在**中枢那台电脑**上：
+### 6.1 先部署一个模型服务
+
+一般直接让 Agent 来做（对它说“在 desk-wsl 上用 vLLM 部署 Qwen2.5-7B-Instruct”，它会用 `model_pull` 下载、`service_define` 部署）。你也可以自己用命令行定义一个**托管服务**：节点负责启动它、崩了自动重启、做健康检查、记录日志。`--node` 是目标电脑（通过中枢操作别的电脑时再加 `--connection home`，在中枢那台电脑上用 `--connection hub-local`）：
+
+```sh
+hive service define ollama --preset ollama --node desk                                   # Ollama（任何系统）；模型另外用 ollama pull 下载
+hive service define qwen --preset vllm --model Qwen/Qwen2.5-7B-Instruct --node desk-wsl   # vLLM（Linux / WSL）；--model 可以是本地文件夹
+hive service define qwen-gguf --preset llamacpp --model ~/models/qwen2.5-7b-q4_k_m.gguf --node desk   # llama.cpp 的 GGUF 文件
+```
+
+- 预设的其他参数用 `--arg 键=值`（可重复），例如 `--arg python=~/.venvs/vllm/bin/python --arg max_model_len=32768`；每个预设有哪些参数：`hive guide presets`。
+- 不用预设、自己写启动命令也行。例如想先拿一个假的 OpenAI 兼容服务（`stub.py`，监听 8000 端口）把整条路试通：
+
+  ```sh
+  hive service define stub --argv 'python3 stub.py 8000' --cwd ~/hive-test --port 8000 --endpoint http://127.0.0.1:8000/v1 --node desk
+  ```
+
+  `--argv` 是程序和参数（整体加引号），`--port` 是它监听的端口（用来做健康检查），`--endpoint` 是它的 OpenAI 兼容地址（网关和 `model_chat` 用它）。其他参数用 `--param 键=值`，例如 `--param health=tcp`。
+- 命令会等最多 30 秒并打印状态（`state running, health healthy` 表示好了）。之后看日志：`hive logs desk --service qwen -f`；看状态：`hive call service.status name=qwen wait=120 --node desk`。
+- `hive guide model-serving` 打印 Agent 用的部署说明（显存估算、下载、各种预设的写法）；`hive guide` 列出全部主题，内容和 Agent 的 `guide` 工具完全一样。
+
+### 6.2 生成网关地址和专用口令
+
+假设 `desk-wsl` 上已经有一个名叫 `qwen` 的 vLLM 服务（上一步部署的）。在**中枢那台电脑**上：
 
 ```sh
 hive gateway token add chatbox --models 'desk-wsl/qwen'   # 生成一个“只能用这个模型”的专用口令（只显示一次）
@@ -421,9 +466,11 @@ hive gateway url desk-wsl qwen                            # 打印各种情况�
 | 看版本 | `hive version` |
 | 本机节点状态 / 停止 / 重启 | `hive node status`、`hive node stop`、`hive node restart` |
 | 中枢状态、节点列表 | `hive hub status`、`hive hub list` |
-| 有哪些电脑在线 | `hive nodes` |
+| 有哪些电脑在线 | `hive nodes`（在中枢那台电脑上默认只显示本机，看全部用 `hive nodes --connection hub-local`；它会提示你） |
 | 在某台电脑上执行命令（退出码就是远端的退出码） | `hive sh desk -- nvidia-smi`（命令里有引号、管道时整体加引号：`hive sh desk -- 'ls ~ \| head'`） |
 | 调用任意动作 | `hive call fs.stat path=~`、`hive call model.pull repo=Qwen/Qwen2.5-7B-Instruct --node desk-wsl` |
+| 部署模型服务 | `hive service define qwen --preset vllm --model Qwen/Qwen2.5-7B-Instruct --node desk-wsl`（见 6.1） |
+| 使用说明（和 Agent 看到的一样） | `hive guide`、`hive guide model-serving`、`hive guide presets` |
 | 看所有动作 | `hive actions` |
 | 跟踪任务 / 服务日志 | `hive logs desk j_xxxx -f`、`hive logs desk --service qwen -f` |
 | 上传 / 下载文件（断点续传） | `hive push desk ./a.gguf ~/models/a.gguf`、`hive pull desk ~/out.txt ./out.txt` |
@@ -468,7 +515,16 @@ hive approvals deny ap_xxxx
 hive approvals grants                   # 看已有的“30 分钟”授权；hive approvals revoke --all 全部收回
 ```
 
-审批要在 Agent 连接的那台机器上做（用中枢就在中枢上）。注意：谨慎档**不拦写文件**，重要数据请放进只读目录（`--root 路径:ro`）。
+审批要在 Agent 连接的那台机器上做（用中枢就在中枢上）。不在终端里（脚本、远程执行）时没法回答 y/N，要加 `--yes`：`hive approvals approve ap_xxxx --yes`。
+
+**批准以后要“重试”**：批准不会自动执行，而是让**同一个调用**带着这个编号再来一次。Agent 会自己重试（它知道带 `approval_id`）；你自己在命令行上被拦下时，命令会告诉你编号，批准后原样再执行一次并加上 `--approval`：
+
+```sh
+hive sh desk --approval ap_xxxx -- nvidia-smi                    # hive sh：命令必须和第一次完全一样
+hive call shell.run command=nvidia-smi --approval ap_xxxx --node desk
+```
+
+注意：谨慎档**不拦写文件**，重要数据请放进只读目录（`--root 路径:ro`）。
 
 **暂停与紧急停止**
 
@@ -479,7 +535,7 @@ hive approvals grants                   # 看已有的“30 分钟”授权；hi
 | `hive node panic` | 紧急停止：暂停 + 断开中继 + 结束所有任务、模型服务、Docker 容器。只作用于这一台电脑 |
 | `hive hub stop` | 停掉中枢，一次切断所有经过中枢的 Agent |
 
-节点进程没在运行时 `pause` / `panic` 也有效。更多见 [docs/SECURITY.md](docs/SECURITY.md)。
+`hive node pause` 会等正在运行的节点确认（最多 3 秒）后才返回 `paused (confirmed by the running node)`，之后发出的命令一定被拦下。节点进程没在运行时 `pause` / `panic` 也有效。`panic` 会先问你 y/N，脚本里用 `hive node panic --yes`。更多见 [docs/SECURITY.md](docs/SECURITY.md)。
 
 **它不是木马**：必须你本人执行 `hive init node`（或 `hive init hub`）并输入 yes；启动时打印醒目横幅；系统服务名就叫 Hive；不会自我传播、不会隐藏。
 
@@ -511,10 +567,12 @@ hive doctor --no-network # 不做联网检查
 | `hive: command not found`（Linux / WSL / macOS） | 虚拟环境没激活：用 `~/.venvs/hive/bin/hive`，或按 2.2 建 `~/.local/bin/hive` 链接后重开终端 |
 | `hive` 不是内部或外部命令（Windows） | 重开 PowerShell；还不行就重新安装 Python 并勾选 “Add python.exe to PATH” |
 | `unavailable: cannot connect to http://127.0.0.1:7701` | 节点没在运行：`hive node run`，或 `hive service install node`；`hive node status` 看原因 |
-| 节点启动报 `refusing to run as root/Administrator` | 不要用 root / 管理员运行，换普通用户 |
+| 节点启动报 `refusing to run as root/Administrator` | 不要用 root / 管理员运行，换普通用户。只有 root 是唯一用户的云容器才在节点配置里写 `"allow_root": true`（`hive join` 在云机器上会自动写） |
 | Claude Desktop 里看不到 Hive 工具 | 完全退出再打开 Claude Desktop；用 `hive mcp-config --client claude-desktop` 核对配置；`hive doctor client` |
 | 中枢连不上家里的某台电脑 | 那台电脑要 `hive init node --tailscale`；Windows 防火墙放行（`hive doctor` 打印命令）；两台电脑 `tailscale status` 都在线 |
-| 改了配置后中枢 / 节点“停了” | 改配置会让正在运行的进程重启；前台运行（`hive hub run`）时没有人把它拉起来，再运行一次，或用 `hive service install hub`（节点：`hive service install node`）安装成服务 |
+| 改了配置后中枢 / 节点“停了” | 在终端窗口里前台运行的会自动重启（`restarting to apply new settings…`）。如果是在后台、没有终端的方式手动启动的（例如 `nohup hive hub run &`），它会停下并提示你 `start it again: hive hub run`；长期使用请装成服务：`hive service install hub`（节点：`hive service install node`） |
+| 中枢里本机节点（`hubhost`）一直 offline | 本机节点没加载中枢口令：`hive node restart`（`hive init hub --with-local-node` 现在会自动做这一步） |
+| `no connection 'home' in client.json`（Claude Desktop 里） | 你改过 `HIVE_HOME`：重新执行 `hive mcp-config --client claude-desktop --connection home --write`，它会把 `HIVE_HOME` 写进配置 |
 | 聊天软件连不上网关地址 | 软件走了系统代理：把 `100.64.0.0/10`、`*.ts.net` 加进代理的直连列表；https 网页版软件要用 Funnel 的 https 地址 |
 | Windows 上升级报 `WinError 32` | 先退出 Claude Desktop、Cursor、Claude Code（它们在运行 `hive.exe`），再 `py -m pip install -U .\hive` |
 | 云机器显示“换了一台机器注册” | 见 4.5：不是你换的就 `hive hub rotate-token NAME`，是你新开的才 `hive hub ack-node NAME` |
@@ -527,26 +585,45 @@ hive doctor --no-network # 不做联网检查
 
 ## 11. 升级与卸载
 
-**升级**（在仓库里先 `git pull` 或重新下载）：
+**升级**（在仓库里先 `git pull` 或重新下载），按你当初的安装方式选一行：
 
 ```sh
-python3 -m pip install -U ./hive        # Windows：先退出 Claude Desktop / Cursor / Claude Code，再 py -m pip install -U .\hive
-                                         # 用虚拟环境的：~/.venvs/hive/bin/pip install -U ./hive
-hive node restart                        # 让正在运行的节点换上新版本
+~/.venvs/hive/bin/pip install -U ./hive   # Linux / macOS / WSL（按 2.2 / 2.3 / 2.4 装在虚拟环境里的，大多数人是这种）
+```
+
+```powershell
+py -m pip install -U .\hive               # Windows：先完全退出 Claude Desktop / Cursor / Claude Code（它们在运行 hive.exe）
+```
+
+- 用单文件 `hive.pyz` 的：重新生成或下载一份新的 `hive.pyz` 覆盖旧文件即可。
+- **不要**在 Linux / macOS 上用 `python3 -m pip install -U ./hive`：它会往系统 Python 再装一份 Hive，并覆盖 `~/.local/bin/hive` 这个链接（新版 Ubuntu 上还会直接报 externally-managed 错误）。
+
+然后让正在运行的程序换上新版本：
+
+```sh
+hive node restart                        # 本机节点
 hive hub restart                         # 中枢那台电脑
 hive hub restart-node --outdated         # 云机器从中枢自动下载新版本并重启（不用再一台台打开网页终端）
 ```
 
 后台任务和模型服务在节点重启、升级时**继续运行**，回来后自动接管。
 
-**卸载**：
+**卸载**（先停掉并移除开机自启，再删程序）：
 
 ```sh
-hive service uninstall node      # 加 --stop-services 同时停掉托管的模型服务；中枢：hive service uninstall hub
-python3 -m pip uninstall hive-agent
+hive service uninstall node              # 加 --stop-services 同时停掉托管的模型服务
+hive service uninstall hub               # 只有中枢那台电脑需要
+rm -rf ~/.venvs/hive ~/.local/bin/hive   # Linux / macOS / WSL：删掉虚拟环境和 hive 链接
+rm -rf ~/.hive                           # 可选：配置、口令、日志、审计都在这里，删了就彻底清干净
 ```
 
-最后删除数据目录 `~/.hive`（配置、口令、日志、审计都在里面）。
+```powershell
+hive service uninstall node
+py -m pip uninstall hive-agent           # Windows
+Remove-Item -Recurse -Force $HOME\.hive  # 可选：删除数据目录
+```
+
+用 `hive.pyz` 的：`python3 hive.pyz service uninstall node` 之后删掉 `hive.pyz` 和数据目录（云机器上是 `/workspace/.hive`）。
 
 ---
 
@@ -608,7 +685,14 @@ hive init hub --tailscale --with-local-node && hive hub run   # several machines
 hive hub add-node desk --direct http://100.101.1.5:7701 --generate
 hive hub add-node pod-a --relay                  # join code / one-liner for a NAT'd GPU pod
 hive hub add-agent claude --cautious             # an agent token for another machine
+hive init client --name home --url http://100.101.1.7:7700 --token - --default   # on the agent's machine (paste)
+hive service define qwen --preset vllm --model Qwen/Qwen2.5-7B-Instruct --node desk   # a model server
+hive guide model-serving                         # the agents' how-to topics
 ```
+
+A foreground `hive node run` / `hive hub run` in a terminal restarts itself in place when a command changes its
+config. Upgrade a venv install with `~/.venvs/hive/bin/pip install -U ./hive`; uninstall with
+`hive service uninstall node` then `rm -rf ~/.venvs/hive ~/.local/bin/hive` (and `~/.hive` for the data).
 
 Python:
 

@@ -74,6 +74,7 @@ def _parse(argv: List[str]) -> argparse.Namespace:
         ap.add_argument("--cwd")
         ap.add_argument("--timeout", type=float)
         ap.add_argument("--connection")
+        ap.add_argument("--approval")
         return ap.parse_args(head)
     ns = cli.build_parser().parse_args(rest)
     if getattr(ns, "fn", None) is None and not getattr(ns, "version", False):
