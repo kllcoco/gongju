@@ -1834,11 +1834,17 @@ def build_server(hub: Hub) -> "ApiServer":
             raise forbidden(f"this relay token belongs to node {link.name}")
         return link, body
 
-    # audit round 3: polls naming an unknown or superseded session (409) count per source IP, as auth failures do;
-    # the token check's own throttle forgets an IP at every successful auth, so this one is separate and is reset
-    # only by a successful register from that IP (what a real node does after a 409)
+    # audit round 3: polls naming an unknown or superseded session (409) count per (relay node, source IP), as auth
+    # failures do; the token check's own throttle forgets an IP at every successful auth, so this one is separate.
+    # Verification fixes: keyed by node too (a relay token can poll only its own node's session, so guesses matter
+    # only to that node, and pods sharing one NAT/proxy address cannot block each other); the block is consulted
+    # only for a poll whose session does not match (a poll with the live session always proceeds, §6 v4); a
+    # successful register clears the (node, IP) count and block (the token holder can register anyway)
     session_throttle = AuthThrottle(int(th.get("max_failures", 10)), float(th.get("window", 60)),
                                     float(th.get("block", 300)))
+
+    def _session_key(link: RelayLink, ip: str) -> str:
+        return f"{link.name.lower()}\n{ip}"
 
     def relay_register(req: "Request") -> dict:
         link, body = _relay_body(req)
@@ -1848,21 +1854,30 @@ def build_server(hub: Hub) -> "ApiServer":
         if len(raw) > (2 << 20) + 65536:
             raise HiveError("too_large", "register body larger than 2 MiB", status=413)
         out = link.register(body, req.client_ip)
-        session_throttle.ok(req.client_ip)
+        key = _session_key(link, req.client_ip)
+        session_throttle.ok(key)
+        with session_throttle._lock:
+            session_throttle._blocked.pop(key)
         return out
 
     def relay_poll(req: "Request") -> dict:
         link, body = _relay_body(req)
-        blocked = session_throttle.check(req.client_ip)
-        if blocked is not None:
-            raise rate_limited("too many polls with an unknown relay session from your address",
-                               retry_after=blocked, reason="auth_throttle", hint="register again later")
+        key = _session_key(link, req.client_ip)
+        sid = body.get("session_id")
+        live = link.session_id
+        matches = (isinstance(sid, str) and bool(sid) and live is not None
+                   and hmac.compare_digest(sid.encode("utf-8", "replace"), live.encode("utf-8")))
+        if not matches:
+            blocked = session_throttle.check(key)
+            if blocked is not None:
+                raise rate_limited("too many polls with an unknown relay session from your address",
+                                   retry_after=blocked, reason="auth_throttle", hint="register again later")
         try:
             return link.poll(body)
         except HiveError as e:
             if e.code == "conflict":
-                session_throttle.fail(req.client_ip)
-                if session_throttle.check(req.client_ip) is not None:
+                session_throttle.fail(key)
+                if session_throttle.check(key) is not None:
                     hub._audit_event("warning", link.name, {"event": "relay session guesses blocked",
                                                             "ip": req.client_ip})
             raise

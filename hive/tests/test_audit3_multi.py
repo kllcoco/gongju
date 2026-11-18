@@ -178,11 +178,12 @@ class TestRelaySession(_Case):
         self.fake.register()
         for _ in range(3):
             self.assertEqual(self.bad_poll().code, "conflict")
-        # blocked now, even with the right session (the token itself is valid)
-        with self.assertRaises(HiveError) as cm:
-            self.fake.poll()
-        self.assertEqual((cm.exception.code, cm.exception.details["reason"]), ("rate_limited", "auth_throttle"))
+        # blocked now: another wrong session gets 429 before the session is looked at
+        e = self.bad_poll()
+        self.assertEqual((e.code, e.details["reason"]), ("rate_limited", "auth_throttle"))
         self.assertIn('"event":"relay session guesses blocked"', _hub_audit(self.hub))
+        # verification fix: a poll with the live session always proceeds (§6 v4: what authenticates is not blocked)
+        self.assertEqual(self.fake.poll()["tasks"], [])
 
     def test_register_clears_the_count(self):
         # what a real node does after a hub restart: 409 on the old session, then register
@@ -190,6 +191,39 @@ class TestRelaySession(_Case):
             self.assertEqual(self.bad_poll().code, "conflict")
             self.fake.register()
         self.assertEqual(self.fake.poll()["tasks"], [])
+
+    def test_register_clears_an_active_block(self):
+        self.fake.register()
+        for _ in range(3):
+            self.bad_poll()
+        self.assertEqual(self.bad_poll().code, "rate_limited")
+        self.fake.register()
+        # unblocked: a wrong session is a plain 409 again
+        self.assertEqual(self.bad_poll().code, "conflict")
+
+    def test_pods_sharing_one_ip_do_not_block_each_other(self):
+        """Verification fix (A3-2): pods behind one NAT egress / proxy bucket; pod-b's stale or made-up sessions
+        must not take pod-a offline."""
+        rtok_b = util.new_token()
+        url, _toks, hub = self.make_hub(
+            [{"name": "pod-a", "mode": "relay", "token_sha256": util.hash_token(self.rtok)},
+             {"name": "pod-b", "mode": "relay", "token_sha256": util.hash_token(rtok_b)}],
+            throttle={"max_failures": 3, "window": 60, "block": 300})
+        a = FakeRelay(url, self.rtok, "pod-a")
+        b = FakeRelay(url, rtok_b, "pod-b")
+        a.register()
+        b.register()
+        for _ in range(5):
+            with self.assertRaises(HiveError) as cm:
+                b.poll(session_id="s_" + "B" * 32)
+        self.assertEqual(cm.exception.code, "rate_limited")
+        # pod-a's valid poll proceeds, and so do its 409s (its own count is untouched)
+        self.assertEqual(a.poll()["tasks"], [])
+        with self.assertRaises(HiveError) as cm:
+            a.poll(session_id="s_" + "A" * 32)
+        self.assertEqual(cm.exception.code, "conflict")
+        # pod-b's own valid session still proceeds while its (node, ip) key is blocked
+        self.assertEqual(b.poll()["tasks"], [])
 
     def test_relay_agent_waits_out_the_block(self):
         from hive import relay

@@ -1900,3 +1900,15 @@ A3-3. **Pod chose the Content-Type of hub gateway replies (LOW):** the relay pat
     dropped `Content-Type` falls back to the JSON default. Tests: `TestGatewayContentType`,
     `TestRelayGatewayContentType` (pod `text/html\x0bX-Evil: 1` → `application/json`, no injected header),
     `TestHeaderControlChars`.
+
+Verification fixes (independent re-test of the round 3 fixes on loopback):
+
+A3-2b. **Relay session throttle let one pod take every pod offline (MAJOR):** the bucket was per source IP, shared by
+    every relay node, and consulted before the session — pod-b's 10 made-up sessions got pod-a's valid poll a 429
+    (300 s), and pod-a's re-register did not unblock it (`AuthThrottle.ok` clears the history, never a block). Every
+    pod behind one NAT egress or one `proxy:<peer>` bucket was exposed. Now `relay_poll` keys the throttle by
+    `(node name, client_ip)` (a relay token polls only its own node's session), consults the block only when the
+    poll's `session_id` does not match the live session (constant-time compare; a matching poll always proceeds,
+    DESIGN §6 v4), and `relay_register` clears both the count and an active block for its `(node, ip)` key. Tests:
+    `TestRelaySession.test_pods_sharing_one_ip_do_not_block_each_other`, `test_register_clears_an_active_block`,
+    `test_session_mismatches_are_throttled_per_ip` (valid session proceeds while blocked). DESIGN §7.2, PROTOCOL §5.2.

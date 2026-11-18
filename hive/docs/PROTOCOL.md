@@ -134,9 +134,11 @@ The hub holds the request up to `poll_wait` until a task, a cancel or a refresh 
   task. At most `max(1, max_parallel − 2)` `model.forward` tasks are delivered at a time (slot reserve).
 - `timeout_s` is relative: the rest of the hub's call deadline without the hub's own slack.
 - Only one poll per node is held; a newer poll makes the older one return empty. Unknown session → 409 (register
-  again). 401/403 → the node backs off 300 s. Audit round 3: 409s count per source IP (`throttle` settings, 10 in
-  60 s → 300 s); a blocked IP's polls get 429 `rate_limited` reason `auth_throttle` with `retry_after` (the node
-  waits at least that long, at most 600 s); a successful register from the IP resets the count.
+  again). 401/403 → the node backs off 300 s. Audit round 3: 409s count per (relay node, source IP) (`throttle` settings,
+  10 in 60 s → 300 s); while that key is blocked, polls whose `session_id` is not the node's live session get 429
+  `rate_limited` reason `auth_throttle` with `retry_after` (the node waits at least that long, at most 600 s); a
+  poll with the live session always proceeds, so pods sharing one address (NAT egress, a proxy without
+  `X-Forwarded-For`) cannot block each other; a successful register clears the node's count and block for that IP.
 - `refresh: "restart"` → the node shuts down gracefully and exits 75 (its service manager starts it again).
 - `status` (≤ 4 KiB) every 30 s.
 
