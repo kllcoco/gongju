@@ -2259,3 +2259,5 @@ FA-B5g. **`hub restart-node --outdated` without auto-update:** the node reports 
     prints the reason and the remedy (role narrowed: `hive init node --relay-role operator --auto-update`; not a pod:
     upgrade by hand with the commands; older nodes without the field: both possible reasons). New `hive init node
     --auto-update / --no-auto-update` (on needs a relay with role operator and no deny_actions). README 11 explains.
+FA-check. Full suite after these fixes: 1557 tests, OK (13 skipped) on Python 3.13 and 3.9, run while a real node
+    listened on 127.0.0.1:7701 and a real hub on 127.0.0.1:7700 (their request logs: no contact from any test).
