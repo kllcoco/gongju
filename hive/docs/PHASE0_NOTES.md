@@ -2018,9 +2018,11 @@ A4-3. **Unauthenticated connection exhaustion / slowloris (HIGH):** 16 idle sock
     flooded; before → after): 16 idle from 127.0.0.1: connection reset (503) → 200 in 3 ms; 64 idle from
     127.0.0.2–5: 503 → 200; 16 and 64 idle on `proxy_port`: owner on the main port reset → 200, an agent through the
     proxy reset → 200; 200 idle mixed (4 loopback addresses + proxy): 503 → 200 (owner and agent); idle pre-auth
-    socket closed after 30.0 s → 5.0 s. Residual: authenticated non-owner keep-alive connections can still fill
-    the non-owner share of the authenticated pool (owners keep their reserve; idle authenticated sockets are not
-    evicted, since a client may be sending on them).
+    socket closed after 30.0 s → 5.0 s. Capacity note: non-owner authenticated connections are now
+    `n - n // 2 - 4` (node 28, hub 124; before: all 64 / 256 shared with idle sockets); a hub with very many relay
+    pods (one long poll each) raises `listen.max_connections`. Residual: authenticated non-owner keep-alive
+    connections can still fill the non-owner share of the authenticated pool (owners keep their reserve; idle
+    authenticated sockets are not evicted, since a client may be sending on them).
 A4-6. **Bodies buffered before per-identity limits (MEDIUM):** a hub buffered and parsed 48 MiB bodies with no global
     bound (40 concurrent ones: peak RSS 1580 MiB, 90 s wall, the pure-Python depth scan ~2 s per body holding the
     GIL). Now, after authentication and before the body is read: (a) a route `pre_body(headers, identity, length)`
