@@ -312,13 +312,30 @@ class TestDenyWrite(Base):
              "~/.config/awesome/rc.lua", "~/.config/qtile/config.py", "~/.config/niri/config.kdl",
              "~/.config/xfce4/xinitrc", "~/.config/lxsession/LXDE/autostart", "~/.julia/config/startup.jl",
              "~/.octaverc", "~/.ghci", "~/.irbrc", "~/.psqlrc", "~/.sqliterc", "~/.lldbinit", "~/.mailcap",
-             "~/.vscode/extensions/x/ext.js", "~/venvs/other/pyvenv.cfg"]
+             "~/.vscode/extensions/x/ext.js", "~/venvs/other/pyvenv.cfg",
+             # v8.1 audit round 2 (finding 2): submodule git dirs, attributes, build-tool init, D-Bus services, VS Code
+             "~/proj/.git/modules/sub/config", "~/proj/.git/modules/sub/hooks/post-checkout",
+             "~/proj/.git/modules/a/modules/b/config", "~/proj/.git/info/attributes", "~/.mavenrc",
+             "~/.gradle/init.gradle", "~/.gradle/init.d/x.gradle", "~/.local/share/dbus-1/services/x.service",
+             "~/proj/.vscode/settings.json", "~/proj/.vscode/launch.json", "~/.config/Code/User/settings.json",
+             "~/.config/Code - Insiders/User/settings.json", "~/.config/Code - OSS/User/keybindings.json",
+             "~/Library/Application Support/Code/User/settings.json", "~/AppData/Roaming/Code/User/settings.json",
+             "~/.config/VSCodium/User/settings.json", "~/.config/Cursor/User/settings.json",
+             "~/proj/.git/config.worktree", "~/proj/.git/worktrees/w1/config.worktree", "~/.gradle/gradle.properties",
+             "~/proj/.npmrc"]
 
     def test_v81_exec_paths_not_overbroad(self):
         pol = build_policy(self.fh)
         for p in ("~/.config/systemd/notes.txt", "~/proj/yarnrc.yml", "~/.local/share/other/x", "~/kde/x.sh",
                   "~/.config/i3x/config", "~/proj/bin/run.sh", "~/go/src/app/main.go", "~/.config/zshx",
-                  "~/proj/.vscode/settings.json", "~/proj/conda-notes.txt"):
+                  "~/proj/conda-notes.txt",
+                  # v8.1 audit round 2: the new patterns stay narrow
+                  "~/proj/.vscode/extensions.json", "~/proj/vscode/settings.json", "~/proj/.git/info/exclude",
+                  "~/proj/.git/objects/ab/cdef", "~/proj/git/modules/x", "~/proj/modules/.git-notes",
+                  "~/proj/.git/worktrees/w1/HEAD", "~/proj/.gradle/init.gradle", "~/.gradle/caches/x.jar",
+                  "~/.config/Code/Cache/x", "~/.config/Code/logs/x.log",
+                  "~/.config/Code/CachedData/x", "~/.local/share/dbus-1/other/x", "~/proj/npmrc.txt",
+                  "~/proj/settings.json", "~/proj/attributes"):
             with self.subTest(p=p):
                 eff(pol, FILES).resolve_path(p, write=True)
 

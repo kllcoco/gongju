@@ -41,7 +41,8 @@ class TestBindPlan(unittest.TestCase):
         self.assertIn("~/b.yaml", P("A=~/b.yaml x")[0])
         self.assertNotIn("./~/b.yaml", P("A=~/b.yaml x")[0])
         # PowerShell / cmd: bound literally and expanded
-        self.assertEqual(P("python ~/x.py", shell="cmd")[0], ["python", "./~/x.py", "~/x.py"])
+        # (cmd also binds python.com/.exe/.bat/.cmd in the cwd as missing: it looks there before PATH; audit round 2)
+        self.assertEqual(P("python ~/x.py", shell="cmd")[0][:3], ["python", "./~/x.py", "~/x.py"])
 
     def test_variables(self):
         P = presets.bind_plan
@@ -136,7 +137,8 @@ class TestNodeBinding(unittest.TestCase):
             for cmd in ("bash ~/lib/q.sh", "bash $HOME/lib/q.sh"):
                 with self.subTest(cmd=cmd):
                     _aid, rv = self.review(n, "shell.run", {"command": cmd})
-                    self.assertEqual({f["path"]: f["bind"] for f in rv["files"]},
+                    # audit round 2: path = the path as named (re-resolved at consume), real = where it is now
+                    self.assertEqual({f.get("real", f["path"]): f["bind"] for f in rv["files"]},
                                      {os.path.realpath(str(n.home / "lib" / "q.sh")): "sha256"})
                     self.assertIn("echo benign-q", rv["lines"])
 
@@ -261,10 +263,11 @@ class TestHubBindingFake(_HubCase):
         return answer
 
     def test_literal_tilde_and_variables(self):
-        for params, want in (({"command": "bash '~/lib/q.sh'", "cwd": "/w"}, "/w/./~/lib/q.sh"),
-                             ({"argv": ["bash", "~/lib/y.sh"], "cwd": "/w"}, "/w/./~/lib/y.sh"),
+        # audit round 2: "./" segments of the named path are dropped (/w/./x -> /w/x; "~" inside a path is literal)
+        for params, want in (({"command": "bash '~/lib/q.sh'", "cwd": "/w"}, "/w/~/lib/q.sh"),
+                             ({"argv": ["bash", "~/lib/y.sh"], "cwd": "/w"}, "/w/~/lib/y.sh"),
                              ({"command": "bash $HOME/x.sh", "cwd": "/w"}, "$HOME/x.sh"),
-                             ({"command": "echo hi", "env": {"BASH_ENV": "envx.sh"}, "cwd": "/w"}, "/w/./envx.sh")):
+                             ({"command": "echo hi", "env": {"BASH_ENV": "envx.sh"}, "cwd": "/w"}, "/w/envx.sh")):
             with self.subTest(params=params):
                 paths = []
                 rec = self.run_call(params, self.stat(paths))

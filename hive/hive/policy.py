@@ -118,6 +118,18 @@ DEFAULT_EXEC_PATHS: Tuple[str, ...] = (
     "~/.config/xmonad/**", "~/.xmonad/**", "~/.config/xfce4/xinitrc", "~/.config/lxsession/**",
     "~/.julia/config/**", "~/.octaverc", "~/.ghci", "~/.irbrc", "~/.pryrc", "~/.psqlrc", "~/.sqliterc",
     "~/.lldbinit", "~/.mailcap", "~/.vscode/extensions/**", "~/.vscode-server/extensions/**", "**/pyvenv.cfg",
+    # v8.1 (audit round 2): submodule git dirs (their config sets core.hooksPath/fsmonitor and holds hooks), the
+    # repo-local attributes file (filter/diff drivers), build-tool init scripts, D-Bus session service files and
+    # VS Code workspace/user settings and launch configs (interpreter paths, terminal profiles, tasks on open)
+    "**/.git/modules/**", "**/.git/info/attributes", "~/.mavenrc", "~/.gradle/init.gradle", "~/.gradle/init.d/**",
+    "~/.local/share/dbus-1/services/**", "**/.vscode/settings.json", "**/.vscode/launch.json",
+    "~/.config/Code*/User/**", "~/Library/Application Support/Code*/User/**", "~/AppData/Roaming/Code*/User/**",
+    # … and the same one step further: VSCodium/Cursor user settings, per-worktree git config, the user-wide Gradle
+    # properties (org.gradle.jvmargs can add a -javaagent) and project .npmrc (script-shell, node-options)
+    "~/.config/VSCodium/User/**", "~/Library/Application Support/VSCodium/User/**",
+    "~/AppData/Roaming/VSCodium/User/**", "~/.config/Cursor/User/**", "~/Library/Application Support/Cursor/User/**",
+    "~/AppData/Roaming/Cursor/User/**", "**/.git/config.worktree", "**/.git/worktrees/*/config.worktree",
+    "~/.gradle/gradle.properties", "**/.npmrc",
 )
 
 DEFAULT_COMMAND_DENY: Tuple[str, ...] = (
