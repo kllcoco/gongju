@@ -38,6 +38,7 @@ log = logging.getLogger("hive.gateway")
 PATHS = {"models": "GET", "chat/completions": "POST", "completions": "POST", "embeddings": "POST"}
 ROUTE = "/openai/{node}/{service}/{rest*}"
 SSE_TYPE = "text/event-stream"
+USAGE_SCAN_MAX = 1 << 20     # M2: JSON replies up to 1 MiB passed through in chunks are parsed for the audit usage
 
 
 @dataclass
@@ -217,6 +218,11 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
             backend.authorize(ident, node, service)
         except HiveError as e:
             raise _fold_hint(e)
+        anode = node
+        try:
+            anode = getattr(backend, "audit_node", lambda n: n)(node)
+        except Exception:  # noqa: BLE001 - audit naming only
+            pass
         key = getattr(backend, "inflight_key", lambda i: i.display_name)(ident)
         with lock:
             if inflight.get(key, 0) >= cap:
@@ -228,7 +234,7 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
                                    request_id=req.request_id, cancel=req.cancel)
         except BaseException as e:
             release(key)
-            record(ident, node, service, path, model, stream, 0, len(body), 0, None, req.request_id, req.client_ip,
+            record(ident, anode, service, path, model, stream, 0, len(body), 0, None, req.request_id, req.client_ip,
                    int((time.monotonic() - t0) * 1000))
             if isinstance(e, HiveError):
                 raise _fold_hint(e)
@@ -237,14 +243,14 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
         if resp.body is not None or resp.chunks is None:
             data = resp.body or b""
             release(key)
-            record(ident, node, service, path, model, stream, resp.status, len(body), len(data),
+            record(ident, anode, service, path, model, stream, resp.status, len(body), len(data),
                    _usage(data) or (_sse_usage(data[-65536:]) if data.startswith(b"data:") else None),
                    req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
             return resp.status, headers, data
 
         # The cleanup lives in ClosingIterator.close(), which also runs when the server closes the stream before the
         # first chunk (client gone while the upstream head was awaited): slot released, upstream closed, audited.
-        seen = {"n": 0, "tail": b""}
+        seen: Dict[str, Any] = {"n": 0, "tail": b"", "head": []}
 
         def count(src: Iterator[bytes]) -> Iterator[bytes]:
             for chunk in src:
@@ -252,12 +258,18 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
                     continue
                 seen["n"] += len(chunk)
                 seen["tail"] = (seen["tail"] + chunk)[-65536:]
+                if seen["head"] is not None:
+                    # M2: a JSON reply passed through chunk by chunk (hub direct link) keeps its usage for the audit
+                    seen["head"] = seen["head"] + [chunk] if seen["n"] <= USAGE_SCAN_MAX else None
                 yield chunk
 
         def done() -> None:
             release(key)
-            record(ident, node, service, path, model, stream, resp.status, len(body), seen["n"],
-                   _sse_usage(seen["tail"]), req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
+            usage = _sse_usage(seen["tail"])
+            if usage is None and seen["head"] and not seen["head"][0].lstrip().startswith(b"data:"):
+                usage = _usage(b"".join(seen["head"]))
+            record(ident, anode, service, path, model, stream, resp.status, len(body), seen["n"],
+                   usage, req.request_id, req.client_ip, int((time.monotonic() - t0) * 1000))
 
         upstream = resp.chunks
 
@@ -299,6 +311,10 @@ class NodeGatewayBackend(GatewayBackend):
     def inflight_key(self, identity: "Identity") -> str:
         """Per gateway token: ``display_name`` (the hub passthrough is ``hub-home/gw/<models token>``)."""
         return f"{identity.display_name}\x00{identity.token_sha256}"
+
+    def audit_node(self, node: str) -> str:
+        """M2: audit rows name this node, not the URL segment ("self")."""
+        return self.rt.name
 
     def _own(self, node: str) -> None:
         n = (node or "").lower()
@@ -442,6 +458,11 @@ class HubGatewayBackend(GatewayBackend):
     def inflight_key(self, identity: "Identity") -> str:
         """Per gateway token."""
         return f"{identity.name}\x00{identity.token_sha256}"
+
+    def audit_node(self, node: str) -> str:
+        """M2: audit rows name the canonical node (an alias resolves, §8.1); unknown names as given."""
+        link = self.hub.resolve(node)
+        return link.name if link is not None else node
 
     def _pairs(self, identity: "Identity") -> List[str]:
         return [g for g in identity.models]

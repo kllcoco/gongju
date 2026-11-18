@@ -74,9 +74,34 @@ STUB_OPENAI = textwrap.dedent("""\
             if "stream_options" in req and not req.get("stream"):    # vLLM behaviour
                 return self._send(400, {"error": {"message": "stream_options needs stream", "type": "BadRequest"}})
             msgs = req.get("messages") or [{}]
-            text = "pong: " + str(msgs[-1].get("content", req.get("prompt", "")))
+            last = str(msgs[-1].get("content", req.get("prompt", "")))
+            text = "pong: " + last
             if seen_auth:
                 text += " [auth:" + seen_auth[:12] + "]"
+            if last == "fail400":
+                return self._send(400, {"error": {"message": "upstream says no", "type": "invalid_request_error",
+                                                  "code": "stub_400"}})
+            if last.startswith("slow"):
+                time.sleep(3)
+            if path.endswith("/completions") and not path.endswith("/chat/completions"):
+                return self._send(200, {"id": "t1", "object": "text_completion", "created": 1, "model": model,
+                                        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+                                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+            if last == "tools" and not req.get("stream"):
+                calls = [{"id": "call_%d" % i, "type": "function",
+                          "function": {"name": "f%d" % i, "arguments": json.dumps({"i": i})}} for i in range(2)]
+                return self._send(200, {"id": "c2", "object": "chat.completion", "created": 1, "model": model,
+                                        "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                                     "message": {"role": "assistant", "content": None,
+                                                                 "reasoning_content": "thinking", "tool_calls": calls}}],
+                                        "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}})
+            n = int(req.get("n") or 1)
+            if n > 1 and not req.get("stream"):
+                return self._send(200, {"id": "c3", "object": "chat.completion", "created": 1, "model": model,
+                                        "choices": [{"index": i, "finish_reason": "stop",
+                                                     "message": {"role": "assistant", "content": "%s #%d" % (text, i)}}
+                                                    for i in range(n)],
+                                        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}})
             if req.get("stream"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
