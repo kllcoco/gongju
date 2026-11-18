@@ -85,17 +85,19 @@ class TestInit(CliCase):
 
     def test_init_client_and_hub(self):
         code, out, err = run(["init", "client", "--url", "http://127.0.0.1:7700", "--token-env", "TOK", "--name",
-                              "home"], env={"TOK": "hv_abc"})
+                              "home"], env={"TOK": "hv_abc0123456789abcdefghijklmnopqrstuvwxyzABCD"})
         self.assertEqual(code, 0, err)
         cc = config.load_client_config()
         self.assertEqual(cc.default, "home")
-        self.assertEqual(Path(cc.connections["home"].token_file).read_text().strip(), "hv_abc")
-        code, out, err = run(["init", "client", "--url", "http://127.0.0.1:7700", "--token", "hv_x", "--name", "b"])
+        self.assertEqual(Path(cc.connections["home"].token_file).read_text().strip(), "hv_abc0123456789abcdefghijklmnopqrstuvwxyzABCD")
+        code, out, err = run(["init", "client", "--url", "http://127.0.0.1:7700", "--token", "hv_x0123456789abcdefghijklmnopqrstuvwxyzABCD", "--name", "b"])
         self.assertIn("visible in ps", err)
         code, out, err = run(["init", "hub", "--yes"])
         self.assertEqual(code, 0, err)
         self.assertTrue((self.home / "hub" / "config.json").exists())
-        self.assertEqual(run(["init", "hub", "--yes"])[0], 2)
+        code, out, err = run(["init", "hub", "--yes"])
+        self.assertEqual(code, 0, err)                     # external review round 2: a friendly no-op
+        self.assertIn("nothing to change", out)
 
 
 class TestNodeCommands(CliCase):

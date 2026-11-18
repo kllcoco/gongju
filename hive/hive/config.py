@@ -1158,6 +1158,23 @@ def _is_loopback_bind(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost") or (host not in ("tailscale",) and is_loopback_host(host))
 
 
+def check_listen_raw(lst: dict) -> None:
+    """The listen part of ``startup_safety_checks`` on a raw ``listen`` dict, run before an init writes it (v8.1,
+    external review round 2): plaintext HTTP on a non-loopback, non-tailnet address needs TLS or
+    ``allow_insecure_remote``, else the daemon would refuse to start after the change."""
+    if not isinstance(lst, dict) or lst.get("enabled", True) is False:
+        return
+    host = str(lst.get("host") or "127.0.0.1")
+    tls = lst.get("tls") if isinstance(lst.get("tls"), dict) else {}
+    if bool(tls.get("cert")) != bool(tls.get("key")):
+        raise bad_request("listen.tls needs both cert and key", hint="pass both --tls-cert and --tls-key")
+    if _is_loopback_bind(host) or host == "tailscale" or _is_cgnat_literal(host) or tls.get("cert") \
+            or lst.get("allow_insecure_remote"):
+        return
+    raise forbidden(f"refusing plaintext HTTP on {host}; nothing was changed",
+                    hint="use --tailscale (WireGuard, no certificate), --tls-cert/--tls-key, or listen on 127.0.0.1")
+
+
 def startup_safety_checks(cfg: Any, kind: str) -> List[str]:
     """Raise on fatal startup problems (§5.1 item 4, consent, root); return warnings."""
     warnings: List[str] = []
@@ -1376,6 +1393,7 @@ def init_node(*, name: Optional[str] = None, preset: str = "standard", topology:
         agent_entry["require_approval"] = list(CAUTIOUS_ACTIONS)
     raw["auth"] = {"tokens": [{"name": "owner", "sha256": hash_token(owner_tok), "kind": "owner",
                                "note": "local CLI"}, agent_entry]}
+    check_listen_raw(raw["listen"])
     cfg = _parse_node(copy.deepcopy(raw), cfg_path)
     secure_mkdir(cfg_path.parent, required=True)
     write_json_atomic(cfg_path, raw, private=True)
@@ -1430,8 +1448,10 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
                         tls_cert: Optional[str], tls_key: Optional[str], proxy: Optional[str], mirror: Optional[str],
                         models_dir: Optional[str], wsl_keepalive: Sequence[str]) -> Tuple[NodeConfig, Dict[str, str]]:
     changed: List[str] = []
+    before: Dict[str, Any] = {}
 
     def fn(raw: dict) -> None:
+        before["listen"] = copy.deepcopy(raw.get("listen") or {})
         if jd is not None or relay_url:
             url = jd["u"] if jd is not None else relay_url
             tok = jd["t"] if jd is not None else relay_token
@@ -1511,11 +1531,88 @@ def _edit_existing_node(cfg_path: Path, *, jd: Optional[dict], topology: Optiona
         if not changed:
             raise bad_request("config exists; pass the settings to change, or --force to rewrite (new tokens)",
                               path=str(cfg_path))
+        if lst != before["listen"]:
+            check_listen_raw(lst)
 
     edit_config(cfg_path, fn, kind="node")
     cfg = load_node_config(str(cfg_path))
     cfg._changed = sorted(set(changed))  # type: ignore[attr-defined]
+    cfg._notes = []  # type: ignore[attr-defined]
+    if "listen" in changed or "listen.tls" in changed:
+        cfg._notes = _sync_local_node_listen(before.get("listen") or {}, cfg)  # type: ignore[attr-defined]
     return cfg, {}
+
+
+def _listen_url(enabled: bool, port: Any, tls: bool, default_port: int) -> Optional[str]:
+    if not enabled:
+        return None
+    return f"{'https' if tls else 'http'}://127.0.0.1:{port or default_port}"
+
+
+def _sync_local_node_listen(old: dict, cfg: NodeConfig) -> List[str]:
+    """After ``init node --listen/--no-listen`` on an existing config (v8.1, external review round 2): point the
+    client.json connections ``this-pc``/``this-pc-owner`` at the new local URL (dropped when the node stops
+    listening, so the CLI never talks to another node on the old port), and the hub-on-this-machine's direct entry
+    for the old URL (``--with-local-node``) at the new one. Returns lines for the CLI."""
+    notes: List[str] = []
+    paths = default_paths()
+    tokdir = paths["tokens"]
+    lst = cfg.listen
+    old_url = _listen_url(old.get("enabled", True) is not False, old.get("port", NODE_PORT),
+                          bool((old.get("tls") or {}).get("cert")), NODE_PORT)
+    new_url = _listen_url(bool(lst.enabled), lst.port, bool(lst.tls.cert), NODE_PORT)
+    if old_url == new_url:
+        return notes
+    names = ("this-pc", "this-pc-owner")
+
+    def upd(c: dict) -> None:
+        conns = c.setdefault("connections", {})
+        for n in names:
+            if new_url is None:
+                if conns.pop(n, None) is not None:
+                    notes.append(f"client.json: removed connection {n} (the node no longer listens)")
+            elif n in conns or (tokdir / f"{n}.token").exists():
+                e = dict(conns.get(n) or {"token_file": str(tokdir / f"{n}.token")})
+                e["url"] = new_url
+                conns[n] = e
+                notes.append(f"client.json: {n} -> {new_url}")
+        if c.get("default") in names and c.get("default") not in conns:
+            rest = sorted(conns)
+            if rest:
+                c["default"] = rest[0]
+            else:
+                c.pop("default", None)
+    _client_update(upd)
+    hub_path = paths["hub_config"]
+    if old_url and hub_path.exists():
+        hit: List[str] = []
+
+        def hub_fn(raw: dict) -> None:
+            for n in raw.get("nodes") or []:
+                if isinstance(n, dict) and n.get("mode") == "direct" and \
+                        str(n.get("url") or "").rstrip("/") == old_url:
+                    if new_url is not None:
+                        n["url"] = new_url
+                    hit.append(str(n.get("name")))
+        try:
+            raw0 = read_json(hub_path, default=None) or {}
+            if any(isinstance(n, dict) and n.get("mode") == "direct" and str(n.get("url") or "").rstrip("/") == old_url
+                   for n in (raw0.get("nodes") or [] if isinstance(raw0, dict) else [])):
+                if new_url is not None:
+                    edit_config(hub_path, hub_fn, kind="hub")
+                else:
+                    hub_fn(copy.deepcopy(raw0))
+        except HiveError as e:
+            notes.append(f"warning: could not update the hub config: {e.message}")
+        for name in hit:
+            if new_url is not None:
+                notes.append(f"hub config: local node '{name}' -> {new_url} (restart the hub to apply: "
+                             "hive hub restart)")
+            else:
+                notes.append(f"warning: the hub on this machine reaches node '{name}' at {old_url}, which no longer "
+                             f"listens; give the node a loopback listen again or remove it: hive hub remove-node "
+                             f"{name}")
+    return notes
 
 
 def init_hub(*, name: Optional[str] = None, listen: str = "127.0.0.1:7700", public_url: Optional[str] = None,
@@ -1551,6 +1648,7 @@ def init_hub(*, name: Optional[str] = None, listen: str = "127.0.0.1:7700", publ
         entry = _local_node_entry(raw["name"])
         local_name = entry["name"]
         raw["nodes"] = [entry]
+    check_listen_raw(raw["listen"])
     cfg = _parse_hub(copy.deepcopy(raw), cfg_path)
     cfg._local_node = local_name  # type: ignore[attr-defined]
     secure_mkdir(cfg_path.parent, required=True)
@@ -1607,6 +1705,7 @@ def edit_hub_init(*, listen: Optional[str] = None, tailscale: bool = False, publ
 
     def fn(raw: dict) -> None:
         lst = raw.setdefault("listen", {})
+        local["old"] = copy.deepcopy(lst)
         if tailscale:
             lst["host"] = "tailscale"
             changed.append("listen")
@@ -1633,6 +1732,8 @@ def edit_hub_init(*, listen: Optional[str] = None, tailscale: bool = False, publ
         if not changed:
             raise bad_request("hub config exists; pass the settings to change, or --force to rewrite (new tokens)",
                               path=str(cfg_path))
+        if lst != local["old"]:
+            check_listen_raw(lst)
 
     if local_node:
         # refuse a name clash before a token is minted into the node config
@@ -1654,6 +1755,20 @@ def edit_hub_init(*, listen: Optional[str] = None, tailscale: bool = False, publ
     cfg = load_hub_config(str(cfg_path))
     cfg._changed = sorted(set(changed))  # type: ignore[attr-defined]
     cfg._local_node = (local.get("entry") or {}).get("name")  # type: ignore[attr-defined]
+    cfg._notes = []  # type: ignore[attr-defined]
+    old = local.get("old") or {}
+    old_url = _listen_url(True, old.get("port", HUB_PORT), bool((old.get("tls") or {}).get("cert")), HUB_PORT)
+    new_url = _listen_url(True, cfg.listen.port, bool(cfg.listen.tls.cert), HUB_PORT)
+    if "listen" in changed and old_url != new_url:
+        # v8.1 (external review round 2): hub-local follows the hub's port
+        def upd(c: dict) -> None:
+            conns = c.setdefault("connections", {})
+            if "hub-local" in conns or (paths["tokens"] / "hub-owner.token").exists():
+                e = dict(conns.get("hub-local") or {"token_file": str(paths["tokens"] / "hub-owner.token")})
+                e["url"] = new_url
+                conns["hub-local"] = e
+                cfg._notes.append(f"client.json: hub-local -> {new_url}")  # type: ignore[attr-defined]
+        _client_update(upd)
     return cfg
 
 

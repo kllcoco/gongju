@@ -17,7 +17,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as _xml_escape
 
 from . import __version__, util
@@ -431,6 +431,9 @@ def install(kind: str, config_path: Path, *, method: str = "auto", system: bool 
     ctx = _context(kind, config_path, home=home)
     check_launcher(ctx.data_dir)
     res = InstallResult(method=m)
+    hand: Optional[dict] = None
+    if _installed(ctx)[0] is None:
+        hand = _holder(ctx)        # a daemon runs but no installation started it: `hive <kind> run` by hand
     if m == "systemd":
         _install_systemd(ctx, res, system=system, dry_run=dry_run, capture_path=capture_path)
     elif m == "launchd":
@@ -439,6 +442,10 @@ def install(kind: str, config_path: Path, *, method: str = "auto", system: bool 
         _install_schtasks(ctx, res, dry_run=dry_run, capture_path=capture_path)
     else:
         _install_watchdog(ctx, res, dry_run=dry_run, capture_path=capture_path)
+    if hand is not None:
+        # v8.1 (external review round 2): the installed copy cannot start while that one holds the lock
+        res.notes.append(f"a {kind} started by hand is running (pid {hand.get('pid')}): stop it (Ctrl-C in "
+                         f"its window, or hive {kind} stop) and the service takes over within a few seconds")
     if dry_run:
         res.notes.insert(0, "dry run: nothing was written or started")
     return res
@@ -862,6 +869,7 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
             res.commands.append(_schtasks("/Run", "/TN", TASK_NAMES[kind]))
         return res
     old: Optional[dict] = None
+    marks: Dict[Path, int] = {}
     if h is None:
         if method is None:
             raise unavailable(f"the {kind} is not running", hint=f"start it: hive {kind} run (or hive service "
@@ -869,6 +877,7 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
         _issue_start(ctx, method, system, res)
     else:
         old = h
+        marks = _log_marks(ctx)
         _write_control(ctx, "restart")
         end = _clock() + EXIT_WAIT
         # until the old start is gone: its pid exited, or the lock holder changed (a foreground re-exec, v8.1)
@@ -883,6 +892,11 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
             if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
                 res.notes.append(f"its launcher restarted the {kind}")
                 return res
+            why = _start_failure(ctx, marks)
+            if why:
+                # v8.1 (external review round 2): it did re-exec (or was relaunched) and refused the new settings
+                raise unavailable(f"the {kind} restarted but could not start: {why}",
+                                  hint=f"fix the setting (hive init {kind} …), then start it: hive {kind} run")
             raise unavailable(f"the {kind} stopped, but it ran in the foreground (no service installation restarts "
                               "it)", hint=f"start it again: hive {kind} run")
         if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
@@ -897,9 +911,53 @@ def restart(kind: str, *, dry_run: bool = False) -> InstallResult:
             _execute(c)
         if _wait_new_holder(ctx, old, HOLDER_WAIT) is not None:
             return res
+    why = _start_failure(ctx, marks) if old is not None else None
+    if why:
+        raise unavailable(f"the {kind} restarted but could not start: {why}",
+                          hint=f"fix the setting (hive init {kind} …); {method} keeps retrying, or start it by hand: "
+                               f"{_manual(ctx, method, system)}")
     raise unavailable(f"the {kind} did not start within {HOLDER_WAIT:g} s",
                       hint=f"start it by hand: {_manual(ctx, method, system)}; see the {kind} log in "
                            f"{ctx.data_dir / 'logs'}")
+
+
+_START_FAIL_RE = re.compile(r"(?:node|hub) failed to start: (.+)|(refusing to run[^\n]*)|"
+                            r"((?:address already in use|only one usage of each socket address)[^\n]*)", re.I)
+
+
+def _log_files(ctx: _Ctx) -> List[Path]:
+    logs = ctx.data_dir / "logs"
+    return [logs / f"{ctx.kind}.log", logs / "stdout.log"]
+
+
+def _log_marks(ctx: _Ctx) -> Dict[Path, int]:
+    out: Dict[Path, int] = {}
+    for p in _log_files(ctx):
+        try:
+            out[p] = p.stat().st_size
+        except OSError:
+            out[p] = 0
+    return out
+
+
+def _start_failure(ctx: _Ctx, marks: Dict[Path, int]) -> Optional[str]:
+    """The reason of a start failure the daemon logged since ``marks`` (v8.1): "<kind> failed to start: …",
+    "refusing to run …" or an address-in-use bind error; None when nothing like that was logged."""
+    found: Optional[str] = None
+    for p, start in marks.items():
+        try:
+            with open(str(p), "rb") as fh:
+                if fh.seek(0, 2) < start:
+                    start = 0
+                fh.seek(start)
+                text = fh.read(1 << 20).decode("utf-8", "replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = _START_FAIL_RE.search(line)
+            if m:
+                found = (m.group(1) or m.group(2) or m.group(3) or "").strip()[:300]
+    return found
 
 
 __all__ = ["METHODS", "InstallResult", "detect_method", "install", "uninstall", "status", "restart",

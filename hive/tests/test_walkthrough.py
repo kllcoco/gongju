@@ -265,9 +265,13 @@ class TestInitHub(CliCase):
         self.assertEqual(raw["listen"]["port"], 7790)
         self.assertEqual(raw["tokens"], before)
         self.assertEqual((self.home / "tokens" / "hub-owner.token").read_text(), tok)
-        code, out, err = run(["init", "hub"])                               # nothing to change
-        self.assertEqual(code, 2)
-        self.assertIn("--force", err)
+        code, out, err = run(["init", "hub"])                               # nothing to change: a no-op
+        self.assertEqual(code, 0, err)
+        self.assertIn("nothing to change", out)
+        self.assertIn("--force", out)
+        # external review round 2: hub-local follows the port
+        cc = config.load_client_config()
+        self.assertEqual(cc.connections["hub-local"].url, "http://127.0.0.1:7790")
 
     def test_rerun_with_local_node_adds_it(self):
         self.assertEqual(run(["init", "node", "--yes", "--name", "desk"])[0], 0)
@@ -307,13 +311,13 @@ class TestInitHub(CliCase):
 class TestInitClientToken(CliCase):
     def test_token_from_stdin_saved_private(self):
         code, out, err = run(["init", "client", "--name", "home", "--url", "http://127.0.0.1:7700", "--token", "-",
-                              "--default"], stdin="hv_secret123\n")
+                              "--default"], stdin="hv_secret1230123456789abcdefghijklmnopqrstuvwxyzABCD\n")
         self.assertEqual(code, 0, err)
         p = self.home / "tokens" / "home.token"
-        self.assertEqual(p.read_text().strip(), "hv_secret123")
+        self.assertEqual(p.read_text().strip(), "hv_secret1230123456789abcdefghijklmnopqrstuvwxyzABCD")
         if os.name == "posix":
             self.assertEqual(p.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn("hv_secret123", out + err)
+        self.assertNotIn("hv_secret1230123456789abcdefghijklmnopqrstuvwxyzABCD", out + err)
         self.assertNotIn("visible in ps", err)
         cc = config.load_client_config()
         self.assertEqual(cc.default, "home")
@@ -322,13 +326,13 @@ class TestInitClientToken(CliCase):
     def test_token_to_named_file_and_prompt(self):
         target = self.home / "elsewhere" / "h.token"
         with mock.patch.object(cli.sys, "stdin", _Tty()), \
-                mock.patch.object(cli.getpass, "getpass", return_value="hv_prompted") as gp, \
+                mock.patch.object(cli.getpass, "getpass", return_value="hv_prompted0123456789abcdefghijklmnopqrstuvwxyzABCD") as gp, \
                 mock.patch("sys.stdout", new_callable=io.StringIO):
             code = cli.main(["init", "client", "--name", "h", "--url", "http://127.0.0.1:7700", "--token", "-",
                              "--token-file", str(target)])
         self.assertEqual(code, 0)
         gp.assert_called_once()
-        self.assertEqual(target.read_text().strip(), "hv_prompted")
+        self.assertEqual(target.read_text().strip(), "hv_prompted0123456789abcdefghijklmnopqrstuvwxyzABCD")
         if os.name == "posix":
             self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
@@ -344,7 +348,7 @@ class TestInitClientToken(CliCase):
     @unittest.skipUnless(os.name == "posix", "POSIX modes")
     def test_existing_token_file_is_tightened(self):
         tf = self.home / "t.token"
-        tf.write_text("hv_x\n")
+        tf.write_text("hv_x0123456789abcdefghijklmnopqrstuvwxyzABCD\n")
         os.chmod(tf, 0o644)
         code, out, err = run(["init", "client", "--name", "h", "--url", "http://127.0.0.1:7700", "--token-file",
                               str(tf)])

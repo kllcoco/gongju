@@ -228,9 +228,17 @@ class TestLifecycle(SvcCase):
         e = self.n.err("service.define", {"name": "clash", "argv": SLEEPER, "port": port, "health": "none"})
         self.assertEqual(e["code"], "conflict")
         self.assertIn(f"port {port} in use", e["message"])
-        self.assertEqual(self.state("clash"), "failed")
+        # external review round 2: a NEW definition refused on its port is not kept
+        self.assertIn("the service was not saved", e["message"])
+        self.assertNotIn("clash", [x["name"] for x in self.n.ok("service.list", {})["services"]])
         r = self.define(name="clash", argv=SLEEPER, port=port, health="none", force_port=True, wait=10)
         self.assertEqual(r["state"], "running")
+        self.assertTrue(r["created"])
+        # an existing definition stays (its update is what failed to start)
+        e = self.n.err("service.define", {"name": "clash", "argv": SLEEPER + ["x"], "port": port,
+                                          "health": "none"})
+        self.assertEqual(e["code"], "conflict")
+        self.assertIn("clash", [x["name"] for x in self.n.ok("service.list", {})["services"]])
 
     def test_define_change_restarts_and_redacts(self):
         r = self.define(name="cfg", argv=SLEEPER, env=["MODE=a", "MY_API_KEY=supersecretvalue"], wait=10)

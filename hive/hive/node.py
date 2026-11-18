@@ -30,8 +30,8 @@ from . import __version__, catalog, schema
 from .auth import Identity, TokenStore
 from .errors import (HiveError, bad_request, conflict, internal, not_found, timeout as timeout_error, unavailable,
                      unsupported, too_large)
-from .util import (FileLock, IS_WINDOWS, glob_match, iso_utc, new_id, pid_alive, process_create_time, secure_mkdir,
-                   write_json_atomic)
+from .util import (FileLock, IS_WINDOWS, glob_match, iso_utc, new_id, pid_alive, process_create_time, read_json,
+                   secure_mkdir, write_json_atomic)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import NodeConfig
@@ -354,6 +354,27 @@ class NodeRuntime:
             self.audit.record(kind="lifecycle", identity=None, ip="", via="", node=self.name, action=None,
                               params=None, ok=True, code=None, ms=0, request_id="", extra={"event": "resumed"})
         self._was_paused = paused
+        self._ack_paused(paused)
+
+    def _ack_paused(self, paused: bool) -> None:
+        """Write ``paused.ack`` once the node applies a PAUSED change (v8.1, external review round 2): ``hive node
+        pause``/``resume`` confirm through it, with or without a listener (relay-only nodes)."""
+        nonce = None
+        if paused:
+            try:
+                raw = read_json(self.data_dir / "PAUSED", None)
+                nonce = raw.get("id") if isinstance(raw, dict) else None
+            except Exception:  # noqa: BLE001
+                nonce = None
+        key = (paused, nonce)
+        if getattr(self, "_acked", None) == key:
+            return
+        try:
+            write_json_atomic(self.data_dir / PAUSED_ACK, {"paused": paused, "id": nonce, "pid": os.getpid(),
+                                                           "at": iso_utc()}, private=True)
+            self._acked = key
+        except OSError as e:
+            log.warning("cannot write %s: %s", PAUSED_ACK, e)
 
     def is_paused(self) -> bool:
         """PAUSED file present (1 s cache)."""
@@ -866,11 +887,28 @@ def build_server(rt: NodeRuntime) -> "ApiServer":
 # ---------------------------------------------------------------------------------------------------------------
 # kill switch (work whether or not the daemon runs)
 
-def pause(data_dir: Path) -> None:
-    """Write PAUSED (non-read calls denied within 1 s; the daemon revokes this node's grants)."""
+PAUSED_ACK = "paused.ack"
+
+
+def pause(data_dir: Path) -> str:
+    """Write PAUSED (non-read calls denied within 1 s; the daemon revokes this node's grants); returns its id, which
+    the running node echoes in ``paused.ack`` once applied (v8.1)."""
     d = Path(data_dir)
     secure_mkdir(d)
-    write_json_atomic(d / "PAUSED", {"at": iso_utc()}, private=True)
+    nonce = os.urandom(6).hex()
+    write_json_atomic(d / "PAUSED", {"at": iso_utc(), "id": nonce}, private=True)
+    return nonce
+
+
+def pause_acked(data_dir: Path, *, paused: bool, nonce: Optional[str] = None) -> bool:
+    """The running node has applied this pause (same id) or the resume (v8.1, ``paused.ack``)."""
+    try:
+        raw = read_json(Path(data_dir) / PAUSED_ACK, None)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(raw, dict) or bool(raw.get("paused")) != paused:
+        return False
+    return not paused or nonce is None or raw.get("id") == nonce
 
 
 def resume(data_dir: Path, *, relay: bool = True) -> None:

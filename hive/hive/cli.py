@@ -220,7 +220,9 @@ def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> bool:
         out.line(f"applied (restarted the {kind})")
         return True
     except HiveError as e:
-        if e.code == "unavailable" and "foreground" in e.message:
+        if e.code == "unavailable" and "could not start" in e.message:
+            out.line(f"not applied: {e.message}" + (f"; {e.hint}" if e.hint else ""))
+        elif e.code == "unavailable" and "foreground" in e.message:
             out.line(f"the {kind} stopped to apply the change (it ran in the foreground without a terminal); "
                      f"start it again: hive {kind} run")
         else:
@@ -426,7 +428,12 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
     if not toks:
         changed = getattr(cfg, "_changed", [])
         out.line(f"updated {cfg_path}: " + (", ".join(changed) if changed else "no changes"))
+        notes = list(getattr(cfg, "_notes", None) or [])
+        for n in notes:
+            out.line(n)
         _restart_daemon("node", out, no_restart=args.no_restart)
+        if any(n.startswith("hub config:") for n in notes):
+            _restart_daemon("hub", out, no_restart=args.no_restart)
         return EXIT_OK
     lst = cfg.listen
     out.line(f"node '{cfg.name}' configured at {cfg_path} (preset {cfg.policy.preset})")
@@ -526,6 +533,8 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
         changed = getattr(cfg, "_changed", [])
         out.line(f"updated {paths['hub_config']}: " + (", ".join(changed) if changed else "no changes")
                  + " (tokens unchanged)")
+        for n in getattr(cfg, "_notes", None) or []:
+            out.line(n)
         if args.funnel:
             out.line("expose it to pods with: tailscale funnel --bg 7709")
         _apply_local_node(cfg, out)
@@ -568,12 +577,22 @@ def _tighten_token_file(path: Path, out: Out) -> None:
         pass
 
 
+CLIENT_TOKEN_RE = re.compile(r"^hv_[A-Za-z0-9_-]{32,256}$")
+
+
 def cmd_init_client(args: argparse.Namespace, out: Out) -> int:
     """``hive init client`` (``--token -``: from stdin or a hidden prompt, saved 0600 by Hive itself, v8.1)."""
     from . import config
     name = args.name or "default"
     stdin_token = getattr(args, "token", None) == "-"
     tok = _read_token_arg(args, out)
+    if tok is not None:
+        tok = tok.strip()
+        if not CLIENT_TOKEN_RE.match(tok):
+            # v8.1 (external review round 2): a partial or mistaken paste is caught here, not later as "invalid token"
+            shown = (tok[:6] + "…") if len(tok) > 6 else tok
+            raise CliError(f"that does not look like a Hive token ({shown!r}, {len(tok)} characters); nothing was "
+                           "saved", hint="copy the whole hv_… line the hub or node printed (about 46 characters)")
     token_file = None
     if args.token_file and not args.token_env:
         tf = Path(os.path.expanduser(args.token_file)).resolve()
@@ -647,9 +666,12 @@ def cmd_node_run(args: argparse.Namespace, out: Out) -> int:
 
 
 def cmd_node_status(args: argparse.Namespace, out: Out) -> int:
-    """``hive node status`` (HTTP via this-pc-owner; file-based when the daemon is down)."""
+    """``hive node status`` (HTTP via this-pc-owner; file-based when the daemon is down or, v8.1 external review
+    round 2, does not listen: no this-pc-owner connection, never the client default)."""
     client = None
     try:
+        if not _local_owner_conn(args):
+            raise HiveError("unavailable", "no local connection")
         client = _connect(args, owner_default=True)
         info = client.call("node.info", {})
         jobs: Any = None
@@ -708,7 +730,10 @@ def cmd_node_status(args: argparse.Namespace, out: Out) -> int:
     if out.as_json:
         out.data(st)
         return EXIT_OK
-    if holder is not None:
+    if holder is not None and not cfg.listen.enabled:
+        out.line(f"node '{cfg.name}' is running (pid {holder.get('pid')}); it does not listen, so this is read from "
+                 "its state files")
+    elif holder is not None:
         out.line(f"node '{cfg.name}' holds its lock (pid {holder.get('pid')}) but does not answer on this-pc-owner")
     else:
         out.line(f"node '{cfg.name}' is not running (start it: hive node run, or hive service install node)")
@@ -767,11 +792,11 @@ def cmd_node_pause(args: argparse.Namespace, out: Out) -> int:
     from . import node
     cfg = _node_config(args)
     d = _data_dir(cfg)
-    node.pause(d)
+    nonce = node.pause(d)
     if _holder(d) is None:
         out.line("paused (the node is not running; it starts paused): non-read calls are refused and nothing is "
                  "spawned; resume with: hive node resume")
-    elif _wait_paused(args, PAUSE_CONFIRM_S):
+    elif _wait_paused(args, PAUSE_CONFIRM_S, data_dir=d, paused=True, nonce=nonce):
         out.line("paused (confirmed by the running node): non-read calls are refused and nothing is spawned; resume "
                  "with: hive node resume")
     else:
@@ -783,36 +808,62 @@ def cmd_node_pause(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
-PAUSE_CONFIRM_S = 3.0     # v8.1: node pause waits this long for the running node to report paused
+PAUSE_CONFIRM_S = 3.0     # v8.1: node pause/resume wait this long for the running node to apply it
 
 
-def _wait_paused(args: argparse.Namespace, budget: float) -> bool:
-    """v8.1: ``hive node pause`` returns once the running node reports ``paused`` (node.info), at most ``budget``."""
+def _local_owner_conn(args: argparse.Namespace) -> bool:
+    """An HTTP route to THIS node: --connection/HIVE_URL/HIVE_CONNECTION given, or client.json has this-pc-owner
+    (removed when the node stops listening), never the client default, which may be another node or a hub."""
+    if getattr(args, "connection", None) or os.environ.get("HIVE_URL") or os.environ.get("HIVE_CONNECTION"):
+        return True
+    try:
+        from .config import load_client_config
+        return "this-pc-owner" in load_client_config().connections
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wait_paused(args: argparse.Namespace, budget: float, *, data_dir: Optional[Path] = None, paused: bool = True,
+                 nonce: Optional[str] = None) -> bool:
+    """v8.1: ``hive node pause``/``resume`` return once the running node has applied it, at most ``budget``: its
+    ``paused.ack`` (works without a listener, external review round 2) or, over this-pc-owner, ``node.info``."""
+    from . import node
     end = time.monotonic() + budget
     client = None
     try:
-        client = _connect(args, owner_default=True)
-        while True:
+        if _local_owner_conn(args):
             try:
-                if client.call("node.info", {}, timeout=2).get("paused"):
-                    return True
+                client = _connect(args, owner_default=True)
             except HiveError:
-                pass
+                client = None
+        while True:
+            if data_dir is not None and node.pause_acked(data_dir, paused=paused, nonce=nonce):
+                return True
+            if client is not None:
+                try:
+                    if bool(client.call("node.info", {}, timeout=2).get("paused")) == paused:
+                        return True
+                except HiveError:
+                    pass
             if time.monotonic() >= end:
                 return False
             time.sleep(0.2)
-    except HiveError:
-        return False
     finally:
         if client is not None:
             client.close()
 
 
 def cmd_node_resume(args: argparse.Namespace, out: Out) -> int:
-    """``hive node resume [--no-relay]``."""
+    """``hive node resume [--no-relay]`` (v8.1, external review round 2: waits ≤ 3 s until the running node has
+    applied it, so the next call is not refused as paused)."""
     from . import node
     cfg = _node_config(args)
-    node.resume(_data_dir(cfg), relay=not args.no_relay)
+    d = _data_dir(cfg)
+    node.resume(d, relay=not args.no_relay)
+    if _holder(d) is not None and not _wait_paused(args, PAUSE_CONFIRM_S, data_dir=d, paused=False):
+        out.line("resumed: the running node did not confirm within 3 s (it applies it within about 1 s); nothing "
+                 "was restarted")
+        return EXIT_OK
     out.line("resumed (nothing was restarted)")
     return EXIT_OK
 
@@ -2877,10 +2928,20 @@ def cmd_guide(args: argparse.Namespace, out: Out) -> int:
     if out.as_json:
         out.data({"topic": args.topic or "overview", "text": text})
         return EXIT_OK
+    if (args.topic or "").strip().lower() == "presets":
+        # v8.1 (external review round 2): the topic is written for agents' tool calls; map it to the CLI
+        out.line(PRESETS_CLI_LINE)
+        out.line("")
     out.line(text.rstrip("\n"))
     out.line("")
     out.line("topics: " + ", ".join(guides.TOPICS) + "   (hive guide TOPIC)")
     return EXIT_OK
+
+
+PRESETS_CLI_LINE = ("From the command line: hive service define NAME --preset P [--model M] [--arg key=value …] "
+                    "[--node N]; each preset_args entry 'key=value' below is one --arg key=value, and model=… is "
+                    "--model … (e.g. hive service define qwen --preset vllm --model Qwen/Qwen2.5-7B-Instruct --arg "
+                    "python=~/.venvs/vllm/bin/python).")
 
 
 def cmd_tls_pin(args: argparse.Namespace, out: Out) -> int:
