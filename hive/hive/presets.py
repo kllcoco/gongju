@@ -760,15 +760,35 @@ _Q_NONE, _Q_DOUBLE, _Q_LITERAL = 0, 1, 2
 def _posix_tokens(text: str) -> List[List[Tuple[str, int]]]:
     """Words of a POSIX shell string as ``[(char, quoting)]``: operators ``();<>|&`` and whitespace split words,
     ``#`` at a word start begins a comment; an unclosed quote raises ValueError."""
-    words: List[List[Tuple[str, int]]] = []
+    return [val[0] for kind, val in _posix_scan(text) if kind == "w"]
+
+
+def _posix_scan(text: str) -> List[Tuple[str, Any]]:
+    """``_posix_tokens`` with the command structure kept (v8.1, audit round 2): ``("w", (chars, redirect))`` per
+    word and ``("sep", None)`` where a simple command ends (``; & | ( )`` and newlines). ``redirect`` marks a word
+    after ``<``/``>`` (its target) and a digit word right before one (``2>&1``)."""
+    items: List[Tuple[str, Any]] = []
     cur: Optional[List[Tuple[str, int]]] = None
+    redir = False
     i, n = 0, len(text)
     while i < n:
         c = text[i]
         if c in " \t\r\n" or c in _SHELL_OPS:
             if cur is not None:
-                words.append(cur)
+                fd = c in "<>" and all(q == _Q_NONE and ch.isdigit() for ch, q in cur)
+                items.append(("w", (cur, redir or fd)))
+                redir = False
                 cur = None
+            prev = text[i - 1] if i else ""
+            nxt = text[i + 1] if i + 1 < n else ""
+            if c in "<>":
+                redir = True
+            elif (c == "&" and (prev in "<>" or nxt == ">")) or (c == "|" and prev == ">"):
+                pass        # >&, <&, &>, >|: part of a redirection
+            elif c == "\n" or c in _SHELL_OPS:
+                if not items or items[-1][0] != "sep":
+                    items.append(("sep", None))
+                redir = False
             i += 1
             continue
         if c == "#" and cur is None:
@@ -817,8 +837,8 @@ def _posix_tokens(text: str) -> List[List[Tuple[str, int]]]:
         cur.append((c, _Q_NONE))
         i += 1
     if cur is not None:
-        words.append(cur)
-    return words
+        items.append(("w", (cur, redir)))
+    return items
 
 
 _NAME_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -986,34 +1006,808 @@ def text_may_change_cwd(text: str) -> bool:
     return bool(_CWD_TEXT_RE.search(text) or _DYNAMIC_TEXT_RE.search(text))
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# v8.1 (audit round 2, finding 1): the script an interpreter runs is bound whatever its name looks like.
+#
+# Each simple command is read the way the program reads its arguments: leading NAME=VALUE assignments and shell
+# keywords, wrappers that run the rest of the line (env, nice, timeout, sudo, xargs, uv run, …), then a known
+# interpreter (sh family, python, perl, ruby, node, deno, bun, Rscript/R, php, lua, awk, sed, pwsh/powershell, cmd)
+# whose options are skipped with their values (``python -X dev``, ``bash -O extglob``, ``node --require x``,
+# ``perl -I dir``) until the script operand, which is bound as ``./name`` (a missing one is bound ``absent``).
+# ``python -m mod`` binds the module files the cwd would shadow; ``sh -c``/``cmd /c``/``pwsh -Command`` text is
+# read again as a command line. Words recognized as command names, option values that are not files, and code
+# (``-c``/``-e`` text) are "quiet": a missing one is not listed in the review header; every other missing word that
+# is not a flag or a path is listed as "no file here, not bound" (approval_review/hub).
+
+class _W:
+    """One word of a simple command: its text (quotes removed), bind spellings and whether it is a redirect target."""
+    __slots__ = ("text", "spellings", "redir")
+
+    def __init__(self, text: str, spellings: List[Optional[str]], redir: bool = False) -> None:
+        self.text = text
+        self.spellings = spellings
+        self.redir = redir
+
+
+def _plain_spellings(w: str) -> List[Optional[str]]:
+    """Spellings of a word nothing expands (argv element, PowerShell/cmd word, option value)."""
+    lit = _literal_spelling(w)
+    if w.startswith("~"):
+        return [lit, None if _known_var(w) else w]
+    return [lit]
+
+
+class _Roles:
+    """What ``_scan_commands`` found: script operands (text -> spellings), quiet words, extra paths bound quietly
+    (python -m module files, cmd PATHEXT names), command text to read again, header items, cwd changes."""
+
+    def __init__(self) -> None:
+        self.ops: Dict[str, List[Optional[str]]] = {}
+        self.quiet: set = set()
+        self.extras: List[str] = []
+        self.nested: List[Tuple[str, str]] = []
+        self.unbound: List[str] = []
+        self.cwd = False
+
+    def hush(self, w: Union[_W, str]) -> None:
+        """Not listed when missing (a path-like word is still bound and listed as before)."""
+        text = w.text if isinstance(w, _W) else w
+        for sp in [text] + list(w.spellings if isinstance(w, _W) else _plain_spellings(text)):
+            if sp is not None and not _pathlike(sp):
+                self.quiet.add(sp)
+
+    def op(self, w: Union[_W, str], *, pathext: bool = False) -> None:
+        """``w`` is a script the program runs: bind it as a path relative to the cwd (``./name``)."""
+        if isinstance(w, str):
+            w = _W(w, _plain_spellings(w))
+        if not w.text or w.text == "-":
+            return
+        if pathext and "." not in os.path.basename(w.text.replace("\\", "/")):
+            self.hush(w)
+            for ext in _PATHEXT:   # cmd runs name.com/.exe/.bat/.cmd from the cwd before PATH
+                self.extra(w.text + ext)
+            return
+        out: List[Optional[str]] = []
+        for sp in w.spellings:
+            if sp is not None and relative_word(sp) and not _pathlike(sp) and not sp.startswith(("./", ".\\")):
+                sp = LITERAL_PREFIX + sp
+            if sp not in out:
+                out.append(sp)
+        self.ops.setdefault(w.text, out)
+
+    def extra(self, path: str) -> None:
+        if relative_word(path) and not path.startswith(("./", ".\\")):
+            path = LITERAL_PREFIX + path
+        if path not in self.extras:
+            self.extras.append(path)
+            self.quiet.add(path)
+
+
+_PATHEXT = (".com", ".exe", ".bat", ".cmd")
+_SCAN_DEPTH = 4
+_SH_KEYWORDS = frozenset({"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "fi", "done", "esac",
+                          "function", "coproc", "[[", "]]"})
+_CMD_BUILTINS = frozenset({
+    "assoc", "break", "call", "cd", "chdir", "cls", "color", "copy", "date", "del", "dir", "echo", "endlocal",
+    "erase", "exit", "for", "ftype", "goto", "if", "md", "mkdir", "mklink", "move", "path", "pause", "popd", "prompt",
+    "pushd", "rd", "rem", "ren", "rename", "rmdir", "set", "setlocal", "shift", "start", "time", "title", "type",
+    "ver", "verify", "vol"})
+_NUMERIC_RE = re.compile(r"^[+-]?[0-9][0-9.:,_]*[A-Za-z%]{0,3}$")
+
+
+def _cmd_base(word: str) -> str:
+    base = word.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return base[:-4] if base.endswith(".exe") else base
+
+
+# wrappers that run the rest of their words as a command:
+# (short options with a value, long options with a value, positional words before the command, options that change
+#  the cwd, options after which no command runs, options whose value is a command line, options whose value is a file)
+_Wrap = Tuple[str, AbstractSet[str], int, AbstractSet[str], AbstractSet[str], AbstractSet[str], AbstractSet[str]]
+_E: AbstractSet[str] = frozenset()
+_WRAPPERS: Dict[str, _Wrap] = {
+    "env": ("uCSP", frozenset({"--unset", "--chdir", "--split-string"}), 0, frozenset({"-C", "--chdir"}), _E,
+            frozenset({"-S", "--split-string"}), _E),
+    "nice": ("n", frozenset({"--adjustment"}), 0, _E, _E, _E, _E),
+    "timeout": ("sk", frozenset({"--signal", "--kill-after"}), 1, _E, _E, _E, _E),
+    "sudo": ("ugChprtTUDRac", frozenset({"--user", "--group", "--close-from", "--chdir", "--chroot", "--prompt",
+                                          "--role", "--type", "--command-timeout", "--other-user", "--host",
+                                          "--login-class", "--auth-type"}), 0,
+             frozenset({"-D", "--chdir", "-R", "--chroot"}),
+             frozenset({"-e", "--edit", "-l", "--list", "-v", "--validate", "-K", "-V", "--version"}), _E, _E),
+    "doas": ("uC", _E, 0, _E, _E, _E, _E),
+    "xargs": ("adEILnPs", frozenset({"--arg-file", "--delimiter", "--max-lines", "--max-args", "--max-procs",
+                                     "--max-chars", "--process-slot-var", "--replace", "--eof"}), 0, _E, _E, _E,
+              frozenset({"-a", "--arg-file"})),
+    "nohup": ("", _E, 0, _E, _E, _E, _E),
+    "setsid": ("", _E, 0, _E, _E, _E, _E),
+    "time": ("fo", frozenset({"--format", "--output"}), 0, _E, _E, _E, _E),
+    "stdbuf": ("ioe", frozenset({"--input", "--output", "--error"}), 0, _E, _E, _E, _E),
+    "ionice": ("cnpPu", frozenset({"--class", "--classdata", "--pid", "--pgid", "--uid"}), 0, _E,
+               frozenset({"-p", "--pid", "-P", "--pgid", "-u", "--uid"}), _E, _E),
+    "chrt": ("TPD", frozenset({"--sched-runtime", "--sched-period", "--sched-deadline"}), 1, _E,
+             frozenset({"-p", "--pid", "-m", "--max"}), _E, _E),
+    "taskset": ("", _E, 1, _E, frozenset({"-p", "--pid"}), _E, _E),
+    "exec": ("a", _E, 0, _E, _E, _E, _E),
+    "command": ("", _E, 0, _E, frozenset({"-v", "-V"}), _E, _E),
+    "builtin": ("", _E, 0, _E, _E, _E, _E),
+    "caffeinate": ("wt", _E, 0, _E, _E, _E, _E),
+    "chroot": ("", frozenset({"--userspec", "--groups"}), 1, frozenset({"<positional>"}), _E, _E, _E),
+    "busybox": ("", _E, 0, _E, _E, _E, _E),
+    "wsl": ("du", frozenset({"--distribution", "--user", "--cd"}), 0, frozenset({"--cd"}),
+            frozenset({"-l", "--list", "--install", "--shutdown", "--terminate", "-t", "--export", "--import",
+                       "--unregister", "--set-default", "-s", "--status", "--update", "--mount", "--unmount",
+                       "--set-version", "--set-default-version", "--help", "--version", "-v"}), _E, _E),
+}
+# tools whose "run" subcommand runs the rest as a command (their value options; cwd options)
+_RUNNERS: Dict[str, _Wrap] = {
+    "uv": ("pf", frozenset({"--with", "--with-editable", "--with-requirements", "--python", "--project", "--directory",
+                            "--env-file", "--extra", "--group", "--only-group", "--no-group", "--no-extra", "--package",
+                            "--index", "--default-index", "--index-url", "--extra-index-url", "--find-links",
+                            "--config-file", "--cache-dir", "--prerelease", "--resolution", "--index-strategy",
+                            "--keyring-provider", "--exclude-newer", "--link-mode", "--refresh-package",
+                            "--reinstall-package", "--upgrade-package", "--no-binary-package", "--no-build-package",
+                            "--python-platform", "--color", "--allow-insecure-host", "--config-setting"}), 0,
+           frozenset({"--directory", "--project"}), _E, _E, frozenset({"--env-file", "--with-requirements"})),
+    "poetry": ("PC", frozenset({"--project", "--directory"}), 0, frozenset({"-C", "--directory", "-P", "--project"}),
+               _E, _E, _E),
+    "pipenv": ("", _E, 0, _E, _E, _E, _E),
+    "pdm": ("p", frozenset({"--project", "--venv"}), 0, frozenset({"-p", "--project"}), _E, _E, _E),
+    "conda": ("np", frozenset({"--name", "--prefix", "--cwd"}), 0, frozenset({"--cwd"}), _E, _E, _E),
+    "mamba": ("np", frozenset({"--name", "--prefix", "--cwd"}), 0, frozenset({"--cwd"}), _E, _E, _E),
+    "micromamba": ("np", frozenset({"--name", "--prefix", "--cwd"}), 0, frozenset({"--cwd"}), _E, _E, _E),
+}
+
+# interpreters: short options (letter -> role), long options (name -> role), what the first operand is, subcommands.
+# Roles: val (a value that is not a file: quiet), file (a value naming a file: listed when missing), rest (takes the
+# rest of the word only), code (code text; no script follows), code+ (code text; a script may still follow), prog
+# (awk/sed program text: operands are input files), script (the value is the script: bound), script! (the value
+# is the script and options end), module (python -m), lmod (lua -l), cwd (changes the cwd), nested (the value is a
+# command line: read again), nested+ (same, a script may still follow), shc (sh -c: the first operand is a command
+# line), stdin (no script operand), stop (nothing more to read), safe (python -I/-P: the cwd is not on sys.path).
+# Long names ending in "?" take a value only after "=".
+_Spec = Dict[str, Any]
+_SH_SPEC: _Spec = {"short": {"c": "shc", "s": "stdin", "o": "val", "O": "val"}, "plus": True,
+                   "long": {"--rcfile": "file", "--init-file": "file"}}
+_INTERP: Dict[str, _Spec] = {
+    "sh": _SH_SPEC,
+    "fish": {"short": {"c": "nested", "C": "nested+", "p": "file", "d": "val", "o": "file"},
+             "long": {"--command": "nested", "--init-command": "nested+", "--profile": "file", "--debug": "val",
+                      "--debug-output": "file", "--features": "val", "--profile-startup": "file"}},
+    "python": {"short": {"c": "code", "m": "module", "W": "val", "X": "val", "Q": "val", "I": "safe", "P": "safe"},
+               "long": {"--check-hash-based-pycs": "val"}},
+    "perl": {"short": {"e": "code", "E": "code", "I": "file", **{c: "rest" for c in "xi0lCdDFMmV"}}, "code_last": True},
+    "ruby": {"short": {"e": "code", "I": "file", "r": "file", "C": "cwd", "E": "val",
+                       **{c: "rest" for c in "xiF0lKTW"}},
+             "long": {"--encoding": "val", "--external-encoding": "val", "--internal-encoding": "val"},
+             "code_last": True},
+    "node": {"short": {"e": "code", "p": "code", "r": "file", "C": "val"},
+             "long": {**{k: "file" for k in ("--require", "--import", "--loader", "--experimental-loader",
+                                             "--env-file", "--env-file-if-exists", "--openssl-config",
+                                             "--experimental-policy", "--experimental-config-file", "--icu-data-dir",
+                                             "--redirect-warnings", "--localstorage-file")},
+                      **{k: "val" for k in ("--conditions", "--inspect-port", "--debug-port", "--input-type",
+                                            "--title", "--diagnostic-dir", "--tls-cipher-list", "--tls-keylog",
+                                            "--unhandled-rejections", "--dns-result-order", "--heapsnapshot-signal",
+                                            "--report-dir", "--report-directory", "--report-filename",
+                                            "--report-signal", "--watch-path", "--policy-integrity",
+                                            "--secure-heap", "--secure-heap-min", "--cpu-prof-dir",
+                                            "--cpu-prof-name", "--cpu-prof-interval", "--heap-prof-dir",
+                                            "--heap-prof-name", "--heap-prof-interval", "--test-reporter",
+                                            "--test-reporter-destination", "--test-name-pattern",
+                                            "--test-skip-pattern", "--test-concurrency", "--test-shard",
+                                            "--test-timeout", "--disable-warning", "--max-http-header-size")},
+                      "--eval": "code", "--print": "code", "--run": "stop"},
+             "subs": {"inspect": "again"}},
+    "deno": {"short": {"c": "file", "L": "val"},
+             "long": {"--config": "file", "--import-map": "file", "--lock": "file", "--cert": "file",
+                      "--location": "val", "--seed": "val", "--ext": "val", "--log-level": "val",
+                      "--env-file?": "file", "--preload": "file", "--watch-exclude?": "val"},
+             "subs": {**{k: "again" for k in ("run", "serve", "bench", "test", "compile", "check")}, "eval": "code",
+                      **{k: "stop" for k in ("task", "repl", "install", "x", "add", "remove", "fmt", "lint",
+                                             "upgrade", "init", "publish", "jupyter", "completions", "coverage",
+                                             "types", "uninstall", "outdated", "clean", "info", "doc", "lsp",
+                                             "vendor", "cache", "help", "approve-scripts")}}},
+    "bun": {"short": {"e": "code", "p": "code", "r": "file", "c": "file", "d": "val", "l": "val"},
+            "long": {"--cwd": "cwd", "--preload": "file", "--config": "file", "--env-file": "file",
+                     "--tsconfig-override": "file", "--define": "val", "--loader": "val", "--main-fields": "val",
+                     "--conditions": "val", "--port": "val", "--eval": "code", "--print": "code", "--shell": "val",
+                     "--filter": "val", "--elide-lines": "val"},
+            "subs": {"run": "again", **{k: "stop" for k in (
+                "test", "x", "install", "i", "add", "a", "remove", "rm", "build", "pm", "create", "c", "init",
+                "upgrade", "link", "unlink", "update", "outdated", "publish", "patch", "audit", "info", "exec", "repl",
+                "help")}}},
+    "rscript": {"short": {"e": "code"}, "long": {}, "code_last": True},
+    "r": {"short": {"f": "script!", "e": "code"}, "long": {"--file?": "script!"}, "first": "none",
+          "subs": {"CMD": "rcmd"}},
+    "php": {"short": {"c": "file", "d": "val", "f": "script!", "r": "code", "B": "code+", "R": "code", "F": "script",
+                      "E": "code+", "z": "file", "t": "file", "S": "val"},
+            "long": {"--php-ini": "file", "--define": "val", "--file": "script!", "--run": "code",
+                     "--process-begin": "code+", "--process-code": "code", "--process-file": "script",
+                     "--process-end": "code+", "--zend-extension": "file"},
+            "code_last": True},
+    "lua": {"short": {"e": "code+", "l": "lmod", "b": "stop", "j": "val", "O": "rest"}},
+    "awk": {"short": {"f": "script", "E": "script", "i": "script", "v": "val", "F": "val", "l": "file"},
+            "long": {"--file": "script", "--exec": "script", "--include": "script", "--assign": "val",
+                     "--field-separator": "val", "--load": "file", "--source": "prog"},
+            "first": "prog"},
+    "sed": {"short": {"f": "script", "e": "prog", "l": "val", "i": "rest"},
+            "long": {"--file": "script", "--expression": "prog", "--line-length": "val", "--in-place?": "val"},
+            "first": "prog"},
+    "osascript": {"short": {"e": "code", "l": "val", "s": "val"}, "code_last": True},
+    "tclsh": {"short": {}},
+}
+_PY_RE = re.compile(r"^(python|pypy|ipython)[0-9.]*[wmd]?$|^pyw?$")
+
+
+def _interp_kind(base: str) -> Optional[str]:
+    if re.match(r"^((ba|da|z|k|mk|a|ya|r|lk|ok|pdk|po)?sh|ksh93)$", base):
+        return "sh"
+    if _PY_RE.match(base):
+        return "python"
+    if re.match(r"^perl[0-9.]*$", base):
+        return "perl"
+    if re.match(r"^(j|truffle)?ruby[0-9.]*$", base):
+        return "ruby"
+    if base in ("node", "nodejs"):
+        return "node"
+    if re.match(r"^php[0-9.]*(-cli)?$", base):
+        return "php"
+    if re.match(r"^lua(jit|[0-9.]*)$", base):
+        return "lua"
+    if base in ("awk", "gawk", "mawk", "nawk"):
+        return "awk"
+    if base in ("sed", "gsed"):
+        return "sed"
+    if re.match(r"^(tclsh|wish)[0-9.]*$", base):
+        return "tclsh"
+    if base in ("pwsh", "pwsh-preview", "powershell", "powershell_ise"):
+        return "pwsh" if base.startswith("pwsh") else "powershell"
+    if base in _INTERP or base == "cmd":
+        return base
+    return None
+
+
+def _value(words: List[_W], i: int, rest: str) -> Tuple[Optional[_W], int]:
+    """(value word, index after it) of an option at ``words[i]``: the attached rest, else the next word."""
+    if rest:
+        return _W(rest, _plain_spellings(rest)), i + 1
+    if i + 1 < len(words):
+        return words[i + 1], i + 2
+    return None, i + 1
+
+
+def _skip_wrapper(spec: _Wrap, base: str, words: List[_W], i: int, roles: _Roles) -> int:
+    """Index of the command word a wrapper at ``words[i - 1]`` runs (``len(words)`` when none)."""
+    short, longs, npos, cwd, stops, splits, files = spec
+    n = len(words)
+    while i < n:
+        w = words[i]
+        t = w.text
+        if t == "--":
+            return i + 1
+        if base == "env" and _NAME_ASSIGN_RE.match(t):
+            _assignment(w, roles)
+            i += 1
+            continue
+        if t.startswith("--") and len(t) > 2:
+            name, eq, val = t.partition("=")
+            if name in stops:
+                return n
+            if name in cwd:
+                roles.cwd = True
+            if name in splits or name in longs:
+                if eq:
+                    v: Optional[_W] = _W(val, _plain_spellings(val))
+                    i += 1
+                else:
+                    v, i = _value(words, i, "")
+                if v is not None:
+                    if name in splits:
+                        roles.hush(v)
+                        roles.nested.append((v.text, "bash"))
+                        return n
+                    if name not in files:
+                        roles.hush(v)
+                continue
+            i += 1
+            continue
+        if t.startswith("-") and len(t) > 1:
+            j = 1
+            nxt = i + 1
+            while j < len(t):
+                ch = t[j]
+                if "-" + ch in stops:
+                    return n
+                if ch in short or "-" + ch in splits:
+                    if "-" + ch in cwd:
+                        roles.cwd = True
+                    v, nxt = _value(words, i, t[j + 1:])
+                    if v is not None:
+                        if "-" + ch in splits:
+                            roles.hush(v)
+                            roles.nested.append((v.text, "bash"))
+                            return n
+                        if "-" + ch not in files:
+                            roles.hush(v)
+                    break
+                j += 1
+            i = nxt
+            continue
+        if npos > 0:
+            roles.hush(w)
+            if "<positional>" in cwd:
+                roles.cwd = True
+            npos -= 1
+            i += 1
+            continue
+        return i
+    return n
+
+
+def _assignment(w: _W, roles: _Roles) -> None:
+    """A NAME=VALUE word before a command: the value is quiet, unless NAME loads a file (BASH_ENV, …: bound)."""
+    k, _eq, v = w.text.partition("=")
+    roles.hush(w.text)
+    for _key, x in env_file_values({k: v}):
+        if "$" in x or "`" in x:
+            roles.unbound.append(f"{k}={x} {UNBOUND_VARS}")
+        else:
+            roles.op(x)
+    if not env_file_values({k: v}):
+        roles.hush(v)
+
+
+def _module_files(mod: str, roles: _Roles) -> None:
+    """Files in the cwd that ``python -m mod`` would run instead of the installed module (bound quietly)."""
+    parts = [p for p in mod.split(".") if p]
+    if not parts or not all(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p) for p in parts):
+        return
+    roles.extra(parts[0] + ".py")
+    roles.extra(parts[0] + "/__init__.py")
+    if len(parts) == 1:
+        roles.extra(parts[0] + "/__main__.py")
+    else:
+        roles.extra("/".join(parts) + ".py")
+
+
+def _scan_interp(kind: str, words: List[_W], i: int, roles: _Roles) -> None:
+    """Read an interpreter's options from ``words[i]`` on and mark its script operand."""
+    if kind in ("pwsh", "powershell"):
+        _scan_pwsh(kind, words, i, roles)
+        return
+    if kind == "cmd":
+        _scan_cmd(words, i, roles)
+        return
+    spec = _INTERP[kind]
+    short: Dict[str, str] = spec.get("short") or {}
+    longs: Dict[str, str] = spec.get("long") or {}
+    first = spec.get("first", "script")
+    n = len(words)
+    mode = ""          # "" script expected, "shc" first operand is a command line, "none" no script operand
+    safe = False
+    program = False
+    subbed = False
+    while True:
+        while i < n:
+            w = words[i]
+            t = w.text
+            if t == "--":
+                i += 1
+                break
+            if t == "-":
+                return
+            role: Optional[str] = None
+            v: Optional[_W] = None
+            if t.startswith("--") and len(t) > 2:
+                name, eq, val = t.partition("=")
+                role = longs.get(name)
+                if role is None and eq:
+                    role = longs.get(name + "?")
+                if role is None:
+                    i += 1
+                    continue
+                if eq:
+                    v = _W(val, _plain_spellings(val))
+                    i += 1
+                else:
+                    v, i = _value(words, i, "")
+            elif (t.startswith("-") or (spec.get("plus") and t.startswith("+"))) and len(t) > 1:
+                j = 1
+                nxt = i + 1
+                while j < len(t):
+                    r = short.get(t[j])
+                    if r is None:
+                        j += 1
+                        continue
+                    if r == "rest":
+                        break
+                    if r in ("shc", "stdin", "safe"):
+                        if r == "safe":
+                            safe = True
+                        else:
+                            mode = "shc" if r == "shc" else "none"
+                        j += 1
+                        continue
+                    if r == "stop":
+                        return
+                    role = r
+                    v, nxt = _value(words, i, t[j + 1:])
+                    break
+                i = nxt
+            else:
+                break
+            if role is None or v is None:
+                if role in ("code", "module", "script!", "nested"):
+                    return
+                continue
+            if role == "val":
+                roles.hush(v)
+            elif role == "file":
+                pass
+            elif role == "cwd":
+                roles.hush(v)
+                roles.cwd = True
+            elif role in ("code", "code+", "prog"):
+                roles.hush(v)
+                if role == "prog":
+                    program = True
+                if role == "code":
+                    if not spec.get("code_last"):
+                        return
+                    mode = "none"
+            elif role in ("script", "script!"):
+                roles.op(v)
+                program = True
+                mode = "none"
+                if role == "script!":
+                    return
+            elif role == "module":
+                roles.hush(v)
+                if not safe:
+                    _module_files(v.text, roles)
+                return
+            elif role == "lmod":
+                roles.hush(v)
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", v.text):
+                    roles.extra(v.text.replace(".", "/") + ".lua")
+            elif role in ("nested", "nested+"):
+                roles.hush(v)
+                roles.nested.append((v.text, "bash"))
+                if role == "nested":
+                    return
+        if i >= n:
+            return
+        w = words[i]
+        sub = (spec.get("subs") or {}).get(w.text) if not subbed else None
+        if sub is not None and mode == "":
+            roles.hush(w)
+            subbed = True
+            if sub == "again":
+                i += 1
+                continue
+            if sub == "code" and i + 1 < n:
+                roles.hush(words[i + 1])
+            if sub == "rcmd":     # R CMD BATCH [options] file
+                if i + 1 < n and words[i + 1].text == "BATCH":
+                    roles.hush(words[i + 1])
+                    k = i + 2
+                    while k < n and words[k].text.startswith("-"):
+                        k += 1
+                    if k < n:
+                        roles.op(words[k])
+            return
+        break
+    if mode == "shc":
+        roles.hush(w)
+        roles.nested.append((w.text, "bash"))
+    elif mode == "none" or first == "none":
+        return
+    elif first == "prog":
+        if not program:
+            roles.hush(w)
+    else:
+        roles.op(w)
+
+
+_PWSH_VALUES = ("executionpolicy", "windowstyle", "configurationname", "configurationfile", "custompipename",
+                "inputformat", "outputformat", "settingsfile", "psconsolefile", "workingdirectory", "version")
+
+
+def _scan_pwsh(kind: str, words: List[_W], i: int, roles: _Roles) -> None:
+    """pwsh/powershell: ``-File script`` (or pwsh's first operand) is the script; ``-Command`` text (or Windows
+    PowerShell's first operand) is read again; ``-EncodedCommand`` cannot be read. Parameter names are
+    case-insensitive and may be shortened."""
+    n = len(words)
+    while i < n:
+        w = words[i]
+        t = w.text
+        if t == "--":
+            i += 1
+            break
+        if not (t.startswith(("-", "/")) and len(t) > 1):
+            break
+        p = t.lstrip("-/").lower()
+        p, _c, attached = p.partition(":")
+        if p in ("f", "file") or (len(p) >= 2 and "file".startswith(p)):
+            if i + 1 < n:
+                roles.op(words[i + 1])
+            return
+        if p in ("c", "command") or (len(p) >= 2 and "command".startswith(p)):
+            rest = " ".join(x.text for x in words[i + 1:])
+            if rest.strip() and rest.strip() != "-":
+                roles.nested.append((rest, "powershell"))
+            return
+        if p.startswith("ex") or p == "ep":
+            pass
+        elif p in ("e", "ec") or (len(p) >= 2 and "encodedcommand".startswith(p)):
+            roles.unbound.append(f"{t} (encoded command; not read or bound)")
+            for x in words[i + 1:i + 2]:
+                roles.hush(x)
+            return
+        if p in ("wd",) or (len(p) >= 2 and "workingdirectory".startswith(p)):
+            roles.cwd = True
+        takes = p in ("ep", "wd", "w", "config", "if", "of", "inp", "settings") or p.startswith("ex") or any(
+            len(p) >= 2 and full.startswith(p) for full in _PWSH_VALUES)
+        if p in ("v", "version") and kind == "pwsh":
+            takes = False
+        if takes and not attached and i + 1 < n:
+            roles.hush(words[i + 1])
+            i += 2
+            continue
+        i += 1
+    if i >= n:
+        return
+    if kind == "pwsh":
+        roles.op(words[i])
+    else:
+        roles.nested.append((" ".join(x.text for x in words[i:]), "powershell"))
+
+
+def _scan_cmd(words: List[_W], i: int, roles: _Roles) -> None:
+    """``cmd /c text`` / ``/k text``: the text is read again as a cmd line (its command word is a script there)."""
+    n = len(words)
+    while i < n:
+        t = words[i].text
+        if t.lower() in ("/c", "/k", "/r"):
+            rest = " ".join(x.text for x in words[i + 1:])
+            if rest.strip():
+                roles.nested.append((rest, "cmd"))
+            return
+        if t[:1] != "/":
+            return
+        i += 1
+
+
+def _scan_command(words: List[_W], roles: _Roles, dialect: str) -> None:
+    """One simple command (redirect targets removed): assignments, keywords, wrappers, then the program."""
+    n = len(words)
+    i = 0
+    while i < n:
+        t = words[i].text
+        if dialect == "posix" and t in _SH_KEYWORDS:
+            roles.hush(t)
+            i += 1
+            continue
+        if dialect == "posix" and _NAME_ASSIGN_RE.match(t):
+            _assignment(words[i], roles)
+            i += 1
+            continue
+        break
+    guard = 0
+    while i < n and guard < 16:
+        guard += 1
+        w = words[i]
+        base = _cmd_base(w.text)
+        if dialect == "cmd":
+            if base == "call":
+                roles.hush(w)
+                if i + 1 < n:
+                    roles.op(words[i + 1], pathext=True)
+                return
+            if base not in _CMD_BUILTINS and not os.path.isabs(w.text) and ":" not in w.text:
+                if "." in base and not _interp_kind(base):
+                    roles.op(w)       # run3.bat: the script itself
+                    return
+                roles.op(w, pathext=True)   # npm, python, run3: cmd tries name.com/.exe/.bat/.cmd in the cwd first
+        roles.hush(w)
+        if dialect == "posix" and base in ("source", ".") and w.text in ("source", "."):
+            k = i + 1
+            while k < n and words[k].text.startswith("-"):
+                k += 1
+            if k < n:
+                roles.op(words[k])
+            return
+        if base in _WRAPPERS:
+            i = _skip_wrapper(_WRAPPERS[base], base, words, i + 1, roles)
+            continue
+        if base in _RUNNERS:
+            if i + 1 < n and words[i + 1].text == "run":
+                roles.hush(words[i + 1])
+                k = i + 2
+                if base == "uv":
+                    k2 = k
+                    while k2 < n and words[k2].text.startswith("-"):
+                        if words[k2].text in ("-m", "--module") and k2 + 1 < n:
+                            roles.hush(words[k2 + 1])
+                            _module_files(words[k2 + 1].text, roles)
+                            return
+                        k2 += 1
+                i = _skip_wrapper(_RUNNERS[base], base, words, k, roles)
+                continue
+            return
+        kind = _interp_kind(base)
+        if kind is not None:
+            _scan_interp(kind, words, i + 1, roles)
+        return
+
+
+def _win_segments(text: str, dialect: str) -> List[List[_W]]:
+    """Simple commands of a PowerShell/cmd line: split on ``; & | ( ) { }`` and newlines outside quotes (``"`` for
+    cmd, ``"`` and ``'`` for PowerShell); a word after ``<``/``>`` is a redirect target."""
+    quotes = '"' if dialect == "cmd" else "\"'"
+    segs: List[List[_W]] = [[]]
+    cur: Optional[List[str]] = None
+    q = ""
+    redir = False
+
+    def end() -> None:
+        nonlocal cur, redir
+        if cur is not None:
+            t = "".join(cur)
+            segs[-1].append(_W(t, _plain_spellings(t), redir))
+            redir = False
+            cur = None
+
+    for c in text:
+        if q:
+            if c == q:
+                q = ""
+            else:
+                cur.append(c)  # type: ignore[union-attr]
+            continue
+        if c in quotes:
+            q = c
+            if cur is None:
+                cur = []
+            continue
+        if c in " \t\r":
+            end()
+            continue
+        if c in ";&|(){}\n":
+            end()
+            if segs[-1]:
+                segs.append([])
+            continue
+        if c in "<>":
+            end()
+            redir = True
+            continue
+        if cur is None:
+            cur = []
+        cur.append(c)
+    end()
+    return [s for s in segs if s]
+
+
+def _posix_segments(text: str) -> List[List[_W]]:
+    """Simple commands of a POSIX shell line (``_posix_tokens`` words, split at operators and newlines; a word
+    after ``<``/``>`` and a digit word right before one are redirections)."""
+    segs: List[List[_W]] = [[]]
+    for kind, val in _posix_scan(text):
+        if kind == "w":
+            chars, redir = val
+            t = "".join(c for c, _q in chars)
+            segs[-1].append(_W(t, _shell_spellings(chars), redir))
+        elif segs[-1]:
+            segs.append([])
+    return [s for s in segs if s]
+
+
+def _scan_commands(argv_or_command: Union[List[str], str], *, shell: Optional[str], os_name: Optional[str]
+                   ) -> _Roles:
+    """Roles of the words of a command (argv or shell line)."""
+    roles = _Roles()
+    if isinstance(argv_or_command, (list, tuple)):
+        segs = [[_W(str(x), _plain_spellings(str(x))) for x in argv_or_command]]
+        dialect = "argv"
+    elif _windows_shell(shell, os_name):
+        dialect = "cmd" if shell == "cmd" else "pwsh"
+        segs = _win_segments(str(argv_or_command), dialect)
+    else:
+        dialect = "posix"
+        try:
+            segs = _posix_segments(str(argv_or_command))
+        except ValueError:
+            segs = _win_segments(str(argv_or_command), "pwsh")
+    for seg in segs:
+        _scan_command([w for w in seg if not w.redir], roles, dialect)
+    return roles
+
+
+def listable_missing(word: str, quiet: AbstractSet[str]) -> bool:
+    """A missing, non-path word the review header lists as "no file here, not bound" (audit round 2): not quiet,
+    not a number or size, not a NAME=VALUE pair and not text with spaces."""
+    return bool(word) and word not in quiet and not word.startswith("-") and not _NUMERIC_RE.match(word) \
+        and not _NAME_ASSIGN_RE.match(word) and not re.search(r"\s", word)
+
+
+MISSING_UNBOUND = "(no file here, not bound)"
+
+
 def bind_plan(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
               os_name: Optional[str] = None) -> Tuple[List[str], List[str], List[str]]:
-    """(spellings to bind, relative words whose cwd may change, header items for words that cannot be bound) (v8.1).
+    """(spellings to bind, relative words whose cwd may change, header items for words that cannot be bound) (v8.1):
+    the first three parts of ``bind_plan_ex``."""
+    words, moved, unbound, _q = bind_plan_ex(argv_or_command, shell=shell, os_name=os_name)
+    return words, moved, unbound
+
+
+def bind_plan_ex(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
+                 os_name: Optional[str] = None, _depth: int = 0
+                 ) -> Tuple[List[str], List[str], List[str], AbstractSet[str]]:
+    """(spellings to bind, relative words whose cwd may change, header items for words that cannot be bound, quiet
+    words) (v8.1).
 
     Spellings are the paths the program opens (``_spelled_words``: a quoted ``~`` or any ``~`` in argv is bound
     literally as ``./~…``). argv lists: once a word changes the directory (``changes_cwd``: ``git -C sub``), later
     relative words move to the second list. Shell strings: when the whole text may change the cwd
     (``text_may_change_cwd``) every relative word moves, before and after; otherwise the argv rule applies. Absolute
-    and ``~`` words stay bound. The node review and the hub review share it."""
+    and ``~`` words stay bound. Audit round 2: the script operand of a known interpreter (``_scan_commands``) is
+    bound as ``./name`` whatever it looks like (missing -> ``absent``), ``python -m`` module files and cmd PATHEXT
+    names are added (quiet), ``sh -c``/``cmd /c``/``pwsh -Command`` text is planned again, and a wrapper option that
+    changes the cwd (``sudo -D``, ``bun --cwd``, …) moves every relative word. Quiet words (command names, option
+    values that are not files, code) are not listed when missing (``bind_files``). The node review and the hub
+    review share it."""
     words: List[str] = []
     moved: List[str] = []
     unbound: List[str] = []
-    after = not isinstance(argv_or_command, (list, tuple)) and text_may_change_cwd(str(argv_or_command))
+    try:
+        roles = _scan_commands(argv_or_command, shell=shell, os_name=os_name)
+    except Exception:  # noqa: BLE001 - the plain word rules still apply
+        roles = _Roles()
+    quiet = set(roles.quiet)
+    after = (not isinstance(argv_or_command, (list, tuple)) and text_may_change_cwd(str(argv_or_command))) \
+        or roles.cwd
+
+    def put(c: str, spellings: List[Optional[str]], forced: bool) -> None:
+        for sp in spellings:
+            if sp is None:
+                item = f"{c} {UNBOUND_VARS}"
+                if (forced or _pathlike(c)) and item not in unbound:
+                    unbound.append(item)
+            elif after and relative_word(sp):
+                if sp not in moved:
+                    moved.append(sp)
+            elif sp not in words:
+                words.append(sp)
+
+    used: set = set()
     for w, cands in _spelled_words(argv_or_command, shell=shell, os_name=os_name):
         for c, spellings in cands:
-            for sp in spellings:
-                if sp is None:
-                    item = f"{c} {UNBOUND_VARS}"
-                    if _pathlike(c) and item not in unbound:
-                        unbound.append(item)
-                elif after and relative_word(sp):
-                    if sp not in moved:
-                        moved.append(sp)
-                elif sp not in words:
-                    words.append(sp)
+            if c in roles.ops:
+                used.add(c)
+                put(c, roles.ops[c], True)
+            else:
+                put(c, spellings, False)
         if not after and changes_cwd(w):
             after = True
-    return words, moved, unbound
+    for c, spellings in roles.ops.items():
+        if c not in used:
+            put(c, spellings, True)
+    if _depth < _SCAN_DEPTH:
+        for text, sh in roles.nested:
+            w2, m2, u2, q2 = bind_plan_ex(text, shell=sh, os_name=os_name, _depth=_depth + 1)
+            put(text, list(w2), False)
+            moved.extend(x for x in m2 if x not in moved)
+            unbound.extend(x for x in u2 if x not in unbound)
+            quiet |= set(q2)
+    elif roles.nested:
+        unbound.append(f"{roles.nested[0][0]} (nested too deep; not bound)")
+    put("", list(roles.extras), False)
+    quiet |= {c for c in roles.ops if not _pathlike(c)}     # bound as ./name; the bare word is not listed again
+    unbound.extend(x for x in roles.unbound if x not in unbound)
+    return words, moved, unbound, frozenset(quiet)
 
 
 def bindable_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
@@ -1098,13 +1892,29 @@ def moved_items(moved: List[str], is_file: Callable[[str], bool]) -> List[str]:
     return out
 
 
-def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str], str]
-               ) -> Tuple[List[dict], List[str], List[str]]:
-    """(files entries, content lines, not-bound header items) per the §5.6 v8 binding rules."""
+def _strip_dot_segments(p: str) -> str:
+    """``p`` without ``./`` segments (``/cwd/./run3`` -> ``/cwd/run3``); ``..`` is kept (a link may sit before it)."""
+    prev = None
+    while prev != p:
+        prev = p
+        p = re.sub(r"([\\/])\.(?:[\\/])", r"\1", p)
+    return p
+
+
+def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str], str],
+               quiet: AbstractSet[str] = frozenset()) -> Tuple[List[dict], List[str], List[str]]:
+    """(files entries, content lines, not-bound header items) per the §5.6 v8 binding rules.
+
+    v8.1 (audit round 2): each entry's ``path`` is the path as the command names it (cwd + word, before symbolic
+    links are resolved; ``real`` = the real path when it differs), so ``FileHolds.acquire`` re-resolves it at consume
+    and a link retargeted after approval is a conflict (as on the hub); a second word naming an already bound file
+    through another path adds an entry for that path too. A missing word that is not path-like is listed as "no file
+    here, not bound" unless it is quiet (``bind_plan_ex``); a quiet path-like word is bound without a header item."""
     files: List[dict] = []
     lines: List[str] = []
     not_bound: List[str] = []
-    seen: set = set()
+    seen: Dict[str, dict] = {}
+    named_seen: set = set()
     bound = 0
     shown_total = 0
     hash_end = time.monotonic() + HASH_BUDGET_S
@@ -1126,7 +1936,13 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
             continue
         except Exception:  # noqa: BLE001
             continue
+        named = _strip_dot_segments(cand)
         if real in seen:
+            first = seen[real]
+            if named != real and named not in named_seen and first.get("bind") != "none":
+                named_seen.add(named)
+                alias = dict(first, path=named, real=real, shown=False)
+                files.append(alias)
             continue
         try:
             st = os.stat(real)
@@ -1140,28 +1956,41 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
         if exists and not os.path.isfile(real):
             continue
         if not exists and not _pathlike(w):
+            if listable_missing(w, quiet):
+                not_bound.append(f"{w} {MISSING_UNBOUND}")
             continue
-        seen.add(real)
+        named_seen.add(named)
+
+        def entry(**kw: Any) -> dict:
+            e = dict(kw)
+            if named != real:
+                e["path"] = named
+                e["real"] = real
+            seen[real] = e
+            return e
+        seen[real] = {"bind": "none"}
         try:
             policy.resolve_path(cand, write=True)
             locked = ""
         except Exception:  # noqa: BLE001
             locked = "; agents cannot change it"
         if bound >= BIND_MAX_FILES:
-            files.append({"path": real, "bind": "none", "sha256": None, "size": st.st_size if exists else None,
-                          "shown": False})
-            not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
+            files.append(entry(path=real, bind="none", sha256=None, size=st.st_size if exists else None,
+                               shown=False))
+            if w not in quiet:
+                not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
             continue
         bound += 1
         if not exists:
-            files.append({"path": real, "bind": "absent", "sha256": None, "size": None, "shown": False})
-            not_bound.append(f"{w} (missing here)")
+            files.append(entry(path=real, bind="absent", sha256=None, size=None, shown=False))
+            if w not in quiet:
+                not_bound.append(f"{w} (missing here)")
             continue
         size = st.st_size
         if size > HASH_MAX or time.monotonic() > hash_end:
             fp = f"stat:{size}:{iso_utc(st.st_mtime)}"
-            files.append({"path": real, "bind": "stat", "sha256": None, "size": size, "shown": False,
-                          "fingerprint": fp, "mtime": iso_utc(st.st_mtime)})
+            files.append(entry(path=real, bind="stat", sha256=None, size=size, shown=False, fingerprint=fp,
+                               mtime=iso_utc(st.st_mtime)))
             lines.append(f"--- file {real} ({human_bytes(size)}, bound by size and mtime{locked}) ---")
             lines.append(NOT_SHOWN)
             continue
@@ -1170,7 +1999,8 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
                 data = f.read(HASH_MAX + 1)
         except OSError:
             bound -= 1
-            seen.discard(real)
+            seen.pop(real, None)
+            named_seen.discard(named)
             if _pathlike(w):
                 not_bound.append(f"{w} (not readable here)")
             continue
@@ -1185,7 +2015,7 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
         if text is not None and shown_total + len(data) <= SHOW_MAX:
             shown = True
             shown_total += len(data)
-        files.append({"path": real, "bind": "sha256", "sha256": digest, "size": len(data), "shown": shown})
+        files.append(entry(path=real, bind="sha256", sha256=digest, size=len(data), shown=shown))
         lines.append(f"--- file {real} ({human_bytes(len(data))}, sha256 {digest[:12]}{locked}) ---")
         if shown and text is not None:
             lines.extend(mask(text).split("\n"))
@@ -1327,10 +2157,11 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
         body.extend(_param_lines(params, skip=("argv", "command", "shell", "cwd", "secret_env"), secret_re=secret_re,
                                  shows_env=True))
         if ctx is not None:
-            words, moved, unbound = bind_plan(params.get("argv") or str(params.get("command") or ""), shell=shell,
-                                              os_name=ctx.os)
+            words, moved, unbound, quiet = bind_plan_ex(params.get("argv") or str(params.get("command") or ""),
+                                                        shell=shell, os_name=ctx.os)
             words, unbound = _env_words(params.get("env"), words, unbound)
-            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=str(cwd), mask=ctx.mask)
+            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=str(cwd), mask=ctx.mask,
+                                                      quiet=quiet)
             not_bound += unbound
     elif action == "service.define":
         if ctx is None:
@@ -1349,16 +2180,18 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             real_cwd = cwd
             if d.get("argv"):
                 body.append("argv: " + json.dumps(d["argv"], ensure_ascii=False))
-                words, moved, unbound = bind_plan(d["argv"])
+                words, moved, unbound, quiet = bind_plan_ex(d["argv"])
             else:
                 shell = _resolved_shell(d.get("shell"), ctx)
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(d.get("command") or "").split("\n"))
-                words, moved, unbound = bind_plan(str(d.get("command") or ""), shell=shell, os_name=ctx.os)
+                words, moved, unbound, quiet = bind_plan_ex(str(d.get("command") or ""), shell=shell,
+                                                            os_name=ctx.os)
             if d.get("stop_command"):
                 body.append("stop_command: " + json.dumps(d["stop_command"], ensure_ascii=False))
-                sw, sm, su = bind_plan(d["stop_command"])
+                sw, sm, su, sq = bind_plan_ex(d["stop_command"])
+                quiet = frozenset(quiet) | frozenset(sq)
                 words += [w for w in sw if w not in words]
                 moved += [w for w in sm if w not in moved]
                 unbound += [w for w in su if w not in unbound]
@@ -1370,7 +2203,7 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                             + (f" (added by the preset: {', '.join(auto)})" if auto else ""))
             body.extend(_param_lines(d, skip=("name", "preset", "argv", "command", "shell", "cwd", "secret_env",
                                               "stop_command", "volumes"), secret_re=secret_re, shows_env=True))
-            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask)
+            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask, quiet=quiet)
             not_bound += unbound
     elif action in ("service.start", "service.restart"):
         body.append(f"action: {action}")
@@ -1385,7 +2218,7 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             real_cwd = cwd
             if argv:
                 body.append("argv: " + json.dumps(argv, ensure_ascii=False))
-                words, moved, unbound = bind_plan(argv)
+                words, moved, unbound, quiet = bind_plan_ex(argv)
                 mt = _argv0_mtime(str(argv[0]), ctx.policy)
                 body.append(f"argv[0] modified: {mt or 'unknown'}")
             else:
@@ -1393,11 +2226,12 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(service.get("command") or "").split("\n"))
-                words, moved, unbound = bind_plan(str(service.get("command") or ""), shell=shell, os_name=ctx.os)
+                words, moved, unbound, quiet = bind_plan_ex(str(service.get("command") or ""), shell=shell,
+                                                            os_name=ctx.os)
             body.append(f"cwd: {cwd_text}")
             body.append(f"defined_by: {service.get('defined_by') or 'unknown'}")
             words, unbound = _env_words(service.get("env"), words, unbound)
-            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask)
+            files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask, quiet=quiet)
             not_bound += unbound
     else:
         try:
@@ -1430,5 +2264,5 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
 
 
 __all__ = ["Preset", "PRESETS", "PresetCtx", "build", "expand_define", "approval_review", "describe",
-           "candidate_words", "bindable_words", "bind_plan", "text_may_change_cwd", "changes_cwd", "moved_items", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
+           "candidate_words", "bindable_words", "bind_plan", "bind_plan_ex", "listable_missing", "text_may_change_cwd", "changes_cwd", "moved_items", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
            "HUB_START_NOTE", "DEF_KEYS", "INTERNAL_KEYS", "BIND_HINT"]

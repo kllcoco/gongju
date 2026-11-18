@@ -28,7 +28,7 @@ import time
 import unicodedata
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, AbstractSet, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import __version__, catalog, schema
 from .auth import CAUTIOUS_ACTIONS, Identity, TokenStore, exec_gated as auth_exec_gated
@@ -1356,10 +1356,10 @@ class Hub:
         review = presets.approval_review(action, params, ctx=None)
         if action not in FILE_BIND_ACTIONS:
             return review
-        words, cwd, moved, unbound = self._bind_words(identity, link, action, params, rid, end, gated)
+        words, cwd, moved, unbound, quiet = self._bind_words(identity, link, action, params, rid, end, gated)
         if not words and not moved and not unbound:
             return review
-        files, lines, not_bound = self._bind_files(identity, link, words, cwd, rid, end, gated)
+        files, lines, not_bound = self._bind_files(identity, link, words, cwd, rid, end, gated, quiet)
         if moved:   # v8.1: relative words after cd / -C are not bound; named in the header (presets.moved_items)
             not_bound += presets.moved_items(moved, lambda w: self._is_file(identity, link, self._join(cwd, w), rid,
                                                                              end, gated))
@@ -1386,23 +1386,24 @@ class Hub:
         return _envelope_result(env)
 
     def _split(self, text: str, shell: Optional[str], os_name: Optional[str]
-               ) -> Tuple[List[str], List[str], List[str]]:
-        """(words to bind, relative words whose cwd may change, unbindable header items) via ``presets.bind_plan``
-        (v8.1); with the node's OS unknown, both the POSIX and the PowerShell reading (a word either one moves is
-        not bound)."""
+               ) -> Tuple[List[str], List[str], List[str], AbstractSet[str]]:
+        """(words to bind, relative words whose cwd may change, unbindable header items, quiet words) via
+        ``presets.bind_plan_ex`` (v8.1); with the node's OS unknown, both the POSIX and the PowerShell reading (a
+        word either one moves is not bound; a non-path word is quiet only when both readings say so)."""
         from . import presets
         if shell not in (None, "", "auto"):
-            return presets.bind_plan(text, shell=shell, os_name=None)
+            return presets.bind_plan_ex(text, shell=shell, os_name=None)
         if os_name == "Windows":
-            return presets.bind_plan(text, shell="powershell")
+            return presets.bind_plan_ex(text, shell="powershell")
         if os_name:
-            return presets.bind_plan(text, shell="bash")
-        out, moved, unbound = presets.bind_plan(text, shell="bash")
-        w2, m2, u2 = presets.bind_plan(text, shell="powershell")
+            return presets.bind_plan_ex(text, shell="bash")
+        out, moved, unbound, q1 = presets.bind_plan_ex(text, shell="bash")
+        w2, m2, u2, q2 = presets.bind_plan_ex(text, shell="powershell")
         out += [w for w in w2 if w not in out]
         moved += [w for w in m2 if w not in moved]
         unbound += [w for w in u2 if w not in unbound]
-        return [w for w in out if w not in moved], moved, unbound
+        quiet = (set(q1) & set(q2)) | {w for w in set(q1) | set(q2) if presets._pathlike(w)}
+        return [w for w in out if w not in moved], moved, unbound, frozenset(quiet)
 
     def _is_file(self, identity: Identity, link: NodeLink, path: str, rid: str, end: float, gated: bool) -> bool:
         try:
@@ -1412,33 +1413,35 @@ class Hub:
         return bool(st.get("exists")) and st.get("type") == "file"
 
     def _bind_words(self, identity: Identity, link: NodeLink, action: str, params: dict, rid: str, end: float,
-                    gated: bool) -> Tuple[List[str], Optional[str], List[str], List[str]]:
+                    gated: bool) -> Tuple[List[str], Optional[str], List[str], List[str], AbstractSet[str]]:
         from . import presets
         os_name = link.os_name()
         words: List[str] = []
         moved: List[str] = []
         unbound: List[str] = []
+        quiet: set = set()
 
-        def add(plan: Tuple[List[str], List[str], List[str]]) -> None:
+        def add(plan: Tuple[List[str], List[str], List[str], AbstractSet[str]]) -> None:
             words.extend(w for w in plan[0] if w not in words)
             moved.extend(w for w in plan[1] if w not in moved)
             unbound.extend(w for w in plan[2] if w not in unbound)
+            quiet.update(plan[3])
 
         cwd = params.get("cwd") if isinstance(params.get("cwd"), str) else None
         env: Any = params.get("env")
         if action in ("shell.run", "job.start"):
             if params.get("argv"):
-                add(presets.bind_plan([str(x) for x in params["argv"]]))
+                add(presets.bind_plan_ex([str(x) for x in params["argv"]]))
             else:
                 add(self._split(str(params.get("command") or ""), params.get("shell"), os_name))
         elif action == "service.define":
             if params.get("argv"):
-                add(presets.bind_plan([str(x) for x in params["argv"]]))
+                add(presets.bind_plan_ex([str(x) for x in params["argv"]]))
             elif params.get("command"):
                 add(self._split(str(params.get("command") or ""), params.get("shell"), os_name))
             sc = params.get("stop_command")
             if sc:
-                add(presets.bind_plan([str(x) for x in sc]) if isinstance(sc, list) else
+                add(presets.bind_plan_ex([str(x) for x in sc]) if isinstance(sc, list) else
                     self._split(str(sc), params.get("shell"), os_name))
             for item in params.get("preset_args") or []:
                 s = str(item)
@@ -1451,17 +1454,17 @@ class Hub:
                 st = self._sub(identity, link, "service.status", {"name": params.get("name")}, rid, 0, end, gated)
             except HiveError as e:
                 if e.code in ("policy_denied", "forbidden", "not_found"):
-                    return [], None, [], []
+                    return [], None, [], [], frozenset()
                 raise
             d = st.get("definition") if isinstance(st.get("definition"), dict) else {}
             if d.get("argv"):
-                add(presets.bind_plan([str(x) for x in d["argv"]]))
+                add(presets.bind_plan_ex([str(x) for x in d["argv"]]))
             elif d.get("command"):
                 add(self._split(str(d.get("command")), d.get("shell"), os_name))
             cwd = d.get("cwd") if isinstance(d.get("cwd"), str) else None
             env = d.get("env")
         w2, u2 = presets._env_words(env, words, unbound)   # v8.1: files named by BASH_ENV, LD_PRELOAD, …
-        return w2, cwd, moved, u2
+        return w2, cwd, moved, u2, frozenset(quiet)
 
     @staticmethod
     def _join(cwd: Optional[str], w: str) -> str:
@@ -1473,8 +1476,12 @@ class Hub:
         return cwd.rstrip("/\\") + sep + w
 
     def _bind_files(self, identity: Identity, link: NodeLink, words: List[str], cwd: Optional[str], rid: str,
-                    end: float, gated: bool) -> Tuple[List[dict], List[str], List[str]]:
-        from .presets import NOT_SHOWN, _pathlike
+                    end: float, gated: bool, quiet: AbstractSet[str] = frozenset()
+                    ) -> Tuple[List[dict], List[str], List[str]]:
+        """``presets.bind_files`` over the link (fs.stat/fs.read on the node). Audit round 2: a missing non-path word
+        is listed as "no file here, not bound" unless quiet; a second path to an already bound file adds an entry
+        for that path."""
+        from .presets import MISSING_UNBOUND, NOT_SHOWN, _pathlike, _strip_dot_segments, listable_missing
 
         def entry(**kw: Any) -> dict:
             # v8.1 (external review): the node re-resolves the bound path at consume (FileHolds.acquire), so it is
@@ -1484,18 +1491,20 @@ class Hub:
             if path != rp:
                 e["path"] = path
                 e["real"] = rp
+            seen[rp] = e
             return e
         files: List[dict] = []
         lines: List[str] = []
         not_bound: List[str] = []
-        seen: set = set()
+        seen: Dict[str, dict] = {}
+        named_seen: set = set()
         bound = 0
         shown_left = SHOW_MAX
         i = 1
         for w in words:
             if "\x00" in w:
                 continue
-            path = self._join(cwd, w)
+            path = _strip_dot_segments(self._join(cwd, w))
             try:
                 st = self._sub(identity, link, "fs.stat", {"path": path}, rid, i, end, gated)
                 i += 1
@@ -1508,22 +1517,31 @@ class Hub:
                 raise
             rp = st.get("path") if isinstance(st.get("path"), str) else path
             if rp in seen:
+                first = seen[rp]
+                if path != rp and path not in named_seen and first.get("bind") != "none":
+                    named_seen.add(path)
+                    files.append(dict(first, path=path, real=rp, shown=False))
                 continue
             exists = bool(st.get("exists"))
             if exists and st.get("type") != "file":
                 continue
             if not exists and not _pathlike(w):
+                if listable_missing(w, quiet):
+                    not_bound.append(f"{w} {MISSING_UNBOUND}")
                 continue
-            seen.add(rp)
+            seen[rp] = {"bind": "none"}
+            named_seen.add(path)
             size = st.get("size") if isinstance(st.get("size"), int) else None
             if bound >= BIND_MAX_FILES:
                 files.append(entry(path=rp, bind="none", sha256=None, size=size, shown=False))
-                not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
+                if w not in quiet:
+                    not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
                 continue
             bound += 1
             if not exists:
                 files.append(entry(path=rp, bind="absent", sha256=None, size=None, shown=False))
-                not_bound.append(f"{w} (missing here)")
+                if w not in quiet:
+                    not_bound.append(f"{w} (missing here)")
                 continue
             size = int(size or 0)
             mtime = st.get("mtime")
@@ -1551,7 +1569,8 @@ class Hub:
                         if _pathlike(w):
                             not_bound.append(f"{w} (not resolvable here)")
                         bound -= 1
-                        seen.discard(rp)
+                        seen.pop(rp, None)
+                        named_seen.discard(path)
                         continue
                     if e.code not in ("unsupported", "too_large", "bad_request"):
                         raise
@@ -1561,7 +1580,8 @@ class Hub:
                 digest = str(r.get("sha256") or "").split(":", 1)[-1] or None
                 if digest is None:
                     bound -= 1
-                    seen.discard(rp)
+                    seen.pop(rp, None)
+                    named_seen.discard(path)
                     continue
             shown = content is not None
             if shown:
