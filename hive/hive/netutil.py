@@ -1,11 +1,10 @@
 """NetGuard (SSRF categories, proxy routes, C1–C4), guarded HTTP, open_stream, open_download, AuthSpec, tcp_check
 (design §11.2 and §5.4 NetGuard, WP3).
 
-WP3a: ``NetGuard`` (rules 1–6 incl. ``HOST:PORT`` deny entries, fake-ip, redirect allow, proxy routes and
-``pin_ip``), ``guarded_request`` (per-hop vetting, pinned direct connections, proxy CONNECT/absolute-form, C1–C4),
-``tcp_check``, ``AuthSpec``/``VettedTarget``/``HttpResult``/``auth_host_allowed``. Still Phase 0 until WP3b:
-``open_stream`` (loopback-only stub: one hop with http.client to loopback http targets, else ``unsupported``) and
-``open_download``.
+``NetGuard`` (rules 1–6 incl. ``HOST:PORT`` deny entries, fake-ip, redirect allow, proxy routes and ``pin_ip``),
+``guarded_request`` (per-hop vetting, pinned direct connections, proxy CONNECT/absolute-form, C1–C4), ``open_stream``
+(one hop, streamed body: gateway passthrough), ``open_download`` (the only HTTP entry point of ``_download``: Range,
+re-vetted redirects, streamed body), ``tcp_check``, ``AuthSpec``/``VettedTarget``/``HttpResult``/``auth_host_allowed``.
 Module rule: imports only stdlib, ``hive.util``, ``hive.errors`` and ``hive.netproxy`` at module level.
 """
 from __future__ import annotations
@@ -25,7 +24,7 @@ from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Mapping, Opti
 from urllib.parse import quote, unquote, urljoin, urlsplit
 
 from . import netproxy
-from .errors import HiveError, bad_request, cancelled, denied, timeout, unavailable, unsupported
+from .errors import HiveError, bad_request, cancelled, denied, timeout, unavailable
 from .util import ip_category, is_local_name, is_loopback_host
 
 log = logging.getLogger("hive.netutil")
@@ -105,10 +104,6 @@ def auth_host_allowed(hosts: Sequence[str], host: str, scheme: str) -> bool:
         if sch == "https" and fnmatch.fnmatchcase(h, e.rstrip(".")):
             return True
     return False
-
-
-def _na(what: str) -> HiveError:
-    return unsupported(f"netutil.{what} not available yet (WP3b)")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -420,19 +415,21 @@ class _Conn(http.client.HTTPConnection):
     with SNI = the original host name; records whether any request byte was written."""
 
     def __init__(self, host: str, port: int, *, timeout: float, dial: Callable[[], socket.socket],
-                 tls: Optional[ssl.SSLContext], sni: str):
+                 tls: Optional[ssl.SSLContext], sni: str, connect_timeout: Optional[float] = None):
         super().__init__(host, port, timeout=timeout)
         self._dial = dial
         self._tls = tls
         self._sni = sni
+        self._connect_timeout = connect_timeout if connect_timeout is not None else timeout
         self.sent = False
 
     def connect(self) -> None:
         sock = self._dial()
         try:
-            sock.settimeout(self.timeout)
+            sock.settimeout(self._connect_timeout)
             if self._tls is not None:
                 sock = self._tls.wrap_socket(sock, server_hostname=self._sni)
+            sock.settimeout(self.timeout)
         except BaseException:
             sock.close()
             raise
@@ -555,11 +552,7 @@ def guarded_request(method: str, url: str, *, guard: Any, purpose: str, headers:
                                  rule="plaintext_credentials", hint="use https:// for requests that carry a secret")
                 if not _auth_allowed(auth, target):
                     raise _secret_host_error(auth, target.host)
-        hdrs: List[Tuple[str, str]] = [(k, v) for k, v in user_headers if here == origin or not _is_cred_header(k)]
-        attach = (auth is not None and _auth_allowed(auth, target)
-                  and ((target.scheme == "https" and verify_tls) or target.category in ("loopback", "private")))
-        if attach:
-            hdrs.append((auth.header, auth.value))   # type: ignore[union-attr]
+        hdrs, attach = _hop_headers(user_headers, auth, target, here == origin, verify_tls)
         result = _one_hop(cur_method, target, hdrs, cur_body, deadline=deadline, max_bytes=max_bytes,
                           verify_tls=verify_tls, ca_file=ca_file, credentialed=attach, cancel=cancel,
                           sent_before=sent_any, follow=follow_redirects)
@@ -599,6 +592,106 @@ class _Headers(dict):
         return super().__getitem__(orig) if orig is not None else default
 
 
+def _dial_for(target: VettedTarget, credentialed: bool, deadline: Callable[[], float]
+              ) -> Tuple[Callable[[], socket.socket], str, Optional[str]]:
+    """(dial, request path, Proxy-Authorization) for one hop: direct to the vetted IP, a CONNECT tunnel (https, or a
+    credentialed http request, C1), or an absolute-form request through an HTTP proxy (naming the vetted IP when
+    ``pin_ip``, rule 5c)."""
+    host, port = target.host, target.port
+    path = target.path
+    if target.route == "proxy" and target.proxy:
+        connect_to = target.ip if (target.pin_ip and target.ip) else host
+        proxy = target.proxy
+        if target.scheme == "https" or credentialed:
+            def dial() -> socket.socket:
+                return netproxy.open_tunnel(proxy, connect_to, port, timeout=max(0.1, deadline()))
+            return dial, path, None
+        p_host, p_port, proxy_auth = _proxy_addr(proxy)
+        path = "http://" + _host_header(connect_to, port, "http") + path
+
+        def dial_abs() -> socket.socket:
+            try:
+                return socket.create_connection((p_host, p_port), timeout=max(0.1, deadline()))
+            except OSError as e:
+                raise unavailable(f"proxy {p_host}:{p_port} is not reachable: {e}", reason="proxy",
+                                  maybe_executed=False,
+                                  hint=f"proxy {p_host}:{p_port} is not reachable; is Clash/v2rayN running? "
+                                       "(network.proxy)")
+        return dial_abs, path, proxy_auth
+    if not target.ip:
+        raise unavailable(f"no address for {host}", reason="dns", maybe_executed=False)
+    ip = target.ip
+
+    def dial_direct() -> socket.socket:
+        return socket.create_connection((ip, port), timeout=max(0.1, deadline()))
+    return dial_direct, path, None
+
+
+def _send_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], body: Optional[bytes], *,
+              connect_timeout: float, io_timeout: float, verify_tls: bool, ca_file: Optional[str],
+              credentialed: bool, sent_before: bool) -> Tuple["_Conn", http.client.HTTPResponse]:
+    """Connect (direct / proxy / tunnel), send the request and read the status line and headers (§11.2 error
+    mapping: before any request byte -> ``maybe_executed`` false). The caller closes the connection."""
+    host, port = target.host, target.port
+    t_connect = time.monotonic() + max(0.1, connect_timeout)
+    dial, path, proxy_auth = _dial_for(target, credentialed, lambda: t_connect - time.monotonic())
+    tls = _tls_context(verify_tls, ca_file) if target.scheme == "https" else None
+    conn = _Conn(host, port, timeout=max(0.1, io_timeout), dial=dial, tls=tls, sni=host,
+                 connect_timeout=max(0.1, connect_timeout))
+    try:
+        conn.connect()
+        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", _host_header(host, port, target.scheme))
+        names = {k.lower() for k, _ in hdrs}
+        if "accept-encoding" not in names:
+            conn.putheader("Accept-Encoding", "identity")
+        if "user-agent" not in names:
+            conn.putheader("User-Agent", "hive")
+        if proxy_auth:
+            conn.putheader("Proxy-Authorization", proxy_auth)
+        for k, v in hdrs:
+            conn.putheader(k, v)
+        if body is not None or method in ("POST", "PUT", "PATCH"):
+            conn.putheader("Content-Length", str(len(body or b"")))
+        conn.endheaders(body if body else None)
+        resp = conn.getresponse()
+    except HiveError:
+        conn.close()
+        raise
+    except BaseException as e:  # noqa: BLE001 - mapped below; the connection is always closed
+        conn.close()
+        raise _map_send_error(e, host, port, sent_before or conn.sent)
+    if target.route == "proxy" and resp.status == 407 and proxy_auth is None and not credentialed \
+            and target.scheme == "http":
+        conn.close()
+        raise unavailable("proxy requires credentials", reason="proxy_auth", maybe_executed=False,
+                          hint="put user:pass in network.proxy")
+    return conn, resp
+
+
+def _map_send_error(e: BaseException, host: str, port: int, sent: bool) -> BaseException:
+    if isinstance(e, ssl.SSLCertVerificationError):
+        return unavailable(f"TLS certificate of {host} could not be verified: {e.verify_message or e}",
+                           reason="tls", maybe_executed=sent,
+                           hint="the server's certificate is not trusted (network.ca_file adds a CA)")
+    if isinstance(e, socket.gaierror):
+        return unavailable(f"cannot resolve {host}: {e}", reason="dns", maybe_executed=sent)
+    if isinstance(e, socket.timeout):
+        return timeout(f"request to {host}:{port} timed out", maybe_executed=sent)
+    if isinstance(e, ssl.SSLError):      # handshake failure, WRONG_VERSION_NUMBER (https to a plain-http port), …
+        return unavailable(f"TLS connection to {host}:{port} failed: {getattr(e, 'reason', None) or e}",
+                           reason="tls", maybe_executed=sent, hint=f"is {host}:{port} really an https:// server?")
+    if isinstance(e, (UnicodeError, ValueError)):   # request line/header not encodable (checked earlier)
+        return bad_request(f"the request to {host} cannot be encoded: {e}",
+                           hint="use ASCII (percent-encoded) URLs and Latin-1 header values")
+    if isinstance(e, ConnectionRefusedError):
+        return unavailable(f"connection to {host}:{port} refused", reason="connect", maybe_executed=sent,
+                           hint=f"nothing listening on {host}:{port}")
+    if isinstance(e, (OSError, http.client.HTTPException)):
+        return unavailable(f"connection to {host}:{port} failed: {e}", reason="connect", maybe_executed=sent)
+    return e
+
+
 def _one_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], body: Optional[bytes], *,
              deadline: float, max_bytes: int, verify_tls: bool, ca_file: Optional[str], credentialed: bool,
              cancel: Optional[threading.Event], sent_before: bool, follow: bool
@@ -607,82 +700,10 @@ def _one_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], bod
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise timeout(f"request to {host} timed out", maybe_executed=sent_before)
-    tls = _tls_context(verify_tls, ca_file) if target.scheme == "https" else None
-    path = target.path
-    proxy_auth: Optional[str] = None
-    if target.route == "proxy" and target.proxy:
-        connect_to = target.ip if (target.pin_ip and target.ip) else host
-        if target.scheme == "https" or credentialed:
-            proxy = target.proxy
-
-            def dial() -> socket.socket:
-                return netproxy.open_tunnel(proxy, connect_to, port, timeout=max(0.1, deadline - time.monotonic()))
-        else:                                                         # absolute-form through an HTTP proxy
-            p_host, p_port, proxy_auth = _proxy_addr(target.proxy)
-            path = "http://" + _host_header(connect_to, port, "http") + path
-
-            def dial() -> socket.socket:
-                try:
-                    return socket.create_connection((p_host, p_port), timeout=max(0.1, deadline - time.monotonic()))
-                except OSError as e:
-                    raise unavailable(f"proxy {p_host}:{p_port} is not reachable: {e}", reason="proxy",
-                                      maybe_executed=False,
-                                      hint=f"proxy {p_host}:{p_port} is not reachable; is Clash/v2rayN running? "
-                                           "(network.proxy)")
-    else:
-        if not target.ip:
-            raise unavailable(f"no address for {host}", reason="dns", maybe_executed=False)
-        ip = target.ip
-
-        def dial() -> socket.socket:
-            return socket.create_connection((ip, port), timeout=max(0.1, deadline - time.monotonic()))
-
-    conn = _Conn(host, port, timeout=max(0.1, remaining), dial=dial, tls=tls, sni=host)
+    conn, resp = _send_hop(method, target, hdrs, body, connect_timeout=remaining, io_timeout=remaining,
+                           verify_tls=verify_tls, ca_file=ca_file, credentialed=credentialed,
+                           sent_before=sent_before)
     try:
-        try:
-            conn.connect()
-            conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
-            conn.putheader("Host", _host_header(host, port, target.scheme))
-            names = {k.lower() for k, _ in hdrs}
-            if "accept-encoding" not in names:
-                conn.putheader("Accept-Encoding", "identity")
-            if "user-agent" not in names:
-                conn.putheader("User-Agent", "hive")
-            if proxy_auth:
-                conn.putheader("Proxy-Authorization", proxy_auth)
-            for k, v in hdrs:
-                conn.putheader(k, v)
-            if body is not None or method in ("POST", "PUT", "PATCH"):
-                conn.putheader("Content-Length", str(len(body or b"")))
-            conn.endheaders(body if body else None)
-            resp = conn.getresponse()
-        except HiveError:
-            raise
-        except ssl.SSLCertVerificationError as e:
-            raise unavailable(f"TLS certificate of {host} could not be verified: {e.verify_message or e}",
-                              reason="tls", maybe_executed=sent_before,
-                              hint="the server's certificate is not trusted (network.ca_file adds a CA)")
-        except socket.gaierror as e:
-            raise unavailable(f"cannot resolve {host}: {e}", reason="dns", maybe_executed=sent_before or conn.sent)
-        except socket.timeout:
-            raise timeout(f"request to {host}:{port} timed out", maybe_executed=sent_before or conn.sent)
-        except ssl.SSLError as e:      # handshake failure, WRONG_VERSION_NUMBER (https to a plain-http port), …
-            raise unavailable(f"TLS connection to {host}:{port} failed: {getattr(e, 'reason', None) or e}",
-                              reason="tls", maybe_executed=sent_before or conn.sent,
-                              hint=f"is {host}:{port} really an https:// server?")
-        except (UnicodeError, ValueError) as e:   # request line/header not encodable (checked earlier; defensive)
-            raise bad_request(f"the request to {host} cannot be encoded: {e}",
-                              hint="use ASCII (percent-encoded) URLs and Latin-1 header values")
-        except ConnectionRefusedError:
-            raise unavailable(f"connection to {host}:{port} refused", reason="connect",
-                              maybe_executed=sent_before or conn.sent, hint=f"nothing listening on {host}:{port}")
-        except (OSError, http.client.HTTPException) as e:
-            raise unavailable(f"connection to {host}:{port} failed: {e}", reason="connect",
-                              maybe_executed=sent_before or conn.sent)
-        if target.route == "proxy" and resp.status == 407 and proxy_auth is None and not credentialed \
-                and target.scheme == "http":
-            raise unavailable("proxy requires credentials", reason="proxy_auth", maybe_executed=False,
-                              hint="put user:pass in network.proxy")
         status, reason = int(resp.status), str(resp.reason or "")
         rheaders = _Headers(resp.getheaders())
         if follow and status in REDIRECT_CODES and rheaders.get("location"):
@@ -723,98 +744,103 @@ def _one_hop(method: str, target: VettedTarget, hdrs: List[Tuple[str, str]], bod
         conn.close()
 
 
-def _vet(guard: Any, url: str, purpose: str, method: str) -> None:
-    check = getattr(guard, "check_url", None)
-    if check is None:
-        return
+def _hop_headers(user_headers: List[Tuple[str, str]], auth: Optional[AuthSpec], target: VettedTarget,
+                 same_origin: bool, verify_tls: bool) -> Tuple[List[Tuple[str, str]], bool]:
+    """Per-hop headers: user credential headers only on the original scheme+host+port (C2); the secret only on
+    hosts it is bound to and over verified TLS or to loopback/private targets (C2, C4)."""
+    hdrs = [(k, v) for k, v in user_headers if same_origin or not _is_cred_header(k)]
+    attach = (auth is not None and _auth_allowed(auth, target)
+              and ((target.scheme == "https" and verify_tls) or target.category in ("loopback", "private")))
+    if attach:
+        hdrs.append((auth.header, auth.value))   # type: ignore[union-attr]
+    return hdrs, attach
+
+
+def _stream_body(conn: "_Conn", resp: http.client.HTTPResponse, host: str, port: int, idle_timeout: float,
+                 cancel: Optional[threading.Event] = None) -> Iterator[bytes]:
+    """Yield the body as it arrives (idle timeout per read); closes the connection at the end or on close()."""
     try:
-        check(url, purpose=purpose, method=method, redirect=False)
-    except HiveError as e:
-        if e.code != "unsupported":   # the P0 NetGuard stub cannot vet; loopback-only below is the stub's limit
-            raise
+        if conn.sock is not None:
+            conn.sock.settimeout(max(0.1, idle_timeout))
+        read = resp.read1 if hasattr(resp, "read1") else resp.read
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise cancelled("cancelled by the caller")
+            try:
+                b = read(65536)
+            except socket.timeout as e:
+                raise timeout(f"idle timeout reading from {host}:{port}: {e}", maybe_executed=True)
+            except (OSError, http.client.HTTPException, ValueError) as e:
+                raise unavailable(f"connection to {host}:{port} failed while reading: {e}", reason="connect",
+                                  maybe_executed=True)
+            if not b:
+                break
+            yield b
+    finally:
+        conn.close()
 
 
 def open_stream(method: str, url: str, *, guard: Any, purpose: str, headers: Optional[Dict[str, str]] = None,
                 body: Optional[bytes] = None, connect_timeout: float = 10, idle_timeout: float = 300,
                 auth: Optional[AuthSpec] = None) -> Tuple[int, Dict[str, str], Iterator[bytes]]:
-    """One hop, no redirects, body streamed in chunks (P0 stub: http:// loopback targets only)."""
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        raise bad_request(f"invalid URL: {url!r}")
-    if parts.scheme not in ("http", "https"):
-        raise bad_request(f"unsupported URL scheme in {url!r}")
-    if parts.username or parts.password:
-        raise bad_request("credentials in URLs are not allowed; use auth_env")
-    host = parts.hostname or ""
-    if parts.scheme != "http" or not is_loopback_host(host):
-        raise unsupported("open_stream to non-loopback or https targets is not available yet (WP3)")
-    _vet(guard, url, purpose, method)
-    try:
-        port = parts.port or 80
-    except ValueError:
-        raise bad_request(f"invalid port in {url!r}")
-    path = parts.path or "/"
-    if parts.query:
-        path += "?" + parts.query
-    hdrs = dict(headers or {})
-    if auth is not None:
-        if auth_host_allowed(auth.hosts, host, "http"):
-            hdrs[auth.header] = auth.value
-    conn = http.client.HTTPConnection(host, port, timeout=connect_timeout)
-    # §11.2 error rules (as guarded_request): timeouts -> timeout; socket errors -> unavailable reason connect|dns;
-    # maybe_executed False before any request byte was written (connect phase), else True
-    try:
-        conn.connect()
-    except socket.gaierror as e:
-        conn.close()
-        raise unavailable(f"cannot resolve {host}: {e}", reason="dns", maybe_executed=False)
-    except socket.timeout as e:
-        conn.close()
-        raise timeout(f"timeout connecting to {host}:{port}: {e}", maybe_executed=False)
-    except OSError as e:
-        conn.close()
-        raise unavailable(f"cannot connect to {host}:{port}: {e}", reason="connect", maybe_executed=False,
-                          hint=f"nothing listening on {host}:{port}")
-    try:
-        if conn.sock is not None:
-            conn.sock.settimeout(idle_timeout)
-        conn.request(method, path, body=body, headers=hdrs)
-        resp = conn.getresponse()
-    except socket.timeout as e:
-        conn.close()
-        raise timeout(f"timeout talking to {host}:{port}: {e}", maybe_executed=True)
-    except (OSError, http.client.HTTPException) as e:
-        conn.close()
-        raise unavailable(f"connection to {host}:{port} failed: {e}", reason="connect", maybe_executed=True)
-    status = resp.status
-    rheaders = {k: v for k, v in resp.getheaders()}
-
-    def chunks() -> Iterator[bytes]:
-        try:
-            while True:
-                try:
-                    b = resp.read1(65536) if hasattr(resp, "read1") else resp.read(65536)
-                except socket.timeout as e:
-                    raise timeout(f"idle timeout reading from {host}:{port}: {e}", maybe_executed=True)
-                except (OSError, http.client.HTTPException) as e:
-                    raise unavailable(f"connection to {host}:{port} failed: {e}", reason="connect",
-                                      maybe_executed=True)
-                if not b:
-                    break
-                yield b
-        finally:
-            conn.close()
-
-    return status, rheaders, chunks()
+    """One hop, no redirects, same routing and C1–C4 rules as guarded_request; the body is yielded in chunks as
+    they arrive (gateway passthrough, §8.7). The secret is attached only where C2/C4 allow it (silently dropped
+    otherwise)."""
+    method = str(method or "GET").upper()
+    if not re.match(r"^[A-Z]{1,16}$", method):
+        raise bad_request(f"invalid HTTP method {method!r}")
+    user_headers = _check_headers(headers, auth)
+    target = guard.check_url(url, purpose=purpose, method=method, redirect=False)
+    hdrs, attach = _hop_headers(user_headers, auth, target, True, True)
+    ca_file = getattr(getattr(guard, "proxies", None), "ca_file", None)
+    conn, resp = _send_hop(method, target, hdrs, body, connect_timeout=connect_timeout, io_timeout=idle_timeout,
+                           verify_tls=True, ca_file=ca_file, credentialed=attach, sent_before=False)
+    rheaders = dict(_Headers(resp.getheaders()).items())
+    return int(resp.status), rheaders, _stream_body(conn, resp, target.host, target.port, idle_timeout)
 
 
 def open_download(url: str, *, guard: Any, purpose: str = "download", headers: Optional[Dict[str, str]] = None,
                   auth: Optional[AuthSpec] = None, range_start: int = 0, connect_timeout: float = 10,
                   idle_timeout: float = 60, max_redirects: int = 5, cancel: Optional[threading.Event] = None
                   ) -> Tuple[int, Dict[str, str], str, Iterator[bytes]]:
-    """The only HTTP entry point of _download (WP3)."""
-    raise _na("open_download")
+    """The only HTTP entry point of ``_download`` (v5): ``(status, headers, final_url, chunks)``. GET with
+    ``Range: bytes=<start>-`` when ``range_start > 0``; manual redirects, each hop re-vetted with
+    ``check_url(redirect=True)`` and the same routing and C1–C4 rules as guarded_request; the body is streamed
+    without buffering (size caps are the caller's: it stops reading and closes the iterator)."""
+    user_headers = [(k, v) for k, v in _check_headers(headers, auth) if k.lower() != "range"]
+    if range_start and int(range_start) > 0:
+        user_headers.append(("Range", f"bytes={int(range_start)}-"))
+    ca_file = getattr(getattr(guard, "proxies", None), "ca_file", None)
+    cur = url
+    origin: Optional[Tuple[str, str, int]] = None
+    hop = 0
+    sent_any = False
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise cancelled("cancelled by the caller")
+        hop += 1
+        target = guard.check_url(cur, purpose=purpose, method="GET", redirect=hop >= 2)
+        here = (target.scheme, target.host.lower(), target.port)
+        if origin is None:
+            origin = here
+        hdrs, attach = _hop_headers(user_headers, auth, target, here == origin, True)
+        if here != origin:     # Range is not a credential: keep it on every hop
+            names = {k.lower() for k, _ in hdrs}
+            hdrs += [(k, v) for k, v in user_headers if k.lower() == "range" and "range" not in names]
+        conn, resp = _send_hop("GET", target, hdrs, None, connect_timeout=connect_timeout, io_timeout=idle_timeout,
+                               verify_tls=True, ca_file=ca_file, credentialed=attach, sent_before=sent_any)
+        sent_any = True
+        status = int(resp.status)
+        rh = _Headers(resp.getheaders())
+        location = rh.get("location") if status in REDIRECT_CODES else None
+        if not location:
+            return status, dict(rh.items()), cur, _stream_body(conn, resp, target.host, target.port, idle_timeout,
+                                                               cancel)
+        conn.close()
+        if hop > max(0, int(max_redirects)):
+            raise unavailable(f"too many redirects (more than {max_redirects})", reason="redirects",
+                              maybe_executed=True, url=cur)
+        cur = urljoin(cur, location.strip()).split("#", 1)[0]
 
 
 def tcp_check(host: str, port: int, timeout: float = 1.0) -> Tuple[bool, Optional[float], Optional[str]]:

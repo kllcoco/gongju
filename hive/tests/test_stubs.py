@@ -124,25 +124,26 @@ class TestNetStubs(unittest.TestCase):
         self.assertFalse(t.pin_ip)
 
     def test_netguard_real(self):
-        # WP3a CONTRACT-REQUEST: NetGuard, guarded_request and tcp_check are real now (tests in test_netutil.py);
-        # open_download stays a stub until WP3b
-        g = netutil.NetGuard(http_allow=["loopback"], http_deny=[], download_allow=[], allow_metadata_ip=False,
-                             proxies=netproxy.load_proxy_settings(None))
+        # WP3a/WP3b CONTRACT-REQUEST: NetGuard, guarded_request, tcp_check, open_stream and open_download are real
+        # (detailed tests in test_netutil.py / test_download.py)
+        g = netutil.NetGuard(http_allow=["loopback"], http_deny=[], download_allow=["loopback"],
+                             allow_metadata_ip=False, proxies=netproxy.load_proxy_settings({"proxy": "off"}))
         t = g.check_url("http://127.0.0.1/", purpose="http")
         self.assertEqual((t.route, t.category, t.ip), ("direct", "loopback", "127.0.0.1"))
         with self.assertRaises(HiveError) as cm:
             g.check_url("http://8.8.8.8/", purpose="http")
         self.assertEqual(cm.exception.code, "policy_denied")
         with self.assertRaises(HiveError) as cm:
-            netutil.open_download("http://127.0.0.1/", guard=g)
-        self.assertEqual(cm.exception.code, "unsupported")
+            netutil.open_download(f"http://127.0.0.1:{helpers.free_port()}/", guard=g)
+        self.assertEqual((cm.exception.code, cm.exception.details["reason"],
+                          cm.exception.details["maybe_executed"]), ("unavailable", "connect", False))
         self.assertEqual(netutil.tcp_check("127.0.0.1", helpers.free_port(), 0.5)[0], False)
 
-    def test_netproxy_no_proxy_stub(self):
-        s = netproxy.load_proxy_settings({"proxy": "http://127.0.0.1:7890"}, {"HTTPS_PROXY": "http://x:1"})
+    def test_netproxy_real(self):
+        # WP3b CONTRACT-REQUEST: netproxy is real (detailed tests in test_netproxy.py)
+        s = netproxy.load_proxy_settings({"proxy": "off"}, {"HTTPS_PROXY": "http://x:1"})
         self.assertEqual(s, netproxy.ProxySettings(None, None, ("localhost", "127.0.0.1", "::1"), "none"))
         self.assertIsNone(netproxy.proxy_for(s, "https", "huggingface.co"))
-        self.assertTrue(netproxy.bypass(s, "huggingface.co"))
         self.assertEqual(netproxy.child_proxy_env(s), {})
         self.assertEqual(netproxy.redact_proxy("http://user:pw@127.0.0.1:7890"), "http://***@127.0.0.1:7890")
         self.assertEqual(netproxy.redact_proxy("http://127.0.0.1:7890"), "http://127.0.0.1:7890")
@@ -150,9 +151,11 @@ class TestNetStubs(unittest.TestCase):
         p = netproxy.ProxySettings("http://u:p@h:1", "http://u:p@h:1", (), "env")
         self.assertEqual(p.describe(), "http://***@h:1 (env)")
         self.assertEqual(p.to_dict()["https"], "http://u:p@h:1")
+        c = netproxy.load_proxy_settings({"proxy": "http://127.0.0.1:7890"}, {})
+        self.assertEqual((c.http, c.https, c.source), ("http://127.0.0.1:7890", "http://127.0.0.1:7890", "config"))
         with self.assertRaises(HiveError) as cm:
-            netproxy.open_tunnel("http://127.0.0.1:1", "x", 443, timeout=1)
-        self.assertEqual(cm.exception.code, "unsupported")
+            netproxy.open_tunnel(f"http://127.0.0.1:{helpers.free_port()}", "x", 443, timeout=1)
+        self.assertEqual((cm.exception.code, cm.exception.details["reason"]), ("unavailable", "proxy"))
 
     def test_open_stream_loopback(self):
         with helpers.StubHTTPServer() as srv:
@@ -165,12 +168,9 @@ class TestNetStubs(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn(b"data: [DONE]", body)
             self.assertEqual(guard.calls[0][1:], ("model", "POST", False))
-        with self.assertRaises(HiveError) as cm:
-            netutil.open_stream("GET", "https://example.com/", guard=None, purpose="model")
-        self.assertEqual(cm.exception.code, "unsupported")
         port = helpers.free_port()
         with self.assertRaises(HiveError) as cm:
-            netutil.open_stream("GET", f"http://127.0.0.1:{port}/", guard=None, purpose="model")
+            netutil.open_stream("GET", f"http://127.0.0.1:{port}/", guard=helpers.FakeNetGuard(), purpose="model")
         self.assertEqual((cm.exception.code, cm.exception.details["reason"],
                           cm.exception.details["maybe_executed"]), ("unavailable", "connect", False))
 
@@ -183,8 +183,9 @@ class TestNetStubs(unittest.TestCase):
         port = lsock.getsockname()[1]
         try:
             with self.assertRaises(HiveError) as cm:
-                netutil.open_stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions", guard=None,
-                                    purpose="model", body=b"{}", connect_timeout=2, idle_timeout=0.3)
+                netutil.open_stream("POST", f"http://127.0.0.1:{port}/v1/chat/completions",
+                                    guard=helpers.FakeNetGuard(), purpose="model", body=b"{}", connect_timeout=2,
+                                    idle_timeout=0.3)
             self.assertEqual((cm.exception.code, cm.exception.details["maybe_executed"]), ("timeout", True))
         finally:
             lsock.close()
