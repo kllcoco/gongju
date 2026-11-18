@@ -135,7 +135,11 @@ class TestGates(unittest.TestCase):
             src = p.read_text(encoding="utf-8")
             with self.subTest(file=p.name):
                 self.assertNotRegex(src, r"shell\s*=\s*True")
-                self.assertNotIn("CERT_NONE", src)
+                # §22.3 rule 11: CERT_NONE only on the pin-verification path of transport.py/relay.py and in
+                # netutil.py's explicit verify_tls=False branch (WP5a CONTRACT-REQUEST; test_transport pins the
+                # transport.py occurrence to _pin_context)
+                if p.name not in ("transport.py", "relay.py", "netutil.py"):
+                    self.assertNotIn("CERT_NONE", src)
                 if p.name not in ("render.py", "cli.py", "util.py"):
                     self.assertNotRegex(src, r"\butil\.iso\(")
                 if p.name not in ("cli.py", "__main__.py"):

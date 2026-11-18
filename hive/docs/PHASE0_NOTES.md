@@ -461,3 +461,135 @@ by the lead or a line in DESIGN.md.
       the first sample of a pid (Process objects are kept per service between calls). jobs.max_running is checked
       and reserved in one locked step; the reaper no longer marks a job `lost` while start_job is still spawning its
       shim (a record in `starting` without a shim pid).
+
+## WP5a hand-off (transport.py, client.py)
+
+69. **CONTRACT-REQUEST (WP5a → P0 test `tests/test_imports.py`):** the grep gate forbade `CERT_NONE` in every file,
+    while §22.3 rule 11 allows it on the pin-verification path of `transport.py`/`relay.py` and in `netutil.py`'s
+    explicit `verify_tls=False` branch. The gate now exempts exactly those three files; `test_transport` pins the
+    `transport.py` occurrence to the function `_pin_context` (AST line-range check). relay.py (WP5b) should reuse
+    `transport._pin_context` / `HttpTransport` rather than build its own context.
+70. **Additive names (WP5a):** `transport.normalize_pin(pin) -> hex`, `transport.cert_pin(der) -> "sha256:…"`,
+    `transport.plaintext_ok(host, ips)` (rule C1), `transport.resolve_host(host, port, timeout=5)`,
+    `HttpTransport.proxy_route() -> (proxy|None, ips|None)`, `HttpTransport.call_socket_timeout(body, timeout=None)
+    -> (seconds, mutating)`, attributes `url/scheme/host/port/proxy/tls_pin/has_token`, settable `timeout` (the
+    Toolkit raises it to `wait_budget + 30`, §17.4) and `offline_hint`; `HttpTarget(transport | url, token=None, *,
+    kind=None, connection=None, **transport_kw)` with `.transport`, `.url`, `.connection`, `actions_info(node)` (the
+    whole `/v1/actions` result incl. `implemented`/`catalog_hash`) and `close()`; `Client.config` (the loaded
+    `ClientConfig` or None) and `Client.connection`; `NodeHandle.call(action, params, **kw)`;
+    `client.new_request_id()`, `client.split_location(spec)`, `client.LOCAL_CONNECTION = "this-pc"`.
+71. **Interpretations (WP5a):**
+    - Every connection resolves the host once (≤ 5 s, helper thread) and the direct route connects to those vetted
+      addresses (no second lookup), so rule C1 and `proxy_for(..., ips)` decide on the same answer. C1: a token goes
+      over `http://` only when the host is loopback, a private/CGNAT IP literal, a name whose resolved addresses are
+      all loopback/private (fake-ip 198.18/15 does not count), or an unresolvable local name / `*.ts.net`;
+      otherwise `policy_denied` rule `plaintext_credentials`, before any connection is made.
+    - Proxy: `"off"` → direct; an explicit URL → every target through it (also loopback/private, §14.4); `"auto"` →
+      `netproxy.load_proxy_settings({"proxy": HIVE_PROXY or None, "no_proxy": [], "use_system_proxy": true,
+      "ca_file": null}, os.environ)` (HIVE_PROXY as a configured source, so bypass rules still apply; never as
+      `explicit=`) and `proxy_for(settings, scheme, host, ips)`. A proxied connection always uses
+      `netproxy.open_tunnel` (CONNECT), also for `http://` targets, because Hive requests carry a token (C1); TLS and
+      the pin are checked inside the tunnel (C3). Until WP3b replaces the netproxy stub, `auto` is direct and an
+      explicit proxy URL fails with the stub's `unsupported`.
+    - Connect-phase failures (`connect`, `dns`, `proxy`, TLS handshake incl. certificate verification → reason
+      `connect`) are retried ≤ 2 times (0.2 s, 0.4 s); `tls_pin`, `proxy_auth` and C1 refusals never. After the
+      first request byte: `unavailable` reason `lost` (no retry; GET/HEAD reconnect once) and socket timeouts →
+      `timeout`, `maybe_executed` true only for `POST /v1/call` of a mutating action — an action the client's catalog
+      does not know counts as mutating (fail safe) and gets deadline 30. Idle keep-alive connections are not reused
+      after 20 s (servers close at 30 s) or when the peer already closed them (select check), so a POST is never sent
+      on a stale socket. A non-JSON or non-envelope response is `internal` (details `status`, escaped `snippet`); a
+      response `X-Hive-Api` other than 1 is `bad_request` "api mismatch"; responses > 128 MiB are refused.
+    - The socket timeout of `POST /v1/call` is `max(timeout or constructor timeout, catalog.deadline(...) + 25)`
+      (§15.1; the constructor timeout is the minimum); other routes use `request(timeout=)` or the constructor value.
+    - `HttpTarget.kind` is lazy (one `GET /v1/whoami`); it returns `"unknown"` while the server is unreachable and on
+      an uninitialised object (Python 3.9's runtime Protocol check calls `hasattr`).
+    - `connect()` sends nothing. Resolution (§14.4): `connect(None)` → `HIVE_URL` (token `HIVE_TOKEN`, else
+      `HIVE_TOKEN_FILE`; pin `HIVE_TLS_PIN`) → `HIVE_CONNECTION` → `default`; `connect("name")` / `"local"` (=
+      `this-pc`, the agent connection; offline → the D45 hint "start it: hive node run (or hive service install
+      node)") ignore `HIVE_URL`; `connect("http(s)://…")` uses the given token, else `HIVE_TOKEN`/`HIVE_TOKEN_FILE`,
+      and `HIVE_TLS_PIN` only when the URL equals `HIVE_URL`; client.json connections are not matched by URL (that
+      could silently pick an owner token such as `hub-local`). Default node: `connect(default_node=)` →
+      `HIVE_NODE` → the connection's `default_node`. Relative `token_file` paths resolve against client.json's
+      folder; only the first line of a token file is used. `connect` options: `ca_file`, `tls_pin`, `timeout`,
+      `proxy`, `default_node`, `config` (client.json path); unknown options → `bad_request`.
+    - `NodeHandle.sh` raises `internal` (details `exit_code`, `stderr`, `state`, `job_id`) unless the state is
+      `exited` with code 0. `follow_logs` starts with the tail, then follows `next_offset`; a job's stream ends once
+      the job is final and a read returns no text; a service's never ends. `JobHandle.wait(timeout)` returns the
+      last status when the time is up. `pull_model(dry_run=True)` returns the plan dict.
+    - Transfers: `Client.transfer("local:P" | "NODE:P", …)` (a prefix is required, "self" allowed) and
+      `NodeHandle.upload/download` call `transfer.copy` with `transfer.LocalFS(None)` and
+      `transfer.NodeFS(target, node)` — WP5b must give `NodeFS` that constructor (`node` may be None = the direct
+      node / default). Until WP5b they raise the stub's `unsupported`. `HubTarget` stays a WP5b stub.
+72. **Open items (WP5a):** `docs/PROTOCOL.md` (WP5) is left for WP5b with the relay protocol. The proxy routes are
+    tested with patched `netproxy` functions and an in-test CONNECT proxy; they must be re-run against the real
+    netproxy when WP3b merges.
+
+## WP3a hand-off (contract requests and interpretations)
+
+69. **CONTRACT-REQUEST (WP3a → P0 tests):** `test_catalog.TestHandlersGate` reads an optional module constant
+    `PENDING_ACTIONS` from each action module: `actions/model.py` is merged in two parts (§22.1: model.endpoints /
+    model.chat in WP3a, model.pull / model.forward in WP3b) and lists `("model.pull", "model.forward")` there. Pending
+    actions count as unmerged (the test skips naming them) and must not be registered while listed. WP3b removes the
+    constant. `test_stubs.test_netguard_stub` became `test_netguard_real` (NetGuard/guarded_request/tcp_check are real;
+    `open_download` stays a stub until WP3b) and `test_part_tracker_noop` became `test_part_tracker_real` (the real
+    PartTracker writes its JSON file, so the test uses a temp dir instead of the cwd).
+70. **CONTRACT-REQUEST (WP3a → WP2 `services.py`, one line):** the start plan's `eff.check_url(endpoint|health_url,
+    purpose="health")` now also tolerates `unavailable` (a DNS failure is not a policy decision; the health check
+    reports it). With the real NetGuard an unresolvable endpoint host (e.g. `https://evil.example/v1` in
+    `test_services.test_endpoint_for_auth`, no DNS in CI) made `service.define` fail. Policy denials still refuse.
+    WP2's `_http_status`/`_tcp_check` now run on the real `guarded_request`/`tcp_check` (their P0 fallbacks stay).
+71. **CONTRACT-REQUEST (WP3a, additive signatures):** `fsops.read_lines(…, *, line_numbers=False)` (numbering inside
+    the byte budget); `fsops.walk(…, skip_dirs=())` (fs.search skips `.git node_modules …` without descending).
+    Extra fsops helpers used by actions/files.py: `os_errors` (the §11.1 OS-error mapping as a context manager),
+    `decode_bytes`/`encode_text` (lossless round trip: BOM kept, undecodable bytes kept with surrogateescape),
+    `split_lines` (only `\r\n`/`\r`/`\n` break lines), `normalize_newlines`, `snippet`, `entry_allowed`,
+    `display_text`, `binary_error`, `json_depth_ok`. `actions/model.py` exports `list_endpoints`/`parse_base_url`
+    (WP3b's model.forward / gateway may reuse them).
+72. **NetGuard interpretations (WP3a):**
+    - Denial rules: `ssrf` (metadata/link-local IPs and names, reserved, literal fake-ip, mixed fake-ip answers),
+      `net_allow` (category/IP/CIDR/host glob not in the allow list; hint lists it), `http_deny`, `own_port`.
+      DNS failure without a usable proxy → `unavailable` reason `dns`, `maybe_executed:false`.
+    - Allow/deny entries: `loopback|private|public`, IPs, CIDRs, host globs, each optionally `HOST:PORT` /
+      `[v6]:PORT`; IP entries match the address and its unwrapped IPv4 (mapped/NAT64/6to4/Teredo).
+    - `own_ports` deny only `purpose="http"` to loopback targets (the node's own API); health checks may reach them.
+    - `VettedTarget.category`: the literal's category; for names the first resolved IP's category, `"fakeip"` when
+      every answer is fake-ip (evaluated as public for the allow decision); `"public"` for an unresolvable proxied
+      name. `pin_ip` is set by NetGuard only for `strict_dns` (never for a fake-ip answer); rule 5c is WP1's.
+    - Name resolution is the module function `netutil._resolve(host, port, timeout)` (getaddrinfo in a daemon
+      thread, ≤ 5 s); tests patch it to stub DNS.
+73. **guarded_request interpretations (WP3a):** besides §11.2 it rejects agent framing headers (`Host`,
+    `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Keep-Alive`, `Trailer`, `Proxy-*`) and an
+    `Authorization` header together with `auth` (`bad_request`), so net.http (WP3b) gets these rules for free. With
+    `auth`, the **first** hop must be a host the secret is bound to (`policy_denied` rule `secret_host`, hint with
+    `hive node secret set NAME --hosts +host`) and must not be plain `http://` to a non-loopback/private target
+    (`plaintext_credentials`); later hops drop the header silently (C2). `Accept-Encoding: identity` and
+    `User-Agent: hive` are sent unless given. 301/302 of a non-GET and 303 become GET without body; 307/308 keep
+    both; more than 5 redirects → `unavailable` reason `redirects`. A 407 from an absolute-form proxy →
+    `unavailable` reason `proxy_auth`; an unreachable proxy → reason `proxy` with the Clash hint. `https` and
+    credentialed `http` through a proxy call `netproxy.open_tunnel` (still the P0 `unsupported` stub until WP3b;
+    `tests/fixtures/connect_proxy.simple_open_tunnel` stands in for it in tests). TLS failures → `unavailable` reason
+    `tls`.
+74. **fs.* interpretations (WP3a):**
+    - Symbolic links: fs.stat reports a link (`type:"link"`, `link_target`, size/mtime of the target) and fs.delete /
+      fs.move act on the link itself, located through a PathGuard-vetted parent; the target must still pass
+      PathGuard (a link to a path outside the roots cannot be stat'ed, moved or deleted: conservative).
+      fs.list/fs.search/recursive fs.copy never follow links (listed/copied as links).
+    - fs.list `sort:"mtime"` and `"size"` are newest/largest first; `total_capped` is also set when the walk hit the
+      call deadline. fs.search `file` values are absolute native paths (fs.list entries stay relative); literal
+      patterns are matched on the whole line, regexes on the first 2 KiB (`cut:true`); match text is cut to 500 chars.
+    - fs.read `encoding` is `locale` whenever the file is not valid UTF-8 (on POSIX it is then shown with U+FFFD,
+      fs.edit round-trips the raw bytes). `long_lines_cut` counts cut lines. `max_bytes`/fs.read_chunk `length`
+      above `limits.max_read_bytes` → `bad_request` naming the limit.
+    - fs.read_chunk `length` is the number of raw file bytes read (the masked `data` may differ, `masked:true`).
+    - fs.move/fs.copy `dst` is the final path (no "into this folder" semantics); an existing folder `dst` is a
+      `conflict`; the destination check refuses with rule `contains_denied`. fs.delete/fs.move refuse targets
+      that are, or contain, a filesystem root, home, the workdir, an fs root or the data dir (rule
+      `protected_path`).
+    - New files get mode 0644 (POSIX), part files 0600; overwrite keeps the original mode bits.
+75. **model.* interpretations (WP3a):** probe rows have `name: null`; config `model_endpoints` rows on non-loopback
+    hosts are listed but not probed (`healthy: null`; read risk reaches only loopback and service endpoints);
+    service/config/probe rows are deduplicated by normalized base URL in that order; an unanswered config row is
+    `healthy:false, server:"unknown"`. model.chat: an `ollama`-kind endpoint without a `/v1` path gets `/v1`
+    appended; automatic target = exactly one `healthy:true` row of the probe listing (a service/config row brings
+    its own `api_key_env`); `content` beyond `max_chars` is cut 75 % head / 25 % tail; the reply is read up to
+    `limits.max_response_bytes`.
