@@ -1057,7 +1057,9 @@ def foreground_restart_ok(*, relaunched: bool = False, supervise: bool = False) 
     if relaunched or supervise:
         return False
     env = os.environ
-    if env.get("HIVE_WATCHDOG") == "1" or env.get("INVOCATION_ID") or env.get("HIVE_FOREGROUND_CHILD") == "1":
+    # v8.1 (external review round 2): INVOCATION_ID is no reason by itself: terminals started by a systemd user unit
+    # (gnome-terminal-server, a tmux server) pass it on; a systemd unit never has a terminal on stdin or stderr
+    if env.get("HIVE_WATCHDOG") == "1" or env.get("HIVE_FOREGROUND_CHILD") == "1":
         return False
     for stream in (sys.stdin, sys.stderr):
         try:

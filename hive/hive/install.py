@@ -687,6 +687,10 @@ def uninstall(kind: str, *, method: str = "auto", system: bool = False, dry_run:
     if m is None:
         res.notes.append(f"no {kind} service installation found")
         _stop_daemon(ctx, res, dry_run=dry_run)
+        # v8.1 (external review round 2): a node only ever run in the foreground still has jobs and services
+        _stop_or_warn_services(ctx, res, kind, stop_services=stop_services, dry_run=dry_run)
+        if dry_run:
+            res.notes.insert(0, "dry run: nothing was removed or stopped")
         return res
     if m == "systemd":
         unit = _unit_path(kind, system)
@@ -741,22 +745,38 @@ def uninstall(kind: str, *, method: str = "auto", system: bool = False, dry_run:
                     p.unlink()
                 except FileNotFoundError:
                     pass
-    if stop_services and kind == "node":
-        if dry_run:
-            res.notes.append("would stop every job and service of this node")
-        else:
-            _stop_daemon(ctx, res, dry_run=False)
-            try:
-                from . import services
-                node_id = getattr(ctx.cfg, "node_id", None) or ""
-                out = services.panic_offline(ctx.data_dir, node_id)
-                res.notes.append(f"stopped {len(out.get('jobs') or [])} jobs and {len(out.get('services') or [])} "
-                                 "services")
-            except Exception as e:  # noqa: BLE001
-                res.notes.append(f"could not stop jobs/services: {e}")
+    _stop_or_warn_services(ctx, res, kind, stop_services=stop_services, dry_run=dry_run)
     if dry_run:
         res.notes.insert(0, "dry run: nothing was removed or stopped")
     return res
+
+
+def _stop_or_warn_services(ctx: _Ctx, res: InstallResult, kind: str, *, stop_services: bool, dry_run: bool) -> None:
+    """``stop_services``: stop every job and service of the node (after the daemon); otherwise name what keeps
+    running, since nothing stops it once Hive is removed (v8.1, external review round 2)."""
+    if kind != "node":
+        return
+    from . import services
+    if stop_services:
+        if dry_run:
+            res.notes.append("would stop every job and service of this node")
+            return
+        _stop_daemon(ctx, res, dry_run=False)
+        try:
+            node_id = getattr(ctx.cfg, "node_id", None) or ""
+            out = services.panic_offline(ctx.data_dir, node_id)
+            res.notes.append(f"stopped {len(out.get('jobs') or [])} jobs and {len(out.get('services') or [])} "
+                             "services")
+        except Exception as e:  # noqa: BLE001
+            res.notes.append(f"could not stop jobs/services: {e}")
+        return
+    try:
+        jobs, svcs = services.running_offline(ctx.data_dir)
+    except Exception:  # noqa: BLE001
+        return
+    if jobs or svcs:
+        res.notes.append(f"{len(svcs)} services and {len(jobs)} jobs keep running; to remove Hive completely use "
+                         f"--stop-services (hive service uninstall node --stop-services)")
 
 
 # ---------------------------------------------------------------------------------------------------------------

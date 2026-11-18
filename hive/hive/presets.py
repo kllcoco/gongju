@@ -749,19 +749,177 @@ _META_SPLIT = re.compile(r"[;|&<>()]+")
 
 
 def _raw_words(argv_or_command: Union[List[str], str], *, shell: Optional[str], os_name: Optional[str]) -> List[str]:
-    if isinstance(argv_or_command, (list, tuple)):
-        return [str(w) for w in argv_or_command]
-    text = str(argv_or_command)
-    if _windows_shell(shell, os_name):
-        return [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
+    return [w for w, _s in _spelled_words(argv_or_command, shell=shell, os_name=os_name)]
+
+
+# v8.1 (external review): quoting state of each character of a POSIX shell word: 0 unquoted, 1 inside "…" ($ still
+# expands, ~ does not), 2 literal ('…', $'…', backslash-escaped: nothing expands)
+_Q_NONE, _Q_DOUBLE, _Q_LITERAL = 0, 1, 2
+
+
+def _posix_tokens(text: str) -> List[List[Tuple[str, int]]]:
+    """Words of a POSIX shell string as ``[(char, quoting)]``: operators ``();<>|&`` and whitespace split words,
+    ``#`` at a word start begins a comment; an unclosed quote raises ValueError."""
+    words: List[List[Tuple[str, int]]] = []
+    cur: Optional[List[Tuple[str, int]]] = None
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in " \t\r\n" or c in _SHELL_OPS:
+            if cur is not None:
+                words.append(cur)
+                cur = None
+            i += 1
+            continue
+        if c == "#" and cur is None:
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if cur is None:
+            cur = []
+        if c == "\\":
+            if i + 1 < n and text[i + 1] != "\n":
+                cur.append((text[i + 1], _Q_LITERAL))
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                raise ValueError("no closing quotation")
+            cur.extend((ch, _Q_LITERAL) for ch in text[i + 1:j])
+            i = j + 1
+            continue
+        if c == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            while j < n and text[j] != "'":
+                if text[j] == "\\" and j + 1 < n:
+                    j += 1
+                cur.append((text[j], _Q_LITERAL))
+                j += 1
+            if j >= n:
+                raise ValueError("no closing quotation")
+            i = j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                if text[j] == "\\" and j + 1 < n and text[j + 1] in '$`"\\\n':
+                    if text[j + 1] != "\n":
+                        cur.append((text[j + 1], _Q_LITERAL))
+                    j += 2
+                    continue
+                cur.append((text[j], _Q_DOUBLE))
+                j += 1
+            if j >= n:
+                raise ValueError("no closing quotation")
+            i = j + 1
+            continue
+        cur.append((c, _Q_NONE))
+        i += 1
+    if cur is not None:
+        words.append(cur)
+    return words
+
+
+_NAME_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SHELL_VAR_RE = re.compile(r"\$(\{[^}]*\}?|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
+_LEADING_VAR_RE = re.compile(r"^\$(\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+UNBOUND_VARS = "(variables; not bound)"
+LITERAL_PREFIX = "./"
+
+
+def _known_var(s: str) -> bool:
+    """``s`` holds a ``$NAME``/``${NAME}``/``%NAME%`` that PathGuard would expand (policy.PATH_VARS)."""
     try:
-        # Phase 2 review: shell operators split words even without spaces ("bash run.sh;true",
-        # "run.sh|bash", "<in.sh"), so a script next to a metacharacter is still bound (§5.6)
-        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        return [w for w in lex if not (w and all(c in _SHELL_OPS for c in w))]
-    except ValueError:
-        return [x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)]
+        from .policy import PATH_VARS, _VAR_RE
+    except Exception:  # noqa: BLE001
+        return "$" in s or "%" in s
+    names = {v.lower() for v in PATH_VARS}
+    return any((m.group(1) or m.group(2) or m.group(3) or "").lower() in names for m in _VAR_RE.finditer(s))
+
+
+def _literal_spelling(s: str) -> Optional[str]:
+    """The word as a path the program opens literally (no ``~`` or variable expansion): ``~…`` -> ``./~…`` (relative
+    to the cwd, so the binding does not expand it); None when PathGuard would expand a variable in it."""
+    if _known_var(s):
+        return None
+    return LITERAL_PREFIX + s if s.startswith("~") else s
+
+
+def _shell_spellings(chars: List[Tuple[str, int]]) -> List[Optional[str]]:
+    """Bind spellings of one POSIX shell word (or the value part of a KEY=VALUE word): the path the shell hands the
+    program. An unquoted leading ``~`` (up to the first ``/``) stays (the binding expands it); a quoted or escaped one
+    is literal (``./~…``); a leading ``$HOME``-style variable outside single quotes stays (PathGuard expands the
+    same fixed set); any other expanded ``$`` makes the word unbindable (None)."""
+    raw = "".join(c for c, _q in chars)
+    if not raw:
+        return []
+    expandable = "".join(c if q != _Q_LITERAL else "\x01" for c, q in chars)
+    dollars = list(_SHELL_VAR_RE.finditer(expandable))
+    if dollars:
+        m = _LEADING_VAR_RE.match(expandable)
+        try:
+            from .policy import PATH_VARS
+        except Exception:  # noqa: BLE001
+            PATH_VARS = ()   # type: ignore[assignment]
+        name = (m.group(2) or m.group(3)) if m else None
+        if not (m and len(dollars) == 1 and name in PATH_VARS):
+            return [None]
+        rest = raw[m.end():]
+        return [None] if _known_var(rest) else [raw]
+    if raw.startswith("~"):
+        prefix = chars[:next((i for i, (c, q) in enumerate(chars) if c == "/" and q == _Q_NONE), len(chars))]
+        if all(q == _Q_NONE for _c, q in prefix):
+            return [None] if _known_var(raw) else [raw]
+    return [_literal_spelling(raw)]
+
+
+def _spelled_words(argv_or_command: Union[List[str], str], *, shell: Optional[str], os_name: Optional[str]
+                   ) -> List[Tuple[str, List[Tuple[str, List[Optional[str]]]]]]:
+    """[(raw word, [(candidate, its bind spellings)])] (v8.1, external review): what each candidate (``_word_candidates``)
+    names as a path. argv elements are literal (nothing expands ``~`` or variables; a leading ``~`` is bound both as
+    the literal ``./~…`` and expanded, since programs often expand it themselves); a POSIX shell expands only an
+    unquoted leading ``~`` (``_shell_spellings``); PowerShell/cmd words are bound literally and, for ``~``, expanded
+    too. A None spelling cannot be bound (the header lists it)."""
+    out: List[Tuple[str, List[Tuple[str, List[Optional[str]]]]]] = []
+
+    def both(c: str) -> List[Optional[str]]:
+        lit = _literal_spelling(c)
+        if c.startswith("~"):
+            return [lit, None if _known_var(c) else c]
+        return [lit]
+
+    if isinstance(argv_or_command, (list, tuple)):
+        for w in (str(x) for x in argv_or_command):
+            out.append((w, [(c, both(c)) for c in _word_candidates(w)]))
+        return out
+    text = str(argv_or_command)
+    toks: Optional[List[List[Tuple[str, int]]]] = None
+    if not _windows_shell(shell, os_name):
+        try:
+            toks = _posix_tokens(text)
+        except ValueError:
+            toks = None
+    if toks is None:
+        for w in (x.strip("\"'") for w in text.split() for x in _META_SPLIT.split(w)):
+            out.append((w, [(c, both(c)) for c in _word_candidates(w)]))
+        return out
+    for chars in toks:
+        w = "".join(c for c, _q in chars)
+        cands: List[Tuple[str, List[Optional[str]]]] = []
+        if w and not w.startswith("-"):
+            cands.append((w, _shell_spellings(chars)))
+        if "=" in w:
+            k = w.index("=")
+            v = w[k + 1:]
+            if v and not v.startswith("-"):
+                vs = _shell_spellings(chars[k + 1:])
+                if vs == [v] and v.startswith("~") and not _NAME_ASSIGN_RE.match(w):
+                    # bash expands ~ after '=' only in NAME=… words; a program may still expand --opt=~/x itself
+                    vs = [_literal_spelling(v), v]
+                cands.append((v, vs))
+        out.append((w, cands))
+    return out
 
 
 def _word_candidates(w: str) -> List[str]:
@@ -810,25 +968,115 @@ def candidate_words(argv_or_command: Union[List[str], str], *, shell: Optional[s
     return out
 
 
-def bindable_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
-                   os_name: Optional[str] = None) -> Tuple[List[str], List[str]]:
-    """(words to bind, relative words after a cwd change) (v8.1): like ``candidate_words``, but once a word changes
-    the directory (``changes_cwd``: ``cd sub && bash run.sh``, ``git -C sub``, ``make -C sub``), that word's
-    relative successors go to the second list ("not bound (cwd may change)"); absolute and ``~`` words stay bound.
-    The node review and the hub review share it."""
+# v8.1 (external review, round 2): in a shell string a cwd change can come from anywhere (a function or loop body run
+# later, eval, a substitution, a variable in command position, cmd's "cd/d" or "cd..", PowerShell's
+# .SetLocation()), so the decision is made on the whole text: when it may change the cwd, NO relative word is bound.
+_CWD_TEXT_RE = re.compile(
+    r"(?i)(?<![\w.-])(cd|chdir|pushd|popd|set-location|sl|push-location|pop-location)(?![\w-]|\.\w)"
+    r"|setlocation|setcurrentdirectory|currentdirectory\s*=")
+_DYNAMIC_TEXT_RE = re.compile(
+    r"(?i)`|\$\(|(?<![\w.-])(eval|source|iex|invoke-expression|invoke-command|icm)(?![\w-])"
+    r"|(^|[;&|(){}\n]|\b(do|then|else|exec|command|env|xargs|sudo|nohup|time)\s)\s*[\"']?\$[{\w]"
+    r"|(^|[;&|(){}\n])\s*\.\s")
+
+
+def text_may_change_cwd(text: str) -> bool:
+    """The shell text may change the directory its relative words are resolved in (a cwd changer anywhere, or code
+    the review cannot read: backticks, ``$(``, eval/source/iex, a variable in command position) (v8.1)."""
+    return bool(_CWD_TEXT_RE.search(text) or _DYNAMIC_TEXT_RE.search(text))
+
+
+def bind_plan(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
+              os_name: Optional[str] = None) -> Tuple[List[str], List[str], List[str]]:
+    """(spellings to bind, relative words whose cwd may change, header items for words that cannot be bound) (v8.1).
+
+    Spellings are the paths the program opens (``_spelled_words``: a quoted ``~`` or any ``~`` in argv is bound
+    literally as ``./~…``). argv lists: once a word changes the directory (``changes_cwd``: ``git -C sub``), later
+    relative words move to the second list. Shell strings: when the whole text may change the cwd
+    (``text_may_change_cwd``) every relative word moves, before and after; otherwise the argv rule applies. Absolute
+    and ``~`` words stay bound. The node review and the hub review share it."""
     words: List[str] = []
     moved: List[str] = []
-    after = False
-    for w in _raw_words(argv_or_command, shell=shell, os_name=os_name):
-        for c in _word_candidates(w):
-            if after and relative_word(c):
-                if c not in moved:
-                    moved.append(c)
-            elif c not in words:
-                words.append(c)
+    unbound: List[str] = []
+    after = not isinstance(argv_or_command, (list, tuple)) and text_may_change_cwd(str(argv_or_command))
+    for w, cands in _spelled_words(argv_or_command, shell=shell, os_name=os_name):
+        for c, spellings in cands:
+            for sp in spellings:
+                if sp is None:
+                    item = f"{c} {UNBOUND_VARS}"
+                    if _pathlike(c) and item not in unbound:
+                        unbound.append(item)
+                elif after and relative_word(sp):
+                    if sp not in moved:
+                        moved.append(sp)
+                elif sp not in words:
+                    words.append(sp)
         if not after and changes_cwd(w):
             after = True
+    return words, moved, unbound
+
+
+def bindable_words(argv_or_command: Union[List[str], str], *, shell: Optional[str] = None,
+                   os_name: Optional[str] = None) -> Tuple[List[str], List[str]]:
+    """(words to bind, relative words whose cwd may change): the first two parts of ``bind_plan``."""
+    words, moved, _u = bind_plan(argv_or_command, shell=shell, os_name=os_name)
     return words, moved
+
+
+# v8.1 (external review): env keys whose value names a file the program loads before the approved command runs
+_ENV_FILE_KEYS = ("BASH_ENV", "ENV", "PYTHONSTARTUP", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "NODE_OPTIONS")
+_NODE_FILE_OPTS = ("-r", "--require", "--import", "--loader", "--experimental-loader")
+
+
+def env_file_values(env: Any) -> List[Tuple[str, str]]:
+    """``[(key, file value)]`` of the env keys that name a file loaded before the command (BASH_ENV, ENV,
+    PYTHONSTARTUP, LD_PRELOAD/DYLD_INSERT_LIBRARIES entries, NODE_OPTIONS --require/--import targets)."""
+    out: List[Tuple[str, str]] = []
+    for k, v in _env_pairs(env):
+        ku = k.upper()
+        if ku not in _ENV_FILE_KEYS or not v:
+            continue
+        if ku in ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
+            vals = [x for x in re.split(r"[:\s]+", v) if x]
+        elif ku == "NODE_OPTIONS":
+            try:
+                toks = shlex.split(v)
+            except ValueError:
+                toks = v.split()
+            vals = []
+            for i, t in enumerate(toks):
+                if t in _NODE_FILE_OPTS and i + 1 < len(toks):
+                    vals.append(toks[i + 1])
+                elif "=" in t and t.split("=", 1)[0] in _NODE_FILE_OPTS:
+                    vals.append(t.split("=", 1)[1])
+        else:
+            vals = [v]
+        out += [(k, x) for x in vals if x]
+    return out
+
+
+def _env_words(env: Any, words: List[str], unbound: List[str]) -> Tuple[List[str], List[str]]:
+    """Add the files named by env values (``env_file_values``) to the words to bind (v8.1): relative values are
+    resolved against the reviewed cwd (made path-like so a missing one is bound as absent), a ``~`` value both
+    expanded and literally; a value with ``$`` or a backtick is listed as not bound."""
+    words = list(words)
+    unbound = list(unbound)
+    for k, x in env_file_values(env):
+        if "$" in x or "`" in x or _known_var(x):
+            item = f"env {k}={x} {UNBOUND_VARS}"
+            if item not in unbound:
+                unbound.append(item)
+            continue
+        if x.startswith("~"):
+            spellings = [x, LITERAL_PREFIX + x]
+        elif relative_word(x) and not x.startswith(("./", ".\\")):
+            spellings = [LITERAL_PREFIX + x]
+        else:
+            spellings = [x]
+        for sp in spellings:
+            if sp not in words:
+                words.append(sp)
+    return words, unbound
 
 
 def _pathlike(word: str) -> bool:
@@ -864,9 +1112,14 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
         if "\x00" in w:
             continue
         expanded = os.path.expanduser(w) if w.startswith("~") else w
-        cand = expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded)
+        if w.startswith("$"):   # a leading $HOME-style word (bind_plan): PathGuard expands it, not joined to the cwd
+            cand = w
+        else:
+            cand = expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded)
         try:
-            real = str(policy.resolve_path(cand, write=True))
+            # v8.1 (external review): resolved with the READ check, so a file agents may not write (service code,
+            # exec paths, held inputs) is still shown and bound; the line says agents cannot change it
+            real = str(policy.resolve_path(cand))
         except HiveError:
             if _pathlike(w):
                 not_bound.append(f"{w} (not resolvable here)")
@@ -889,6 +1142,11 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
         if not exists and not _pathlike(w):
             continue
         seen.add(real)
+        try:
+            policy.resolve_path(cand, write=True)
+            locked = ""
+        except Exception:  # noqa: BLE001
+            locked = "; agents cannot change it"
         if bound >= BIND_MAX_FILES:
             files.append({"path": real, "bind": "none", "sha256": None, "size": st.st_size if exists else None,
                           "shown": False})
@@ -904,7 +1162,7 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
             fp = f"stat:{size}:{iso_utc(st.st_mtime)}"
             files.append({"path": real, "bind": "stat", "sha256": None, "size": size, "shown": False,
                           "fingerprint": fp, "mtime": iso_utc(st.st_mtime)})
-            lines.append(f"--- file {real} ({human_bytes(size)}, bound by size and mtime) ---")
+            lines.append(f"--- file {real} ({human_bytes(size)}, bound by size and mtime{locked}) ---")
             lines.append(NOT_SHOWN)
             continue
         try:
@@ -928,7 +1186,7 @@ def bind_files(words: List[str], *, policy: Any, cwd: str, mask: Callable[[str],
             shown = True
             shown_total += len(data)
         files.append({"path": real, "bind": "sha256", "sha256": digest, "size": len(data), "shown": shown})
-        lines.append(f"--- file {real} ({human_bytes(len(data))}, sha256 {digest[:12]}) ---")
+        lines.append(f"--- file {real} ({human_bytes(len(data))}, sha256 {digest[:12]}{locked}) ---")
         if shown and text is not None:
             lines.extend(mask(text).split("\n"))
         else:
@@ -1069,9 +1327,11 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
         body.extend(_param_lines(params, skip=("argv", "command", "shell", "cwd", "secret_env"), secret_re=secret_re,
                                  shows_env=True))
         if ctx is not None:
-            words, moved = bindable_words(params.get("argv") or str(params.get("command") or ""), shell=shell,
-                                          os_name=ctx.os)
+            words, moved, unbound = bind_plan(params.get("argv") or str(params.get("command") or ""), shell=shell,
+                                              os_name=ctx.os)
+            words, unbound = _env_words(params.get("env"), words, unbound)
             files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=str(cwd), mask=ctx.mask)
+            not_bound += unbound
     elif action == "service.define":
         if ctx is None:
             note = HUB_DEFINE_NOTE
@@ -1089,18 +1349,20 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             real_cwd = cwd
             if d.get("argv"):
                 body.append("argv: " + json.dumps(d["argv"], ensure_ascii=False))
-                words, moved = bindable_words(d["argv"])
+                words, moved, unbound = bind_plan(d["argv"])
             else:
                 shell = _resolved_shell(d.get("shell"), ctx)
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(d.get("command") or "").split("\n"))
-                words, moved = bindable_words(str(d.get("command") or ""), shell=shell, os_name=ctx.os)
+                words, moved, unbound = bind_plan(str(d.get("command") or ""), shell=shell, os_name=ctx.os)
             if d.get("stop_command"):
                 body.append("stop_command: " + json.dumps(d["stop_command"], ensure_ascii=False))
-                sw, sm = bindable_words(d["stop_command"])
+                sw, sm, su = bind_plan(d["stop_command"])
                 words += [w for w in sw if w not in words]
                 moved += [w for w in sm if w not in moved]
+                unbound += [w for w in su if w not in unbound]
+            words, unbound = _env_words(d.get("env"), words, unbound)
             body.append(f"cwd: {cwd_text}")
             auto = [s for s in (d.get("secret_env") or []) if s not in (params.get("secret_env") or [])]
             if d.get("secret_env"):
@@ -1109,6 +1371,7 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             body.extend(_param_lines(d, skip=("name", "preset", "argv", "command", "shell", "cwd", "secret_env",
                                               "stop_command", "volumes"), secret_re=secret_re, shows_env=True))
             files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask)
+            not_bound += unbound
     elif action in ("service.start", "service.restart"):
         body.append(f"action: {action}")
         body.append(f"name: {params.get('name')}")
@@ -1122,7 +1385,7 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
             real_cwd = cwd
             if argv:
                 body.append("argv: " + json.dumps(argv, ensure_ascii=False))
-                words, moved = bindable_words(argv)
+                words, moved, unbound = bind_plan(argv)
                 mt = _argv0_mtime(str(argv[0]), ctx.policy)
                 body.append(f"argv[0] modified: {mt or 'unknown'}")
             else:
@@ -1130,10 +1393,12 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
                 body.append(f"shell: {shell}")
                 body.append("command:")
                 body.extend(str(service.get("command") or "").split("\n"))
-                words, moved = bindable_words(str(service.get("command") or ""), shell=shell, os_name=ctx.os)
+                words, moved, unbound = bind_plan(str(service.get("command") or ""), shell=shell, os_name=ctx.os)
             body.append(f"cwd: {cwd_text}")
             body.append(f"defined_by: {service.get('defined_by') or 'unknown'}")
+            words, unbound = _env_words(service.get("env"), words, unbound)
             files, file_lines, not_bound = bind_files(words, policy=ctx.policy, cwd=cwd, mask=ctx.mask)
+            not_bound += unbound
     else:
         try:
             from .audit import redact_params
@@ -1165,5 +1430,5 @@ def approval_review(action: str, params: dict, *, ctx: Optional[PresetCtx], give
 
 
 __all__ = ["Preset", "PRESETS", "PresetCtx", "build", "expand_define", "approval_review", "describe",
-           "candidate_words", "bindable_words", "changes_cwd", "moved_items", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
+           "candidate_words", "bindable_words", "bind_plan", "text_may_change_cwd", "changes_cwd", "moved_items", "bind_files", "docker_volume", "RISKY_ENV_PATTERNS", "HUB_DEFINE_NOTE",
            "HUB_START_NOTE", "DEF_KEYS", "INTERNAL_KEYS", "BIND_HINT"]

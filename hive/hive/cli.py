@@ -74,6 +74,8 @@ class Out:
 
     def error(self, code: str, message: str, hint: Optional[str] = None, details: Optional[dict] = None) -> None:
         """``code: message`` + ``Hint: …`` on stderr (JSON with --json)."""
+        if code == "not_found" and str(message).startswith("this is node '"):
+            hint = _via_hub_hint(hint)
         if self.as_json:
             d: Dict[str, Any] = {"code": code, "message": message}
             if hint:
@@ -85,6 +87,26 @@ class Out:
         sys.stderr.write(util.escape_terminal(f"{code}: {message}") + "\n")
         if hint:
             sys.stderr.write(util.escape_terminal(f"Hint: {hint}") + "\n")
+
+
+def _via_hub_hint(hint: Optional[str]) -> Optional[str]:
+    """v8.1 (external review round 2): a node name that is not the local node, on a machine whose client.json has a
+    hub connection: say how to reach that node through the hub."""
+    try:
+        from .config import load_client_config
+        conns = list(load_client_config().connections)
+    except Exception:  # noqa: BLE001 - only a hint
+        return hint
+    hubs = [c for c in conns if c == "hub-local"] + [c for c in conns if c != "hub-local" and "hub" in c.lower()]
+    if not hubs:
+        return hint
+    return (hint + "; " if hint else "") + f"other nodes are reached through the hub: --connection {hubs[0]}"
+
+
+def _conn_flag(args: Any) -> str:
+    """`` --connection NAME`` when the command was given one (printed follow-up commands keep it), else ''."""
+    c = getattr(args, "connection", None)
+    return f" --connection {c}" if c else ""
 
 
 def _write(stream: Any, s: str) -> None:
@@ -393,6 +415,12 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
             models_dir=args.models_dir, wsl=bool(args.wsl) and not exists, wsl_keepalive=args.wsl_keepalive or (),
             consent_by=_consent_by(), force=args.force)
     except HiveError as e:
+        if exists and e.code == "bad_request" and e.message.startswith("config exists"):
+            # v8.1 (external review round 2): a bare `hive init node` on a configured node is not an error
+            out.line(f"already set up at {cfg_path}; nothing to change")
+            out.line("  to change a setting pass it (e.g. --listen, --mirror cn, --root); --force rewrites the "
+                     "config with new tokens")
+            return EXIT_OK
         out.error(e.code, e.message, e.hint)
         return EXIT_USAGE
     if not toks:
@@ -488,6 +516,11 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
             cfg = config.edit_hub_init(listen=args.listen, tailscale=args.tailscale, public_url=public_url,
                                        funnel=args.funnel, local_node=args.with_local_node)
         except HiveError as e:
+            if e.code == "bad_request" and e.message.startswith("hub config exists"):
+                out.line(f"already set up at {paths['hub_config']}; nothing to change")
+                out.line("  to change a setting pass it (e.g. --listen, --tailscale, --with-local-node); --force "
+                         "rewrites the config with new tokens")
+                return EXIT_OK
             out.error(e.code, e.message, e.hint)
             return EXIT_USAGE
         changed = getattr(cfg, "_changed", [])
@@ -1366,6 +1399,8 @@ def _verify_joined(cfg: Any, marks: Dict[Path, int], out: Out) -> int:
         time.sleep(0.5)
     if fail:
         out.error("unavailable", f"the node did not start: {fail[-300:]}", _start_fail_hint(cfg, fail))
+        out.line(f"note: the installed background service keeps retrying every few seconds and picks up the fix by "
+                 f"itself; to stop it instead: {_hive_cmd()} service uninstall node")
     elif _holder(_data_dir(cfg)) is not None:
         out.error("unavailable", f"the node runs but has not registered with {cfg.relay.hub_url} within "
                                  f"{JOIN_VERIFY_S:g} s", "it keeps retrying in the background; check that this "
@@ -1378,12 +1413,35 @@ def _verify_joined(cfg: Any, marks: Dict[Path, int], out: Out) -> int:
     return EXIT_UNAVAILABLE
 
 
+def _hive_cmd() -> str:
+    """The command the user runs Hive with here (v8.1, external review round 2): the pod wrapper, ``python3
+    <pyz>``, ``hive`` or ``python3 -m hive``, with ``HIVE_HOME=…`` in front when it is set and not the pod wrapper."""
+    import shlex
+    from .config import default_paths
+    try:
+        wrapper = default_paths()["home"] / "hive"
+        if wrapper.is_file() and os.access(str(wrapper), os.X_OK) and os.name != "nt":
+            return shlex.quote(str(wrapper))
+    except Exception:  # noqa: BLE001
+        pass
+    zp = util._zipapp_path()
+    if zp is not None:
+        base = f"python3 {shlex.quote(str(zp))}"
+    elif _which_not_cwd("hive"):
+        base = "hive"
+    else:
+        base = "python3 -m hive"
+    hh = os.environ.get("HIVE_HOME")
+    return (f"HIVE_HOME={shlex.quote(hh)} " if hh and os.name != "nt" else "") + base
+
+
 def _start_fail_hint(cfg: Any, line: str) -> str:
     low = line.lower()
+    hc = _hive_cmd()
     if "in use" in low or "only one usage" in low:
         lst = cfg.listen
         return (f"its local port {lst.host}:{lst.port} is taken (another Hive node on this machine?). A relay node "
-                "needs no listener: hive init node --no-listen   or give it its own port: hive init node --listen "
+                f"needs no listener: {hc} init node --no-listen   or give it its own port: {hc} init node --listen "
                 "127.0.0.1:7721   (the running watchdog restarts it with the new setting)")
     if "refusing to run" in low:
         return "do not run Hive as root; in a container where root is the only user set allow_root: true"
@@ -2779,18 +2837,29 @@ def cmd_service_define(args: argparse.Namespace, out: Out) -> int:
         out.data(res)
         return EXIT_OK
     node = args.node or "self"
+    cf = _conn_flag(args)
     verb = "defined" if res.get("created") else "updated"
-    out.foreign(f"service '{res.get('name')}' {verb} on {node}: state {res.get('state')}, health "
+    state = str(res.get("state") or "")
+    out.foreign(f"service '{res.get('name')}' {verb} on {node}: state {state}, health "
                 f"{res.get('health') or '-'}" + (f", port {res.get('port')}" if res.get("port") else ""))
     if res.get("endpoint"):
         out.foreign(f"endpoint (on that machine): {res.get('endpoint')}")
     for w in res.get("warnings") or []:
         out.foreign(f"warning: {w}")
-    out.line(f"watch it: hive logs {node} --service {args.name} -f   status: hive call service.status "
-             f"name={args.name} wait=120" + (f" --node {args.node}" if args.node else ""))
+    if state in ("backoff", "failed", "exited") and not args.no_start:
+        # v8.1 (external review round 2): a service that crashed at once is a failure, not "defined"
+        out.foreign(f"it did not start: {res.get('last_error') or 'the process exited'}", err=True)
+        tail = [x for x in str(res.get("tail") or "").splitlines() if x.strip()][-8:]
+        if tail:
+            out.foreign("last output:\n" + "\n".join("  " + x for x in tail), err=True)
+        sys.stderr.write(f"Hint: full log: hive logs {node} --service {args.name}{cf}; fix it and run the same "
+                         "define again\n")
+        return EXIT_ACTION
+    out.line(f"watch it: hive logs {node} --service {args.name} -f{cf}   status: hive call service.status "
+             f"name={args.name} wait=120" + (f" --node {args.node}" if args.node else "") + cf)
     if res.get("endpoint") or args.preset not in (None, "comfyui"):
         out.line(f"chat apps: hive gateway url {node} {args.name}" + ("" if args.node else " --node")
-                 + "   (README section 6.2)")
+                 + f"{cf}   (README section 6.2)")
     return EXIT_OK
 
 
@@ -3398,7 +3467,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """CLI entry point (``hive = hive.cli:main``)."""
+    """CLI entry point (``hive = hive.cli:main``). v8.1 (external review round 2): output piped into a reader that
+    stops early (``hive node status | head -1``) ends quietly instead of a BrokenPipeError traceback."""
+    try:
+        rc = _main(argv)
+        sys.stdout.flush()
+        return rc
+    except BrokenPipeError:
+        _silence_stdout()
+        return EXIT_OK
+
+
+def _silence_stdout() -> None:
+    """Point stdout at devnull so the interpreter's final flush does not raise again (Python docs, SIGPIPE)."""
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(fd, sys.stdout.fileno())
+        os.close(fd)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
     util.prune_cwd_path()
     tolerant_streams()
     args_list = list(sys.argv[1:] if argv is None else argv)

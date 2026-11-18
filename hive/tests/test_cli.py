@@ -73,8 +73,9 @@ class TestInit(CliCase):
     def test_init_existing(self):
         self.assertEqual(run(["init", "node", "--yes"])[0], 0)
         code, out, err = run(["init", "node"])
-        self.assertEqual(code, 2)
-        self.assertIn("config exists", err)
+        self.assertEqual(code, 0, err)                     # external review round 2: a friendly no-op
+        self.assertIn("already set up at", out)
+        self.assertIn("nothing to change", out)
         code, out, err = run(["init", "node", "--listen", "127.0.0.1:7811", "--preset", "full"])
         self.assertEqual(code, 0, err)
         self.assertIn("listen", out)

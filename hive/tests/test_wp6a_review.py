@@ -461,8 +461,8 @@ class TestInitRelayRole(CliCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(config.load_node_config(cfg_path).relay.role, "operator")
         code, out, err = run(["init", "node", "--yes"])
-        self.assertEqual(code, 2)                                        # nothing given: unchanged message
-        self.assertIn("config exists", err)
+        self.assertEqual(code, 0, err)                                   # nothing given: a friendly no-op
+        self.assertIn("nothing to change", out)
         code, out, err = run(["init", "node", "--preset", "standard", "--listen", "127.0.0.1:7812"])
         self.assertIn("--preset applies only when creating a config", out)
 

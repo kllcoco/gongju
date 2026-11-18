@@ -18,9 +18,10 @@ POSIX = os.name != "nt"
 
 class TestBindableWords(unittest.TestCase):
     def test_cd_and_dash_c_unbind_later_relative_words(self):
-        self.assertEqual(presets.bindable_words("cd sub && bash setup.sh"), (["cd"], ["sub", "bash", "setup.sh"]))
+        # external review round 2: in a shell string a cd anywhere unbinds every relative word, before and after
+        self.assertEqual(presets.bindable_words("cd sub && bash setup.sh"), ([], ["cd", "sub", "bash", "setup.sh"]))
         self.assertEqual(presets.bindable_words("bash a.sh; cd sub; bash a.sh ~/b.sh /abs/c.sh"),
-                         (["bash", "a.sh", "cd", "~/b.sh", "/abs/c.sh"], ["sub", "bash", "a.sh"]))
+                         (["~/b.sh", "/abs/c.sh"], ["bash", "a.sh", "cd", "sub"]))
         for cmd in ("pushd sub && bash x.sh", "chdir sub && bash x.sh", "git -C sub run x.sh",
                     "make -Csub x.sh", "make --directory=sub x.sh", "env --chdir=sub bash x.sh",
                     "terraform -chdir=sub apply x.sh"):

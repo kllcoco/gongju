@@ -103,6 +103,20 @@ DEFAULT_EXEC_PATHS: Tuple[str, ...] = (
     "~/.emacs.d/**", "~/.config/emacs/**", "~/.vim/**", "~/.tmux.conf", "~/.config/tmux/**", "~/.wezterm.lua",
     "~/.config/wezterm/**", "~/.hgrc", "**/.hg/hgrc", "**/.yarnrc.yml", "~/.config/direnv/**",
     "~/.config/systemd/*.conf", "~/.config/systemd/*.conf.d/**",
+    # v8.1 (external review, round 2): toolchain homes whose bin/ or shims/ lead PATH, files every shell sources,
+    # terminal and window-manager configs that name the program to start, REPL startup files, editor extensions and
+    # the pyvenv.cfg of any venv (its home= key picks the interpreter)
+    "~/.cargo/**", "~/.rustup/**", "~/go/bin/**", "~/.bun/**", "~/.deno/**", "~/.npm-global/**", "~/.nvm/**",
+    "~/.volta/**", "~/.local/share/pnpm/**", "~/.pyenv/**", "~/.rbenv/**", "~/.sdkman/**", "~/*conda*/**",
+    "~/.oh-my-zsh/**", "~/.config/zsh/**", "~/.zsh/**", "~/.config/starship.toml", "~/.tcshrc", "~/.cshrc",
+    "~/.login", "~/.kshrc", "~/.xonshrc", "~/.config/xonsh/**", "~/.config/nushell/**",
+    "~/.config/alacritty/**", "~/.alacritty.toml", "~/.alacritty.yml", "~/.config/kitty/**", "~/.config/foot/**",
+    "~/.config/ghostty/**", "~/Library/Application Support/com.mitchellh.ghostty/**", "~/.local/share/konsole/**",
+    "~/.config/openbox/**", "~/.config/labwc/**", "~/.config/river/**", "~/.config/bspwm/**", "~/.config/sxhkd/**",
+    "~/.config/awesome/**", "~/.config/qtile/**", "~/.config/niri/**", "~/.config/herbstluftwm/**",
+    "~/.config/xmonad/**", "~/.xmonad/**", "~/.config/xfce4/xinitrc", "~/.config/lxsession/**",
+    "~/.julia/config/**", "~/.octaverc", "~/.ghci", "~/.irbrc", "~/.pryrc", "~/.psqlrc", "~/.sqliterc",
+    "~/.lldbinit", "~/.mailcap", "~/.vscode/extensions/**", "~/.vscode-server/extensions/**", "**/pyvenv.cfg",
 )
 
 DEFAULT_COMMAND_DENY: Tuple[str, ...] = (

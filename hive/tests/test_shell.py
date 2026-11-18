@@ -311,7 +311,7 @@ class TestApprovalBinding(unittest.TestCase):
             self.assertIn("run.sh (cwd may change)", rv["lines"][0])
             self.assertNotIn("bash (cwd may change)", rv["lines"][0])
 
-    def test_outside_roots_and_exec_paths_not_bound(self):
+    def test_outside_roots_not_bound_exec_paths_bound(self):
         with Node() as n:
             outside = n.base / "outside.sh"
             outside.write_text("echo out\n")
@@ -319,8 +319,12 @@ class TestApprovalBinding(unittest.TestCase):
             _aid, rv = self.review(n, "shell.run", {"command": f"bash {outside} ~/.bashrc"})
             paths = [f["path"] for f in rv["files"]]
             self.assertNotIn(str(outside), paths)
-            self.assertNotIn(str(n.home / ".bashrc"), paths)
             self.assertIn("(not resolvable here)", rv["lines"][0])
+            # external review round 2: a file the agent may not write is still shown and bound (read check)
+            self.assertIn(str(n.home / ".bashrc"), paths)
+            self.assertIn("alias x=y", rv["lines"])
+            self.assertTrue(any(x.startswith(f"--- file {n.home / '.bashrc'}") and "agents cannot change it" in x
+                                for x in rv["lines"]), rv["lines"])
 
     def test_secret_in_script_masked(self):
         with Node() as n:

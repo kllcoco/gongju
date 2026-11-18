@@ -300,12 +300,25 @@ class TestDenyWrite(Base):
              "~/.config/i3/config", "~/.config/sway/config", "~/.config/hypr/hyprland.conf", "~/.hgrc",
              "~/proj/.yarnrc.yml", "~/.yarnrc.yml", "~/.config/direnv/direnvrc", "~/.config/systemd/user.conf",
              "~/.zshrc.d/a.zsh", "~/Library/Jupyter/kernels/k/kernel.json",
-             "~/AppData/Roaming/jupyter/kernels/k/kernel.json", "~/proj/.hg/hgrc", "~/.vim/plugin/x.vim"]
+             "~/AppData/Roaming/jupyter/kernels/k/kernel.json", "~/proj/.hg/hgrc", "~/.vim/plugin/x.vim",
+             # v8.1 external review, round 2 (exec-path denylist): PATH dirs, sourced files, terminal/WM/REPL configs
+             "~/.cargo/bin/ls", "~/.cargo/env", "~/go/bin/x", "~/.bun/bin/x", "~/.deno/bin/x", "~/.npm-global/bin/x",
+             "~/.pyenv/shims/python", "~/miniconda3/bin/python", "~/anaconda3/bin/x", "~/.nvm/nvm.sh",
+             "~/.oh-my-zsh/oh-my-zsh.sh", "~/.oh-my-zsh/tools/x.sh", "~/.config/zsh/.zshrc", "~/.zsh/x.zsh",
+             "~/.config/starship.toml", "~/.tcshrc", "~/.cshrc", "~/.kshrc", "~/.xonshrc", "~/.config/nushell/config.nu",
+             "~/.config/alacritty/alacritty.toml", "~/.config/kitty/kitty.conf", "~/.config/foot/foot.ini",
+             "~/.config/ghostty/config", "~/.local/share/konsole/a.profile", "~/.config/openbox/autostart",
+             "~/.config/labwc/autostart", "~/.config/river/init", "~/.config/bspwm/bspwmrc",
+             "~/.config/awesome/rc.lua", "~/.config/qtile/config.py", "~/.config/niri/config.kdl",
+             "~/.config/xfce4/xinitrc", "~/.config/lxsession/LXDE/autostart", "~/.julia/config/startup.jl",
+             "~/.octaverc", "~/.ghci", "~/.irbrc", "~/.psqlrc", "~/.sqliterc", "~/.lldbinit", "~/.mailcap",
+             "~/.vscode/extensions/x/ext.js", "~/venvs/other/pyvenv.cfg"]
 
     def test_v81_exec_paths_not_overbroad(self):
         pol = build_policy(self.fh)
         for p in ("~/.config/systemd/notes.txt", "~/proj/yarnrc.yml", "~/.local/share/other/x", "~/kde/x.sh",
-                  "~/.config/i3x/config"):
+                  "~/.config/i3x/config", "~/proj/bin/run.sh", "~/go/src/app/main.go", "~/.config/zshx",
+                  "~/proj/.vscode/settings.json", "~/proj/conda-notes.txt"):
             with self.subTest(p=p):
                 eff(pol, FILES).resolve_path(p, write=True)
 

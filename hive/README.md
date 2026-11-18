@@ -247,7 +247,7 @@ hive service install node             # 开机/登录后自动启动（Windows �
 ### 4.2 中枢（家里常开的那台电脑）
 
 ```sh
-hive init node                                    # 本机节点，只听 127.0.0.1 就行
+hive init node                                    # 本机节点，只听 127.0.0.1 就行（做过第 3 节的可跳过，再执行也无妨）
 hive init hub --tailscale --with-local-node       # 中枢监听 Tailscale 地址，并自动把本机节点接进来
 hive service install node
 hive service install hub
@@ -611,19 +611,19 @@ hive hub restart-node --outdated         # 云机器从中枢自动下载新版�
 **卸载**（先停掉并移除开机自启，再删程序）：
 
 ```sh
-hive service uninstall node              # 加 --stop-services 同时停掉托管的模型服务
+hive service uninstall node --stop-services   # 同时停掉托管的模型服务和后台任务（不加它们会一直跑下去）
 hive service uninstall hub               # 只有中枢那台电脑需要
 rm -rf ~/.venvs/hive ~/.local/bin/hive   # Linux / macOS / WSL：删掉虚拟环境和 hive 链接
 rm -rf ~/.hive                           # 可选：配置、口令、日志、审计都在这里，删了就彻底清干净
 ```
 
 ```powershell
-hive service uninstall node
+hive service uninstall node --stop-services
 py -m pip uninstall hive-agent           # Windows
 Remove-Item -Recurse -Force $HOME\.hive  # 可选：删除数据目录
 ```
 
-用 `hive.pyz` 的：`python3 hive.pyz service uninstall node` 之后删掉 `hive.pyz` 和数据目录（云机器上是 `/workspace/.hive`）。
+用 `hive.pyz` 的：`python3 hive.pyz service uninstall node --stop-services` 之后删掉 `hive.pyz` 和数据目录（云机器上是 `/workspace/.hive`）。
 
 ---
 
@@ -692,7 +692,7 @@ hive guide model-serving                         # the agents' how-to topics
 
 A foreground `hive node run` / `hive hub run` in a terminal restarts itself in place when a command changes its
 config. Upgrade a venv install with `~/.venvs/hive/bin/pip install -U ./hive`; uninstall with
-`hive service uninstall node` then `rm -rf ~/.venvs/hive ~/.local/bin/hive` (and `~/.hive` for the data).
+`hive service uninstall node --stop-services` then `rm -rf ~/.venvs/hive ~/.local/bin/hive` (and `~/.hive` for the data).
 
 Python:
 

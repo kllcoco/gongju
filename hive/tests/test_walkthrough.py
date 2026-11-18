@@ -66,12 +66,17 @@ class TestForegroundRestart(unittest.TestCase):
                 self.assertTrue(node_mod.foreground_restart_ok())
                 self.assertFalse(node_mod.foreground_restart_ok(relaunched=True))
                 self.assertFalse(node_mod.foreground_restart_ok(supervise=True))
-                for k, v in (("HIVE_WATCHDOG", "1"), ("INVOCATION_ID", "abc"), ("HIVE_FOREGROUND_CHILD", "1")):
+                for k, v in (("HIVE_WATCHDOG", "1"), ("HIVE_FOREGROUND_CHILD", "1")):
                     with mock.patch.dict(os.environ, {k: v}):
                         self.assertFalse(node_mod.foreground_restart_ok(), k)
+                # external review round 2: a terminal started by a systemd user unit inherits INVOCATION_ID
+                with mock.patch.dict(os.environ, {"INVOCATION_ID": "abc", "JOURNAL_STREAM": "8:1"}):
+                    self.assertTrue(node_mod.foreground_restart_ok())
             with mock.patch.object(node_mod.sys, "stdin", io.StringIO()), \
                     mock.patch.object(node_mod.sys, "stderr", io.StringIO()):
                 self.assertFalse(node_mod.foreground_restart_ok())          # no terminal: a supervisor's child
+                with mock.patch.dict(os.environ, {"INVOCATION_ID": "abc"}):
+                    self.assertFalse(node_mod.foreground_restart_ok())      # a systemd unit: no terminal
 
     def _args(self, **kw):
         return SimpleNamespace(config=None, relaunched=False, supervise=False, **kw)

@@ -1356,13 +1356,14 @@ class Hub:
         review = presets.approval_review(action, params, ctx=None)
         if action not in FILE_BIND_ACTIONS:
             return review
-        words, cwd, moved = self._bind_words(identity, link, action, params, rid, end, gated)
-        if not words and not moved:
+        words, cwd, moved, unbound = self._bind_words(identity, link, action, params, rid, end, gated)
+        if not words and not moved and not unbound:
             return review
         files, lines, not_bound = self._bind_files(identity, link, words, cwd, rid, end, gated)
         if moved:   # v8.1: relative words after cd / -C are not bound; named in the header (presets.moved_items)
             not_bound += presets.moved_items(moved, lambda w: self._is_file(identity, link, self._join(cwd, w), rid,
                                                                              end, gated))
+        not_bound += unbound
         from .util import escape_terminal
         review = dict(review)
         rl = list(review.get("lines") or [])
@@ -1384,20 +1385,24 @@ class Hub:
                         exec_gated=gated)
         return _envelope_result(env)
 
-    def _split(self, text: str, shell: Optional[str], os_name: Optional[str]) -> Tuple[List[str], List[str]]:
-        """(words to bind, relative words after a cwd change) via ``presets.bindable_words`` (v8.1)."""
+    def _split(self, text: str, shell: Optional[str], os_name: Optional[str]
+               ) -> Tuple[List[str], List[str], List[str]]:
+        """(words to bind, relative words whose cwd may change, unbindable header items) via ``presets.bind_plan``
+        (v8.1); with the node's OS unknown, both the POSIX and the PowerShell reading (a word either one moves is
+        not bound)."""
         from . import presets
         if shell not in (None, "", "auto"):
-            return presets.bindable_words(text, shell=shell, os_name=None)
+            return presets.bind_plan(text, shell=shell, os_name=None)
         if os_name == "Windows":
-            return presets.bindable_words(text, shell="powershell")
+            return presets.bind_plan(text, shell="powershell")
         if os_name:
-            return presets.bindable_words(text, shell="bash")
-        out, moved = presets.bindable_words(text, shell="bash")
-        w2, m2 = presets.bindable_words(text, shell="powershell")
+            return presets.bind_plan(text, shell="bash")
+        out, moved, unbound = presets.bind_plan(text, shell="bash")
+        w2, m2, u2 = presets.bind_plan(text, shell="powershell")
         out += [w for w in w2 if w not in out]
         moved += [w for w in m2 if w not in moved]
-        return out, moved
+        unbound += [w for w in u2 if w not in unbound]
+        return [w for w in out if w not in moved], moved, unbound
 
     def _is_file(self, identity: Identity, link: NodeLink, path: str, rid: str, end: float, gated: bool) -> bool:
         try:
@@ -1407,28 +1412,34 @@ class Hub:
         return bool(st.get("exists")) and st.get("type") == "file"
 
     def _bind_words(self, identity: Identity, link: NodeLink, action: str, params: dict, rid: str, end: float,
-                    gated: bool) -> Tuple[List[str], Optional[str], List[str]]:
+                    gated: bool) -> Tuple[List[str], Optional[str], List[str], List[str]]:
         from . import presets
         os_name = link.os_name()
         words: List[str] = []
         moved: List[str] = []
+        unbound: List[str] = []
+
+        def add(plan: Tuple[List[str], List[str], List[str]]) -> None:
+            words.extend(w for w in plan[0] if w not in words)
+            moved.extend(w for w in plan[1] if w not in moved)
+            unbound.extend(w for w in plan[2] if w not in unbound)
+
         cwd = params.get("cwd") if isinstance(params.get("cwd"), str) else None
+        env: Any = params.get("env")
         if action in ("shell.run", "job.start"):
             if params.get("argv"):
-                words, moved = presets.bindable_words([str(x) for x in params["argv"]])
+                add(presets.bind_plan([str(x) for x in params["argv"]]))
             else:
-                words, moved = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
+                add(self._split(str(params.get("command") or ""), params.get("shell"), os_name))
         elif action == "service.define":
             if params.get("argv"):
-                words, moved = presets.bindable_words([str(x) for x in params["argv"]])
+                add(presets.bind_plan([str(x) for x in params["argv"]]))
             elif params.get("command"):
-                words, moved = self._split(str(params.get("command") or ""), params.get("shell"), os_name)
+                add(self._split(str(params.get("command") or ""), params.get("shell"), os_name))
             sc = params.get("stop_command")
             if sc:
-                more, mm = presets.bindable_words([str(x) for x in sc]) if isinstance(sc, list) else \
-                    self._split(str(sc), params.get("shell"), os_name)
-                words += [w for w in more if w not in words]
-                moved += [w for w in mm if w not in moved]
+                add(presets.bind_plan([str(x) for x in sc]) if isinstance(sc, list) else
+                    self._split(str(sc), params.get("shell"), os_name))
             for item in params.get("preset_args") or []:
                 s = str(item)
                 if "=" in s:
@@ -1440,19 +1451,21 @@ class Hub:
                 st = self._sub(identity, link, "service.status", {"name": params.get("name")}, rid, 0, end, gated)
             except HiveError as e:
                 if e.code in ("policy_denied", "forbidden", "not_found"):
-                    return [], None, []
+                    return [], None, [], []
                 raise
             d = st.get("definition") if isinstance(st.get("definition"), dict) else {}
             if d.get("argv"):
-                words, moved = presets.bindable_words([str(x) for x in d["argv"]])
+                add(presets.bind_plan([str(x) for x in d["argv"]]))
             elif d.get("command"):
-                words, moved = self._split(str(d.get("command")), d.get("shell"), os_name)
+                add(self._split(str(d.get("command")), d.get("shell"), os_name))
             cwd = d.get("cwd") if isinstance(d.get("cwd"), str) else None
-        return words, cwd, moved
+            env = d.get("env")
+        w2, u2 = presets._env_words(env, words, unbound)   # v8.1: files named by BASH_ENV, LD_PRELOAD, …
+        return w2, cwd, moved, u2
 
     @staticmethod
     def _join(cwd: Optional[str], w: str) -> str:
-        if w.startswith("~") or w.startswith("/") or w.startswith("\\") or re.match(r"^[A-Za-z]:[\\/]", w):
+        if w.startswith("~") or w.startswith("$") or w.startswith("/") or w.startswith("\\") or re.match(r"^[A-Za-z]:[\\/]", w):
             return w
         if not cwd:
             return w
@@ -1462,6 +1475,16 @@ class Hub:
     def _bind_files(self, identity: Identity, link: NodeLink, words: List[str], cwd: Optional[str], rid: str,
                     end: float, gated: bool) -> Tuple[List[dict], List[str], List[str]]:
         from .presets import NOT_SHOWN, _pathlike
+
+        def entry(**kw: Any) -> dict:
+            # v8.1 (external review): the node re-resolves the bound path at consume (FileHolds.acquire), so it is
+            # the path as the command names it (cwd + word, not the real path seen now): a symbolic link in the cwd
+            # or the word retargeted after approval resolves to another file and the consume is refused
+            e = dict(kw)
+            if path != rp:
+                e["path"] = path
+                e["real"] = rp
+            return e
         files: List[dict] = []
         lines: List[str] = []
         not_bound: List[str] = []
@@ -1494,20 +1517,20 @@ class Hub:
             seen.add(rp)
             size = st.get("size") if isinstance(st.get("size"), int) else None
             if bound >= BIND_MAX_FILES:
-                files.append({"path": rp, "bind": "none", "sha256": None, "size": size, "shown": False})
+                files.append(entry(path=rp, bind="none", sha256=None, size=size, shown=False))
                 not_bound.append(f"{w} (over the {BIND_MAX_FILES}-file limit)")
                 continue
             bound += 1
             if not exists:
-                files.append({"path": rp, "bind": "absent", "sha256": None, "size": None, "shown": False})
+                files.append(entry(path=rp, bind="absent", sha256=None, size=None, shown=False))
                 not_bound.append(f"{w} (missing here)")
                 continue
             size = int(size or 0)
             mtime = st.get("mtime")
             if size > HASH_MAX:
                 fp = f"stat:{size}:{mtime}"
-                files.append({"path": rp, "bind": "stat", "sha256": None, "size": size, "shown": False,
-                              "fingerprint": fp, "mtime": mtime})
+                files.append(entry(path=rp, bind="stat", sha256=None, size=size, shown=False, fingerprint=fp,
+                                   mtime=mtime))
                 lines.append(f"--- file {rp} ({human_bytes(size)}, bound by size and mtime) ---")
                 lines.append(NOT_SHOWN)
                 continue
@@ -1543,7 +1566,7 @@ class Hub:
             shown = content is not None
             if shown:
                 shown_left -= size
-            files.append({"path": rp, "bind": "sha256", "sha256": digest, "size": size, "shown": shown})
+            files.append(entry(path=rp, bind="sha256", sha256=digest, size=size, shown=shown))
             lines.append(f"--- file {rp} ({human_bytes(size)}, sha256 {digest[:12]}) ---")
             if content is not None:
                 lines.extend(content.split("\n"))

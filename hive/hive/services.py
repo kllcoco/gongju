@@ -177,6 +177,23 @@ def _shim_alive(run: Path) -> Tuple[bool, Optional[dict]]:
     return util.pid_alive(int(st["shim_pid"]), st.get("shim_ctime")), st
 
 
+def running_offline(data_dir: Path) -> Tuple[List[str], List[str]]:
+    """(job ids, service names) whose shim is alive, read from the state files without a runtime (v8.1, external
+    review round 2: uninstall warns about what keeps running)."""
+    state = Path(data_dir) / "state"
+    jobs: List[str] = []
+    svcs: List[str] = []
+    jobs_dir = state / "jobs"
+    for d in sorted(jobs_dir.iterdir()) if jobs_dir.is_dir() else []:
+        if _shim_alive(d)[0]:
+            jobs.append(d.name)
+    svc_dir = state / "services"
+    for d in sorted(svc_dir.iterdir()) if svc_dir.is_dir() else []:
+        if _shim_alive(d / "run")[0]:
+            svcs.append(d.name)
+    return jobs, svcs
+
+
 def panic_offline(data_dir: Path, node_id: str, *, force_after: float = 10.0) -> dict:
     """Stop every job, service and labelled container without a runtime (§5.10): stop files for live shims, wait
     ``force_after``, force-kill survivors, run stop_commands of services whose shim is dead, ``docker stop`` the
@@ -1945,7 +1962,16 @@ class ServiceManager:
                     with self._lock:
                         self._rs[name].update(restarts=[], _short_runs=0, desired="running")
                         self._rs[name].pop("_manual", None)
-                    self._spawn(name, eff=ctx.policy, ctx=ctx, manual=True)
+                    try:
+                        self._spawn(name, eff=ctx.policy, ctx=ctx, manual=True)
+                    except HiveError as e:
+                        # v8.1 (external review round 2): a NEW definition the node refused to start because its
+                        # port is taken is not kept (it would sit as "failed" and the next define says "updated")
+                        if created and e.code == "conflict" and e.details.get("port"):
+                            self._delete(name, delete_logs=True)
+                            raise conflict(e.message + "; the service was not saved", hint=e.hint,
+                                           port=e.details.get("port"))
+                        raise
             self._wait_started(name, min(float(params.get("wait") or 0), max(0.0, ctx.remaining() - 1.0)),
                                ctx.cancel)
         out = self._result_status(name)
