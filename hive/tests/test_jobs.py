@@ -178,7 +178,7 @@ class TestJobManager(JobCase):
         wait_for(lambda: not util.pid_alive(child), 5)   # the orphaned child is not left running
 
     def test_extra_files_and_run_dir(self):
-        info, _ = self.start_job([PY, os.path.join("{run_dir}", "x.py"), "{run_dir}"],
+        info, _ = self.start_job([PY, os.path.join("{run_dir}", "x.py"), "{run_dir}"], kind="download",
                                  extra_files={"x.py": b"import sys; print(open(sys.argv[1] + '/data.txt').read())",
                                               "data.txt": b"payload"})
         self.assertTrue(self.rt.jobs.wait_final(info["job_id"], 10))

@@ -183,9 +183,16 @@ class TestLifecycle(SvcCase):
         _ = r
 
     def test_restart_no_and_always(self):
-        self.define(name="once", argv=[PY, "-c", "print('bye')"], restart="no")
-        self.wait_state("once", "stopped")
-        self.assertEqual(self.sm.runtime("once")["last_exit_code"], 0)
+        for name, restart, code in (("once", "no", "print('bye'); import sys; sys.exit(3)"),
+                                    ("clean", "on-failure", "print('bye')")):
+            self.define(name=name, argv=[PY, "-c", code], restart=restart)
+            self.wait_state(name, "stopped")
+            time.sleep(services.TICK * 8)              # several supervisor ticks: nothing respawns it
+            rt = self.sm.runtime(name)
+            self.assertEqual((rt["state"], rt["desired"], rt["restarts"]), ("stopped", "stopped", []), name)
+            self.assertEqual(rt["last_exit_code"], 3 if restart == "no" else 0)
+            lg = self.n.ok("service.logs", {"name": name})
+            self.assertEqual(lg["text"].count("bye"), 1, name)
         self.define(name="loop", argv=[PY, "-c", "print('bye')"], restart="always", restart_delay=0.1,
                     max_restarts=1)
         self.wait_state("loop", "failed", timeout=20)
@@ -484,6 +491,8 @@ if cmd == "inspect":
     sys.exit(0)
 if cmd == "ps":
     print(read("ps", "")); sys.exit(0)
+if cmd == "top":
+    print("PID"); print(read("top", "")); sys.exit(0)
 if cmd == "run":
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
     open(os.path.join(st, "run.pid"), "w").write(str(os.getpid()))
@@ -579,6 +588,17 @@ class TestContainers(unittest.TestCase):
                 sm._rs["dk"]["_docker_next"] = 0
             wait_for(lambda: sm.runtime("dk")["state"] == "failed", 20)
         self.assertEqual(sm.runtime("dk")["last_error"], services.DOCKER_WAIT_ERROR)
+
+    def test_container_gpu_memory_from_docker_top(self):
+        if sys.platform != "linux":
+            self.skipTest("docker top pids are host pids on Linux only")
+        self.set("top", "4242\n4243")
+        env = self.define(wait=10)
+        self.assertTrue(env["ok"], env)
+        with mock.patch("hive.gpu.process_memory", return_value={4242: 1000, 4243: 24, 9999: 7}):
+            st = self.n.ok("service.status", {"name": "dk"})
+        self.assertEqual(st["resources"]["gpu_memory_mb"], 1024)
+        self.assertIn(["top", "hive-dk", "-eo", "pid"], self.calls())
 
     def test_panic_stops_labelled_containers(self):
         self.set("ps", "cid1\ncid2")

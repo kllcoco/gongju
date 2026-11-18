@@ -431,9 +431,33 @@ by the lead or a line in DESIGN.md.
       is implemented, the result is not recorded in DESIGN.md yet. Windows-only code paths (Job Objects,
       suspended start, CTRL_BREAK, Toolhelp32, WMI relaunch) are written against the design but only their
       off-Windows guards and the mocked relaunch env-file flow run in this CI; the Windows tests skip here.
-    - `service.status.resources.gpu_memory_mb` for containers (nvidia pids vs `docker top`) is not implemented
-      (null unless the service's own pids appear in `gpu.process_memory()`).
+    - (done in the WP2 review fixes, see 68) `service.status.resources.gpu_memory_mb` for containers.
     - The wsl.exe refusal hint does not name a `wsl-host:<node>` tagged node (the node does not know the hub's
       node list).
     - The §22.2 WP2 v8 item "the relay-role gateway hint" belongs to the gateway/model.forward path (§8.7, WP3/WP5);
       no WP2 module produces that error.
+68. **CONTRACT-REQUEST (WP2 review fixes):**
+    - `JobManager.start_job` `{run_dir}` (narrows §10.4 "every argv element"): substituted in every argv element
+      only for the internal helper kinds `download`/`pull` (net.download, model.pull: unchanged for WP3); for
+      `job`/`shell` jobs and service spawns only in an element that is exactly `{run_dir}/<an extra_files name>`
+      (the PowerShell `-File` fallback of `build_shell_argv`). Agent `command`/`argv` text is never rewritten after
+      CommandGuard and approval saw it (it was a path into the data dir past the `.hive` command_deny).
+    - `ServiceManager.status(name, tail_lines=30, wait=0, cancel=None)`: additive `cancel` event; the
+      service.status handler passes `ctx.cancel` (a cancelled wait returns at once and the handler reports
+      `cancelled`).
+    - Interpretations: a service exit that does not qualify for a restart (restart=no, on-failure with exit 0, or a
+      stop that nobody asked to undo) sets desired `stopped` (the supervisor's "stopped + desired running" start is
+      for boot/autostart only). A shim gone without exit.json (killed, OOM) -> its recorded child is killed
+      (identity-checked) before the restart policy applies, in `_on_exit` and at node start. An adopted record
+      that was `starting` stays `starting` with its original start time (rest of `start_period`; runtime.json keeps
+      `log_offset` so ready_pattern matching starts at that run's output). `service.start` during `stopping` waits
+      for the stop sequence (forcing after stop_timeout + 7 as the supervisor would, bounded by the call) and then
+      spawns with the calling identity (still stopping -> `conflict`, the start is dropped). `endpoints()`
+      `server`: known preset, else `ollama` for endpoint_kind ollama, else "unknown" (WP3's probe decides).
+      `policy_view().code_dirs` resolve cwd with the system identity's `check_cwd` (relative -> workdir, `~`,
+      `$HOME`/`%USERPROFILE%`; no cwd -> the workdir) and argv[0] with `build_argv(..., cwd=)` (so `tools/serve.sh`
+      counts); the implicit workdir adds no CODE_DIR_WARNING of its own. Container `gpu_memory_mb` (Linux): host
+      pids from `docker top <c> -eo pid` (cached 10 s) are matched too. `resources.cpu_pct` with psutil is null on
+      the first sample of a pid (Process objects are kept per service between calls). jobs.max_running is checked
+      and reserved in one locked step; the reaper no longer marks a job `lost` while start_job is still spawning its
+      shim (a record in `starting` without a shim pid).

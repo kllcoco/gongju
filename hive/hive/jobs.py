@@ -160,7 +160,8 @@ def read_log(run_dir: Path, logs: Dict[str, str], finished: Any, secrets: Any = 
     sec = secrets
     if sec is not None and data and getattr(sec, "has_values", False):
         n = max(0, int(getattr(sec, "max_value_bytes", 0) or 0) - 1)
-        before = textlog.read_at(log_path, start - n, n if start >= n else start) if n else b""
+        lo = max(0, start - n)
+        before = textlog.read_at(log_path, lo, start - lo) if n else b""
         after = textlog.read_at(log_path, nxt, n) if n else b""
         try:
             data, masked = sec.mask_edges(data, before, after)
@@ -193,6 +194,7 @@ class JobManager:
         self._orphans: List[Any] = []
         self._last_check: Dict[str, float] = {}
         self._last_progress: Dict[str, float] = {}
+        self._reserved: Dict[str, str] = {}      # job id -> kind: starts past the max_running check, not yet recorded
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -291,27 +293,54 @@ class JobManager:
                   extra_files: Optional[Dict[str, bytes]] = None) -> dict:
         """Start a job under the shim and return its JobInfo (waits <= 5 s for ready.json/exit.json).
 
-        ``extra_files`` are written 0600 into the run dir before the spawn; every argv element containing
-        ``{run_dir}`` is substituted with the run dir path. A pending ``ctx.hold`` is taken over (released when the
-        job ends) and ``ctx.hold`` is set to None (§13.2 step 8a hand-over).
+        ``extra_files`` are written 0600 into the run dir before the spawn. ``{run_dir}`` is substituted with the run
+        dir path only where Hive wrote it: in every argv element of the internal helper kinds (download, pull), and
+        for job/shell only in an element that is exactly ``{run_dir}/<an extra_files name>`` (the PowerShell -File
+        fallback); the agent's own command text is never rewritten after CommandGuard and approval saw it. A pending
+        ``ctx.hold`` is taken over (released when the job ends) and ``ctx.hold`` is set to None (§13.2 step 8a).
         """
         if kind not in KINDS:
             raise bad_request(f"unknown job kind {kind!r}")
         lim = self._limits(ctx)
         max_running = int(getattr(lim, "jobs_max_running", 32) or 32)
-        if self.running_count(None) >= max_running:
-            raise rate_limited("too many running jobs", retry_after=5.0, reason="jobs_running",
-                               hint="too many running jobs; stop some (job_list)")
         jid = util.new_id("j_")
+        with self._lock:     # check and reserve in one step: concurrent starts cannot pass the cap together
+            if self.running_count(None) >= max_running:
+                raise rate_limited("too many running jobs", retry_after=5.0, reason="jobs_running",
+                                   hint="too many running jobs; stop some (job_list)")
+            self._reserved[jid] = kind
+        try:
+            return self._start_reserved(ctx, jid, kind=kind, argv_or_cmdline=argv_or_cmdline, shell=shell, cwd=cwd,
+                                        env=env, stdin=stdin, name=name, timeout=timeout, timeout_grace=timeout_grace,
+                                        merge_stderr=merge_stderr, log_max_bytes=log_max_bytes, log_keep=log_keep,
+                                        keep_awake=keep_awake, tags=tags, command_display=command_display,
+                                        extra_files=extra_files)
+        finally:
+            with self._lock:
+                self._reserved.pop(jid, None)
+
+    def _start_reserved(self, ctx: "ActionContext", jid: str, *, kind: str, argv_or_cmdline: Any, shell: str,
+                        cwd: Path, env: Dict[str, str], stdin: Optional[str], name: Optional[str], timeout: float,
+                        timeout_grace: float, merge_stderr: bool, log_max_bytes: int, log_keep: int,
+                        keep_awake: bool, tags: Any, command_display: str,
+                        extra_files: Optional[Dict[str, bytes]]) -> dict:
         rd = self._run_dir(jid)
         util.secure_mkdir(rd, required=True)
         env = dict(env or {})
+        internal = kind in ("download", "pull")
+        marks = {"{run_dir}" + sep + f for f in (extra_files or {}) for sep in ("/", "\\", os.sep)}
+
+        def subst(a: Any) -> str:
+            a = str(a)
+            if internal:
+                return a.replace("{run_dir}", str(rd))
+            return os.path.join(str(rd), a[len("{run_dir}") + 1:]) if a in marks else a
         if isinstance(argv_or_cmdline, str):
             argv: Optional[List[str]] = None
-            cmdline: Optional[str] = argv_or_cmdline.replace("{run_dir}", str(rd))
+            cmdline: Optional[str] = argv_or_cmdline.replace("{run_dir}", str(rd)) if internal else argv_or_cmdline
             display_src: Union[List[str], str] = cmdline
         else:
-            argv = [str(a).replace("{run_dir}", str(rd)) for a in argv_or_cmdline]
+            argv = [subst(a) for a in argv_or_cmdline]
             cmdline = None
             display_src = argv
             selfcmd = util.self_command()
@@ -352,15 +381,17 @@ class JobManager:
                 "files": {"status": "status.json", "exit": "exit.json", "stop": "stop", "ready": "ready.json"}}
         with self._lock:
             self._jobs[jid] = rec
+            self._reserved.pop(jid, None)
             if hold and holds is not None:
                 self._holds[jid] = hold
                 ctx.hold = None
         self._save(rec)
         try:
             h = proctree.spawn_shim(spec, rd)
-        except HiveError as e:
+        except Exception as e:  # noqa: BLE001 - never leave a "starting" record without a shim behind
             with self._lock:
-                rec.update(state="failed", error=e.message, ended_at=util.iso_utc())
+                rec.update(state="failed", error=e.message if isinstance(e, HiveError) else str(e)[:500],
+                           ended_at=util.iso_utc())
                 self._cond.notify_all()
             self._save(rec)
             self._release_hold(jid)
@@ -426,6 +457,8 @@ class JobManager:
             if popen.poll() is not None:
                 self._finalize(jid)
             return
+        if not rec.get("shim_pid") and rec.get("state") == "starting":
+            return      # start_job is still spawning the shim (records without a shim at node start are finalized there)
         now = time.monotonic()
         if now - self._last_check.get(jid, 0.0) < ADOPT_CHECK:
             return
@@ -756,7 +789,8 @@ class JobManager:
         """Running jobs of ``kind`` (all kinds when None); model.pull uses it for its concurrency cap."""
         with self._lock:
             return sum(1 for r in self._jobs.values()
-                       if r.get("state") in RUNNING and (kind is None or r.get("kind") == kind))
+                       if r.get("state") in RUNNING and (kind is None or r.get("kind") == kind)) + \
+                sum(1 for k in self._reserved.values() if kind is None or k == kind)
 
     def managed_pids(self) -> Dict[int, str]:
         """shim/child pid -> "job:<id>" for proc.list and the kill guard."""

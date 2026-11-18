@@ -171,9 +171,18 @@ class Shim:
             except Exception:  # noqa: BLE001
                 pass
             kw["creationflags"] = winapi.CREATE_NEW_PROCESS_GROUP
+            reopened = None
             if kw.get("stdin") not in (None, subprocess.DEVNULL):
-                kw["stdin"] = self._stdin()
-            self.child = subprocess.Popen(argv, **kw)
+                reopened = kw["stdin"] = self._stdin()
+            try:
+                self.child = subprocess.Popen(argv, **kw)
+            finally:
+                # the child has its own handle; ours must be closed or _remove_stdin cannot delete the file (§10.2)
+                if reopened is not None and reopened is not subprocess.DEVNULL:
+                    try:
+                        reopened.close()
+                    except OSError:
+                        pass
             handle = int(getattr(self.child, "_handle", 0) or 0)
             assigned = bool(self.job is not None and handle and self.job.assign(handle))
         if not assigned and self.job is not None:

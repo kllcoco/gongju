@@ -140,6 +140,13 @@ class TestBuilders(unittest.TestCase):
         with self.assertRaises(HiveError) as cm:
             presets.build("vllm", [("model", "a/b"), ("extra_arg", "--host=0.0.0.0")], "v", ctx=pctx(self.pol))
         self.assertIn("model gateway", cm.exception.message)
+        # abbreviations argparse accepts and values merely containing a bind flag are refused too
+        for bad in ("--hos=0.0.0.0", "--ho", "--listen0.0.0.0", "--bind-address=0.0.0.0", "--LISTEN", "--li",
+                    "--b=0.0.0.0", "x--host"):
+            with self.assertRaises(HiveError, msg=bad):
+                presets.build("vllm", [("model", "a/b"), ("extra_arg", bad)], "v", ctx=pctx(self.pol))
+        for ok in ("--max-model-len=4096", "--hf-overrides={}", "--load-format", "-tp", "--lora-modules"):
+            presets.build("vllm", [("model", "a/b"), ("extra_arg", ok)], "v", ctx=pctx(self.pol))
         p, given = define_params(name="o", preset="ollama", env=["OLLAMA_HOST=0.0.0.0:11434"])
         with self.assertRaises(HiveError):
             presets.expand_define(p, ctx=pctx(self.pol), given=given)

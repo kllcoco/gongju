@@ -169,6 +169,7 @@ class TestShimStop(ShimCase):
                 "if hasattr(signal,'SIGTERM'): signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                 "print('up', flush=True)\n"
                 f"while not os.path.exists({str(marker)!r}): time.sleep(0.05)\n"
+                "time.sleep(1.0)\n"   # the shim appends the stop_command output once that command has exited
                 "print('clean shutdown', flush=True); sys.exit(0)\n")
         stop = [PY, "-c", f"open({str(marker)!r},'w').write('x'); print('stopping now')"]
         h = self.start([PY, "-c", code], stop_argv=stop)

@@ -180,8 +180,12 @@ def _extra_args(values: List[str]) -> List[str]:
         v = str(v)
         if not v or "\x00" in v or "\n" in v:
             raise _ArgError("extra_arg must be a single non-empty token")
-        flag = v.split("=", 1)[0].lower()
-        if flag in HOST_FLAGS:
+        low = v.lower()
+        flag = low.split("=", 1)[0]
+        # §10.6: a value *containing* a bind flag is refused; argparse servers (vLLM, SGLang, ComfyUI) also accept
+        # unique prefixes (--hos=0.0.0.0), so a flag that abbreviates one is refused too
+        if any(h in low for h in HOST_FLAGS) or (
+                flag.startswith("--") and len(flag) >= 3 and any(h.startswith(flag) for h in HOST_FLAGS)):
             raise _ArgError(BIND_HINT)
         out.append(v)
     if len(out) > 50:

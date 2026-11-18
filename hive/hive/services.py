@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from . import presets, proctree, textlog, util
-from .errors import HiveError, bad_request, conflict, denied, not_found, unsupported
+from .errors import HiveError, bad_request, cancelled, conflict, denied, not_found, unsupported
 from .jobs import is_wsl_exe, keep_awake_warnings, read_log
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -341,6 +341,8 @@ class ServiceManager:
         self._view: Optional[dict] = None
         self._view_mtime: Optional[float] = None
         self._container_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
+        self._top_cache: Dict[str, Tuple[float, List[int]]] = {}
+        self._cpu_procs: Dict[str, Dict[int, Any]] = {}
         self._started = False
 
     # ------------------------------------------------------------------------------------------- helpers
@@ -457,9 +459,19 @@ class ServiceManager:
             alive = bool(rs.get("shim_pid")) and util.pid_alive(int(rs["shim_pid"]), rs.get("shim_ctime")) \
                 and not (run / "exit.json").exists()
             if alive:
-                rs.update(state="running" if rs.get("state") not in ("stopping",) else "stopping",
+                prev = rs.get("state")
+                started_mono = _mono()
+                if prev == "starting" and rs.get("started_at"):
+                    try:   # keep the rest of start_period (a model still loading is not judged as running)
+                        started_mono -= max(0.0, _wall() - util.parse_iso(str(rs["started_at"])))
+                    except HiveError:
+                        pass
+                rs.update(state=prev if prev in ("stopping", "starting") else "running",
                           health="unknown" if self._health_kind(d) != "none" else "none", adopted=True,
-                          _started_mono=_mono(), _next_health=_mono())
+                          _started_mono=started_mono, _next_health=_mono(),
+                          _ready_offset=int(rs.get("log_offset") or 0))
+                if prev == "stopping":
+                    rs["_stop_mono"] = _mono()
                 if rs.get("desired") == "stopped" and rs.get("state") != "stopping":
                     rs["desired"] = "running"
                 self._rehold(name, rs)
@@ -468,6 +480,8 @@ class ServiceManager:
             ex = self._read_exit(name)
             if ex is not None and rs.get("state") in ALIVE:
                 rs["last_exit_code"] = ex.get("exit_code")
+            if ex is None and rs.get("shim_pid"):
+                self._kill_orphan(name)     # dead shim, no exit.json: never leave its child running beside a new one
             if rs.get("desired") == "removed":
                 self._delete(name, delete_logs=bool(rs.get("delete_logs")))
                 continue
@@ -568,6 +582,30 @@ class ServiceManager:
         except HiveError:
             return None
         return d if isinstance(d, dict) else None
+
+    def _kill_orphan(self, name: str) -> None:
+        """The shim of ``name`` is gone without exit.json (killed, OOM): kill its recorded child (own session, so it
+        survived the shim) before any restart, so the service never runs twice (identity-checked by create time)."""
+        with self._lock:
+            rs = self._rs.get(name) or {}
+            cands = [(rs.get("child_pid"), rs.get("child_ctime"))]
+        p = self._run_dir(name) / "ready.json"
+        try:
+            r = util.read_json(p, None) if p.exists() else None
+        except HiveError:
+            r = None
+        if isinstance(r, dict):
+            cands.append((r.get("child_pid"), r.get("child_ctime")))
+        seen = set()
+        for pid, ct in cands:
+            if not pid or ct is None or int(pid) in seen:
+                continue
+            seen.add(int(pid))
+            try:
+                if util.pid_alive(int(pid), ct):
+                    proctree.kill_tree(int(pid), force=True, create_time=ct)
+            except Exception:  # noqa: BLE001
+                log.warning("service %s: could not kill the orphaned child %s", name, pid, exc_info=True)
 
     def _alive(self, name: str) -> bool:
         with self._lock:
@@ -758,8 +796,12 @@ class ServiceManager:
                 pass
         for fname, data in files.items():
             util.atomic_write_bytes(run / fname, data, private=True)
-        if isinstance(built, list):
-            built = [str(a).replace("{run_dir}", str(run)) for a in built]
+        if isinstance(built, list) and files:
+            # only the element Hive generated (the PowerShell -File path) refers to the run dir; the definition's
+            # own argv/command text is never rewritten after CommandGuard and approval saw it
+            marks = {"{run_dir}" + sep + f for f in files for sep in ("/", "\\", os.sep)}
+            built = [os.path.join(str(run), str(a)[len("{run_dir}") + 1:]) if str(a) in marks else str(a)
+                     for a in built]
         spec = {"v": 1, "argv": built if isinstance(built, list) else None,
                 "cmdline": built if isinstance(built, str) else None, "cwd": str(cwd), "env": env, "stdin_file": None,
                 "merge_stderr": True, "logs": {"output": "output.log"},
@@ -767,6 +809,7 @@ class ServiceManager:
                 "timeout": 0, "timeout_grace": float(d.get("stop_timeout", 15)), "keep_awake": bool(d.get("keep_awake")),
                 "stop_argv": stop_argv, "post_exit_argv": post,
                 "files": {"status": "status.json", "exit": "exit.json", "stop": "stop", "ready": "ready.json"}}
+        log_offset = textlog.log_size(run / "output.log")
         try:
             h = proctree.spawn_shim(spec, run)
         except HiveError as e:
@@ -795,7 +838,7 @@ class ServiceManager:
                       started_at=now_iso, boot_key=util.boot_key(), restarts=restarts, next_restart_at=None,
                       adopted=False, last_error=None, held_paths=held,
                       _popen=h.popen, _gen=int(rs.get("_gen", 0)) + 1, _started_mono=_mono(),
-                      _next_health=_mono(), _ready_offset=textlog.log_size(run / "output.log"),
+                      _next_health=_mono(), _ready_offset=log_offset, log_offset=log_offset,
                       _health={"last_check": None, "latency_ms": None, "consecutive_failures": 0,
                                "last_error": None})
             rs.pop("_docker_wait_since", None)
@@ -979,6 +1022,8 @@ class ServiceManager:
             except Exception:  # noqa: BLE001
                 pass
         exit_code = ex.get("exit_code") if ex else None
+        if ex is None:
+            self._kill_orphan(name)     # the shim died without exit.json: its child (own session) may still run
         self._release_hold(name)
         base = dict(shim_pid=None, shim_ctime=None, child_pid=None, child_ctime=None, last_exit_code=exit_code,
                     adopted=False)
@@ -988,7 +1033,9 @@ class ServiceManager:
             self._delete(name, delete_logs=bool((self._rs.get(name) or {}).get("delete_logs")))
             return
         if manual or desired == "stopped" or (state == "stopping" and not respawn):
-            self._set(name, state="stopped", health="none", **base)
+            if desired == "running" and not manual:
+                desired = "stopped"     # nobody asked to start it again: the supervisor must not respawn it
+            self._set(name, state="stopped", health="none", desired=desired, **base)
             return
         if self._paused():
             base["last_error"] = PAUSED_ERROR
@@ -1022,7 +1069,9 @@ class ServiceManager:
                 base["last_error"] = f"exited with code {exit_code}" if not respawn else "restarted (unhealthy)"
             self._set(name, state="backoff", health="none", next_restart_at=util.iso_utc(_wall() + delay), **base)
             return
-        self._set(name, state="stopped", health="none", **base)
+        # restart=no, or on-failure with exit code 0: the service stays stopped (desired follows, so the supervisor's
+        # "stopped + desired running" start, meant for boot/autostart starts, does not respawn it)
+        self._set(name, state="stopped", desired="stopped", health="none", **base)
 
     def _check_health(self, name: str, gen: int) -> None:
         with self._lock:
@@ -1172,7 +1221,28 @@ class ServiceManager:
         out["secret_env"] = list(d.get("secret_env") or [])
         return out
 
-    def _resources(self, name: str, rs: dict) -> dict:
+    def _container_pids(self, c: str) -> List[int]:
+        """Host pids of the processes in container ``c`` (``docker top <c> -eo pid``, cached 10 s); Linux only
+        (Docker Desktop pids belong to its VM), [] on any failure."""
+        if util.IS_WINDOWS or util.IS_MAC:
+            return []
+        cached = self._top_cache.get(c)
+        if cached and time.monotonic() - cached[0] < CONTAINER_CACHE_S:
+            return list(cached[1])
+        pids: List[int] = []
+        try:
+            code, out, _e = _docker(["top", c, "-eo", "pid"], 10)
+            if code == 0:
+                for line in out.splitlines()[1:]:
+                    w = line.strip().split()
+                    if w and w[0].isdigit():
+                        pids.append(int(w[0]))
+        except HiveError:
+            pids = []
+        self._top_cache[c] = (time.monotonic(), pids)
+        return list(pids)
+
+    def _resources(self, name: str, rs: dict, d: Optional[dict] = None) -> dict:
         pids: List[int] = []
         for k in ("shim_pid", "child_pid"):
             if rs.get(k):
@@ -1186,14 +1256,35 @@ class ServiceManager:
         cpu: Optional[float] = None
         try:
             import psutil  # type: ignore
-            rss, cpu = 0, 0.0
+            rss = 0
+            # cpu_percent(interval=None) is meaningful only from the second call on the same Process object: keep
+            # them per service between calls; a pid seen for the first time contributes no sample (all new -> null)
+            with self._lock:
+                prev = dict(self._cpu_procs.get(name) or {})
+            keep: Dict[int, Any] = {}
+            total, sampled = 0.0, False
             for p in pids:
                 try:
-                    pr = psutil.Process(p)
+                    pr = prev.get(p)
+                    if pr is not None and not pr.is_running():
+                        pr = None
+                    fresh = pr is None
+                    if fresh:
+                        pr = psutil.Process(p)
                     rss += int(pr.memory_info().rss)
-                    cpu += float(pr.cpu_percent(interval=None))
+                    c = float(pr.cpu_percent(interval=None))
+                    keep[p] = pr
+                    if not fresh:
+                        total += c
+                        sampled = True
                 except Exception:  # noqa: BLE001
                     continue
+            with self._lock:
+                if keep:
+                    self._cpu_procs[name] = keep
+                else:
+                    self._cpu_procs.pop(name, None)
+            cpu = round(total, 1) if sampled else None
         except Exception:  # noqa: BLE001
             if os.path.isdir("/proc/self"):
                 rss = 0
@@ -1205,11 +1296,15 @@ class ServiceManager:
                     except (OSError, ValueError, IndexError):
                         continue
         gpu_mb: Optional[int] = None
-        if pids and not os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
+        gpu_pids = list(pids)
+        if (d or {}).get("container") and rs.get("state") in ALIVE:
+            # §9.6: best-effort for containers: nvidia compute-app pids matched against `docker top <c> -eo pid`
+            gpu_pids += [p for p in self._container_pids(str(d["container"])) if p not in gpu_pids]
+        if gpu_pids and not os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop"):
             try:
                 from . import gpu
                 pm = gpu.process_memory() or {}
-                hit = [pm[p] for p in pids if p in pm]
+                hit = [pm[p] for p in gpu_pids if p in pm]
                 gpu_mb = int(sum(hit)) if hit else (0 if pm else None)
             except Exception:  # noqa: BLE001
                 gpu_mb = None
@@ -1252,7 +1347,7 @@ class ServiceManager:
                     "health_detail": {"last_check": h.get("last_check"), "latency_ms": h.get("latency_ms"),
                                       "consecutive_failures": int(h.get("consecutive_failures") or 0),
                                       "last_error": h.get("last_error")},
-                    "resources": self._resources(name, r), "container": self._container_info(d), "tail": tail})
+                    "resources": self._resources(name, r, d), "container": self._container_info(d), "tail": tail})
         return out
 
     def _settled(self, name: str) -> bool:
@@ -1277,11 +1372,13 @@ class ServiceManager:
             with self._lock:
                 self._cond.wait(min(0.1, max(0.0, end - time.monotonic())))
 
-    def status(self, name: str, tail_lines: int = 30, wait: float = 0) -> dict:
-        """ServiceStatus; ``wait`` blocks until running+healthy/none, failed, stopped, backoff or the wait elapses."""
+    def status(self, name: str, tail_lines: int = 30, wait: float = 0,
+               cancel: Optional[threading.Event] = None) -> dict:
+        """ServiceStatus; ``wait`` blocks until running+healthy/none, failed, stopped, backoff or the wait elapses
+        (or ``cancel`` is set; the caller then reports ``cancelled``)."""
         self._get(name)
         if wait and wait > 0:
-            self._wait_until(name, wait, lambda: self._settled(name))
+            self._wait_until(name, wait, lambda: self._settled(name), cancel)
         return self._status_now(name, tail_lines)
 
     def list(self) -> dict:
@@ -1346,9 +1443,24 @@ class ServiceManager:
                 if rs.get("desired") == "removed":
                     raise conflict("service is being removed; retry in a few seconds")
                 state = rs.get("state")
+                prev_desired = rs.get("desired")
                 rs["desired"] = "running"
                 rs.pop("_manual", None)
             alive = self._alive(name)
+            if alive and state == "stopping" and not rs.get("_respawn"):
+                # a stop is in progress: let it finish, then spawn here with the calling identity (never leave the
+                # start to the supervisor's system identity)
+                alive = self._finish_stop_for_start(ctx, name, prev_desired)
+                state = (self._rs.get(name) or {}).get("state")
+            elif not alive and state in ALIVE and rs.get("shim_pid"):
+                with self._lock:
+                    rs["_manual"] = True    # the shim exited before the supervisor noticed: record it first
+                try:
+                    self._on_exit(name)
+                finally:
+                    with self._lock:
+                        rs.pop("_manual", None)
+                state = (self._rs.get(name) or {}).get("state")
             if (alive and state in ALIVE) or state == "backoff" or rs.get("_docker_wait_since"):
                 self._save_rs(name)     # already starting/running/unhealthy/backoff (or stopping): only wait
             else:
@@ -1357,6 +1469,44 @@ class ServiceManager:
                 self._spawn(name, eff=ctx.policy, ctx=ctx, manual=True)
         self._wait_started(name, min(float(wait or 0), max(0.0, ctx.remaining() - 1.0)), ctx.cancel)
         return self._result_status(name)
+
+    def _finish_stop_for_start(self, ctx: "ActionContext", name: str, prev_desired: Any) -> bool:
+        """service.start during ``stopping`` (caller holds the op lock): wait for the stop sequence to end (force
+        after stop_timeout + 7, as the supervisor would), bounded by the call's remaining time. Returns False once
+        the shim is gone (state stopped, desired running, ready for a manual spawn); still alive -> the start is
+        dropped (desired restored) and ``conflict`` (``cancelled`` when the call was cancelled)."""
+        with self._lock:
+            rs = self._rs[name]
+            d = self._defs.get(name) or {}
+            rs["_manual"] = True        # _on_exit keeps desired running and the supervisor spawns nothing
+            stop_end = float(rs.get("_stop_mono") or _mono()) + float(d.get("stop_timeout", 15)) + STOP_EXTRA_S
+        call_end = time.monotonic() + max(0.0, ctx.remaining() - 2.0)
+        cancel = getattr(ctx, "cancel", None)
+        try:
+            while self._alive(name) and time.monotonic() < call_end and not (cancel is not None and cancel.is_set()):
+                if _mono() >= stop_end:
+                    self._force_kill(name)
+                    end = min(call_end, time.monotonic() + 3.0)
+                    while time.monotonic() < end and self._alive(name):
+                        time.sleep(0.05)
+                    break
+                time.sleep(0.05)
+            if not self._alive(name):
+                with self._lock:
+                    st = rs.get("state")
+                if st in ALIVE:
+                    self._on_exit(name)
+                return False
+        finally:
+            with self._lock:
+                rs.pop("_manual", None)
+        with self._lock:
+            rs["desired"] = prev_desired if prev_desired in ("stopped", "running") else "stopped"
+        self._save_rs(name)
+        if cancel is not None and cancel.is_set():
+            raise cancelled("cancelled by the caller")
+        raise conflict(f"service '{name}' is still stopping; start it again once it has stopped",
+                       hint="service_status shows its state")
 
     def _stop_now(self, name: str, *, desired: str, manual_flag: bool) -> None:
         with self._lock:
@@ -1470,8 +1620,42 @@ class ServiceManager:
                                  secret_names=names, docker=docker,
                                  mask=getattr(sec, "mask", None) or presets._identity_mask)
 
-    def _code_dirs(self, d: dict, node_path: str) -> List[str]:
+    @staticmethod
+    def _code_cwd(d: dict, eff: Any) -> Optional[str]:
+        """The cwd a spawn of ``d`` uses (EffectivePolicy.check_cwd: relative -> workdir, ``~`` and the fixed
+        variables expanded; none -> workdir); a cwd that does not resolve now is still expanded the same way."""
+        cwd = d.get("cwd")
+        if eff is not None:
+            try:
+                return str(eff.check_cwd(cwd))
+            except HiveError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+            if cwd:
+                expand = getattr(eff, "_expand", None)
+                try:
+                    if callable(expand):
+                        return os.path.realpath(expand(str(cwd)))
+                except Exception:  # noqa: BLE001
+                    pass
+                wd = getattr(eff, "workdir", None)
+                try:
+                    base = str(wd() if callable(wd) else wd) if wd is not None else None
+                except Exception:  # noqa: BLE001
+                    base = None
+                if base:
+                    return os.path.realpath(os.path.join(base, os.path.expanduser(str(cwd))))
+        if cwd:
+            return os.path.abspath(os.path.expanduser(os.path.expandvars(str(cwd))))
+        return None
+
+    def _code_dirs(self, d: dict, node_path: str, eff: Any = None) -> List[str]:
+        """Folders holding a service's code, resolved the way a spawn resolves them (§5.4 step 7): argv[0] (or the
+        first command word) through build_argv with the spawn cwd (so ``tools/serve.sh`` counts), its venv prefix,
+        and the cwd (the workdir when none is given). ``eff`` resolves the cwd (None: expanded as given)."""
         out: List[str] = []
+        cwd = self._code_cwd(d, eff)
         first: Optional[str] = None
         if d.get("argv"):
             first = str(d["argv"][0])
@@ -1479,7 +1663,16 @@ class ServiceManager:
             from .jobs import _first_word
             first = _first_word(str(d["command"]))
         if first:
-            exe = first if os.path.isabs(first) else proctree.which(first, node_path)
+            exe: Optional[str]
+            try:
+                exe = proctree.build_argv([first], node_path, cwd=cwd)[0]
+            except HiveError:
+                exe = None
+            except Exception:  # noqa: BLE001
+                exe = None
+            if exe is None and (os.sep in first or (os.altsep and os.altsep in first)):
+                # not there (yet): the folder it would run from still counts
+                exe = first if os.path.isabs(first) else os.path.join(cwd or os.getcwd(), first)
             if exe:
                 is_python = os.path.basename(exe).lower().startswith("python")
                 # a venv python is a symlink to the base interpreter: keep its own path so the venv prefix counts
@@ -1488,8 +1681,8 @@ class ServiceManager:
                 out.append(parent)
                 if os.path.basename(parent) in ("bin", "Scripts") and is_python:
                     out.append(os.path.dirname(parent))
-        if d.get("cwd"):
-            out.append(os.path.abspath(os.path.expanduser(str(d["cwd"]))))
+        if cwd:
+            out.append(cwd)
         uniq: List[str] = []
         for x in out:
             if x not in uniq:
@@ -1545,7 +1738,10 @@ class ServiceManager:
                      if r.get("path") and r.get("path") != "*"]
         except Exception:  # noqa: BLE001
             roots = []
-        for cd in self._code_dirs(d, eff.node_path):
+        implicit = None if d.get("cwd") else self._code_cwd(d, eff)   # the default workdir: no warning of its own
+        for cd in self._code_dirs(d, eff.node_path, eff):
+            if implicit is not None and cd == implicit:
+                continue
             ncd = os.path.normcase(cd.rstrip("/\\") or cd)
             bases = [os.path.normcase(x.rstrip("/\\") or x) for x in [home] + roots]
             if any(ncd == b or b.startswith(ncd.rstrip(os.sep) + os.sep) for b in bases):
@@ -1664,8 +1860,7 @@ class ServiceManager:
             if rs.get("state") not in ALIVE:
                 healthy = False
             out.append({"name": n, "source": "service", "api": d.get("endpoint_kind") or "openai",
-                        "server": d.get("preset") if d.get("preset") in ("vllm", "sglang", "ollama", "llamacpp")
-                        else "unknown", "base_url": d["endpoint"], "healthy": healthy, "models": None})
+                        "server": _server_of(d), "base_url": d["endpoint"], "healthy": healthy, "models": None})
         return out
 
     def policy_view(self) -> dict:
@@ -1680,6 +1875,10 @@ class ServiceManager:
             return view
         pol = self._policy()
         node_path = getattr(pol, "node_path", None) or os.environ.get("PATH", "")
+        try:
+            eff = self._system_eff()     # resolves cwd like a spawn does (relative -> workdir, ~ and variables)
+        except Exception:  # noqa: BLE001
+            eff = None
         with self._lock:
             defs = [dict(d) for d in self._defs.values()]
         eps: List[str] = []
@@ -1687,7 +1886,7 @@ class ServiceManager:
         for d in defs:
             if d.get("endpoint") and d["endpoint"] not in eps:
                 eps.append(str(d["endpoint"]))
-            for cd in self._code_dirs(d, node_path):
+            for cd in self._code_dirs(d, node_path, eff):
                 if cd not in dirs:
                     dirs.append(cd)
         view = {"endpoints": eps, "code_dirs": dirs}
@@ -1711,6 +1910,16 @@ class ServiceManager:
         _d, rs = self._get(name)
         with self._lock:
             return {k: v for k, v in rs.items() if not k.startswith("_")}
+
+
+def _server_of(d: dict) -> str:
+    """model.endpoints ``server`` from a definition (§9.9: the preset or ``endpoint_kind`` first); "unknown" leaves
+    it to WP3's probe (``owned_by`` of /v1/models, else "openai")."""
+    if d.get("preset") in ("vllm", "sglang", "ollama", "llamacpp"):
+        return str(d["preset"])
+    if d.get("endpoint_kind") == "ollama":
+        return "ollama"
+    return "unknown"
 
 
 def _platform() -> str:

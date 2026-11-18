@@ -30,7 +30,8 @@ def service_list(ctx: ActionContext, p: dict) -> dict:
 @handler("service.status")
 def service_status(ctx: ActionContext, p: dict) -> dict:
     """One service's full status; optionally wait until it settles."""
-    out = ctx.rt.services.status(p["name"], tail_lines=int(p.get("tail_lines", 30)), wait=_wait(ctx, p.get("wait")))
+    out = ctx.rt.services.status(p["name"], tail_lines=int(p.get("tail_lines", 30)), wait=_wait(ctx, p.get("wait")),
+                                 cancel=ctx.cancel)
     if ctx.cancel.is_set():
         raise cancelled("cancelled by the caller")
     return out
