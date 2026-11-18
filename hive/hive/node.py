@@ -882,11 +882,31 @@ def resume(data_dir: Path, *, relay: bool = True) -> None:
             pass
 
 
+def _offline_trusted_path(cfg: "NodeConfig", data_dir: Path) -> None:
+    """Offline commands (``panic``) resolve ``docker`` and stop commands like the daemon does: the policy's trusted
+    PATH (``exec.path_prepend`` + PATH minus rw roots, §5.4) instead of the CLI's fail-safe default (M3-2)."""
+    try:
+        from . import proctree
+        from .config import default_paths
+        from .policy import Policy
+        from .secretstore import SecretStore
+        secrets = SecretStore(Path(data_dir) / "secrets.json", passthrough=cfg.secrets.env_passthrough,
+                              env=dict(os.environ))
+        pol = Policy(cfg.policy, workdir=Path(cfg.workdir), data_dir=Path(data_dir),
+                     hive_home=default_paths()["home"], protected=([], []), network=cfg.network,
+                     models=cfg.models, secrets=secrets, gateway=cfg.gateway, is_wsl=_is_wsl(),
+                     model_endpoints=cfg.model_endpoints)
+        proctree.set_trusted_path(pol.trusted_path)
+    except Exception as e:  # noqa: BLE001 - the fail-safe default stays
+        log.warning("trusted PATH for panic not set: %s", e)
+
+
 def panic(cfg: "NodeConfig", data_dir: Path, *, force_after: float = 10.0) -> dict:
     """PAUSED + relay.disabled + ``services.panic_offline`` (stop every job, service and labelled container)."""
     d = Path(data_dir)
     pause(d)
     write_json_atomic(d / "relay.disabled", {"at": iso_utc(), "by": "panic"}, private=True)
+    _offline_trusted_path(cfg, d)
     try:
         from . import services
         out = services.panic_offline(d, cfg.node_id or "", force_after=force_after)
