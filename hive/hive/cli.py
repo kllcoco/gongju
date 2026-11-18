@@ -190,7 +190,7 @@ def _restart_daemon(kind: str, out: Out, *, no_restart: bool = False) -> bool:
         out.line(f"the {kind} is not running: will apply on next start")
         return False
     if no_restart:
-        out.line(f"not applied yet (--no-restart): run hive {kind} restart")
+        out.line(f"restart to apply: hive {kind} restart")
         return False
     try:
         from . import install
@@ -2769,7 +2769,8 @@ def cmd_service_define(args: argparse.Namespace, out: Out) -> int:
     out.line(f"watch it: hive logs {node} --service {args.name} -f   status: hive call service.status "
              f"name={args.name} wait=120" + (f" --node {args.node}" if args.node else ""))
     if res.get("endpoint") or args.preset not in (None, "comfyui"):
-        out.line(f"chat apps: hive gateway url {node} {args.name}   (README section 6)")
+        out.line(f"chat apps: hive gateway url {node} {args.name}" + ("" if args.node else " --node")
+                 + "   (README section 6.2)")
     return EXIT_OK
 
 

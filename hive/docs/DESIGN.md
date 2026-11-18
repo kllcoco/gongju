@@ -1641,7 +1641,7 @@ Deferred (v3, D14). `node` is a single name; `hub.nodes` shows each node's live 
 Transfers run in the tool-host process (`Client.transfer` / `TransferManager`, §15.3); the hub has no transfer engine or `hub.transfer*` actions (D33). When `/mcp` is served by the hub, the tool host *is* the hub process, so node↔node copies through a hub-hosted MCP session flow through the hub (both legs are normal calls with the agent's identity: `read` on the source, `write` on the destination). Server-hosted Toolkits are built with `local_roots=()` and refuse `local:` endpoints (§17.5).
 
 ### 8.6 Config changes
-v3 (D16/D51): no hot reload. CLI commands that change the hub or node config (`hub add-node/remove-node/add-agent/remove-agent/rotate-token`, `node token add/revoke`, `gateway token add/revoke`) write it with `config.edit_config` and then, if the daemon runs, perform the graceful restart (§13.1; `--no-restart` prints "restart to apply"). (v5: `ack-node` and `restart-node` change no config: they use the hub owner routes of §6.3.) v4: the hub uses the same mechanism as the node: `run_hub` polls `<hub data>/control.json` every 1 s and shuts down gracefully on it (v5, D55: exit 0 for `stop`, 75 for `restart`); `install.restart("hub")` (WP4) runs the §13.1 sequence on `hub.lock` (the hub spawns no children, so it never needs the Windows job escape; v6: on Windows its Task Action is still the supervising launcher `hub run --supervise`, §13.1, for crash recovery); `hive hub stop | restart` (§19) expose it. Jobs and services survive (D4); relay nodes re-register within one poll; in-flight hub calls return `unavailable` with `maybe_executed` per §4.1; MCP HTTP sessions are lost and clients re-initialize.
+v3 (D16/D51): no hot reload ((v8.1) a hand-started foreground daemon re-execs itself on the restart, §13.1). CLI commands that change the hub or node config (`hub add-node/remove-node/add-agent/remove-agent/rotate-token`, `node token add/revoke`, `gateway token add/revoke`) write it with `config.edit_config` and then, if the daemon runs, perform the graceful restart (§13.1; `--no-restart` prints "restart to apply"). (v5: `ack-node` and `restart-node` change no config: they use the hub owner routes of §6.3.) v4: the hub uses the same mechanism as the node: `run_hub` polls `<hub data>/control.json` every 1 s and shuts down gracefully on it (v5, D55: exit 0 for `stop`, 75 for `restart`); `install.restart("hub")` (WP4) runs the §13.1 sequence on `hub.lock` (the hub spawns no children, so it never needs the Windows job escape; v6: on Windows its Task Action is still the supervising launcher `hub run --supervise`, §13.1, for crash recovery); `hive hub stop | restart` (§19) expose it. Jobs and services survive (D4); relay nodes re-register within one poll; in-flight hub calls return `unavailable` with `maybe_executed` per §4.1; MCP HTTP sessions are lost and clients re-initialize.
 
 ### 8.7 Model gateway (`gateway.py`, WP5; v3, D48)
 
@@ -2573,6 +2573,8 @@ Managers are created by late import inside `start()`; an `ImportError` yields an
 
 **Graceful stop/restart without signals (v2, D40).** `schtasks /End` is TerminateProcess (no signal reaches `pythonw.exe`), so the node relies on crash-consistent state (already atomic) and offers `hive node stop` / `hive node restart`: the CLI writes `<data>/control.json {"cmd":"stop"|"restart","at"}` (0600), the periodic scheduler polls it every 1 s, deletes it and performs a graceful shutdown (jobs/services keep running) → v5 (D55) exit **0** for `stop` and **75** for `restart`. Every install method restarts only non-zero exits (§20.1), so `hive node stop` leaves the node stopped under systemd, launchd, the watchdog and Task Scheduler alike, and a stopped node is started again with `hive node restart` (or the method's own start command). `restart` (CLI side, WP4 `install.restart(kind)`, v6 sequence): read the lock holder `{pid, ctime}`; if there is none (already stopped), run the method's start command at once (below, without the 20 s wait); else write `control.json` `restart` and wait ≤ 30 s until `pid_alive(pid, ctime)` is false. Start step: **every method** (v6: schtasks too, because the Windows launcher loop relaunches on 75 by itself) → first wait ≤ 20 s for a new lock holder (systemd RestartSec 5 s, launchd throttle 10 s, watchdog `sleep 5`, Windows launcher at once), and only if none appears run the start command once (`schtasks /Run /TN "Hive Node"` when the launcher in `<data>/run/launcher.json` is no longer alive, `systemctl [--user] start hive-<kind>`, `launchctl kickstart gui/<uid>/ai.hive.<kind>`, or re-launch `run-<kind>.sh` with `setsid nohup` when the watchdog pid is dead), so the daemon is never started twice; **no installed method** (foreground) → print "start it again: hive node run". Then wait ≤ 20 s for a new lock holder; on Windows, if none appears, run `schtasks /End` + `/Run` once (safe: jobs, services and the keepalive are outside the task job) and otherwise print the manual command and exit 4. The README upgrade procedure uses `hive node restart`. Config-changing CLI commands use the same restart (§8.6).
 
+(v8.1) **Foreground runs restart themselves.** `hive node run` / `hive hub run` started by hand in a terminal (stdin or stderr is a TTY; not `--relaunched`/`--supervise`; no `HIVE_WATCHDOG=1` or systemd `INVOCATION_ID`) treat exit 75 as "start again": they print `restarting to apply new settings…` and, on POSIX, `os.execv` the same command (`util.self_command()` + the CLI arguments, the original cwd, the same env), so the process and its pid stay; on Windows the first process runs the same command as a child in a loop (with `HIVE_FOREGROUND_CHILD=1`, ignoring Ctrl-C itself) until it exits with something other than 75. Supervised runs keep exit 75 for their supervisor. Because a re-exec keeps pid and ctime, the node and hub lock notes carry a per-start nonce (`"node <hex>"`, `"hub <hex>"`) and `install.restart` compares the holder `(pid, ctime, note)`: the exit wait ends when the pid exits **or** the holder changes, and a new holder is any holder that differs from the old one. "No installed method" then normally finds the re-exec'd holder; only a foreground run without a terminal still ends with "start it again: hive node run".
+
 ### 13.2 `NodeRuntime.call` pipeline (the single PEP; order is binding)
 1. `t0`; validate or generate `request_id`.
 2. (v3: no per-identity rate limit, §5.7.)
@@ -3335,11 +3337,22 @@ hive init hub    [--name N] [--listen HOST:PORT | --tailscale] [--funnel] [--pub
                  [--with-local-node] [--yes] [--force]
      (--funnel: listen.proxy_port 7709, public_url https://<machine>.<tailnet>.ts.net, allowed_hosts; prints `tailscale funnel --bg 7709`;
       always writes ~/.hive/tokens/hub-owner.token and the client.json connection "hub-local";
-      v5: --with-local-node prints the T5 warning that exec-capable agents on this machine can act as the hub)
+      v5: --with-local-node prints the T5 warning that exec-capable agents on this machine can act as the hub;
+      (v8.1) --with-local-node prints the name the local node got (`hubhost` when node and hub share the machine's
+      name) and restarts a running local node so it loads the new hub token (§8.6); --tailscale checks
+      `tailscale ip -4` at once and warns (not fatal); on an existing hub config (no --force) --listen/--tailscale/
+      --public-url/--funnel/--with-local-node change only that setting, keep every token and restart a running hub,
+      like init node; with none of them it exits 2. init node (v8.1) warns at once when run as root/Administrator
+      (allow_root) and checks Tailscale for --tailscale)
 hive init client [--url URL (--token-file F | --token-env VAR | --token T) [--tls-pin P]] [--name NAME] [--default]
-                 (without --default the connection becomes the default only if it is the first one)
+                 (without --default the connection becomes the default only if it is the first one;
+                  (v8.1) --token - reads the token from a pipe or a prompt without echo and Hive writes the token file
+                  itself (0600; tokens/<name>.token, or the --token-file path); an existing --token-file readable by
+                  others is chmod 0600 with a note; add-agent prints this one line)
 hive join [CODE | -] [--name N] [--preset P] [--relay-role R] [--relay-proxy URL|off] [--pod | --no-pod] [--wsl] [--mirror cn|none]
           [--proxy URL|off] [--models-dir PATH] [--install] [--force] [--yes]
+     ((v8.1) --install then follows the node log ≤ 30 s and prints success only after "relay registered with"; a logged
+      start failure (port in use, root) is reported with its fix and exit 4)
      (= init node --join CODE [--pod] [--wsl] + optional service install; CODE omitted -> env HIVE_JOIN, "-" -> stdin;
       v7: --wsl applies the init node --wsl profile (§14.2) when a new config is created; with an existing node config
       (and no --force) join replaces only its relay block and name through edit_config, keeps listen, tags, roots and
@@ -3351,12 +3364,16 @@ hive join [CODE | -] [--name N] [--preset P] [--relay-role R] [--relay-proxy URL
       stdin is a TTY and --yes is absent; sets relay.allow_insecure for private/tailnet http hubs, §5.9)
 hive node run    [--config PATH] [--relaunched] [--supervise]   (banner; foreground; --relaunched is internal, set by the Windows
                                                              launcher, D40; v6: --supervise = the Windows launcher loop, used
-                                                             only by the Task Action, §13.1)
+                                                             only by the Task Action, §13.1; (v8.1) started by hand in a
+                                                             terminal it survives exit 75 by re-exec'ing itself, §13.1)
 hive node status                                            (over loopback HTTP via this-pc-owner; daemon down -> file-based state:
                                                              lock holder, PAUSED, jobs/services from state files)
 hive node stop | restart                                    (graceful via control.json; v5 (D55): stop exits 0 and stays stopped under
                                                              every install method; restart exits 75 and is relaunched, §13.1)
 hive node pause | resume [--no-relay] | panic [--yes]       (node.pause/resume/panic, §5.10; work with the daemon down;
+                                                             (v8.1) pause waits ≤ 3 s for the running node to report
+                                                             paused (node.info) before it returns; panic/approve/deny
+                                                             without a TTY and --yes say "add --yes";
                                                              v8: on a Windows node with wsl.keepalive entries also prints the WSL line, §5.10)
 hive node token add NAME [--role R | --classes C1,C2] [--kind agent|hub] [--deny GLOBS] [--approval GLOBS | --cautious | --no-cautious]
                          [--expires DATE] [--sha256 sha256:HEX]   (--sha256: store this hash instead of generating; prints nothing secret)
@@ -3414,12 +3431,15 @@ hive approvals list [--node | --hub] | approve ID [--for 30m] | deny ID [--yes]
 hive approvals grants [--node | --hub] | revoke [ID | --all] [--node | --hub]   (owner HTTP routes; daemon down -> "node not running")
 hive mcp …                                                 (§18.3)
 hive mcp-config  [--client claude-desktop|claude-code|cursor|generic] [--connection NAME | --local] [--remote] [--write] [--allow-owner]
-                 (v8: without --connection/--local the snippet uses client.json `default`, and prints which connection that is)
+                 (v8: without --connection/--local the snippet uses client.json `default`, and prints which connection that is;
+                  (v8.1) a non-default HIVE_HOME goes into the snippet's "env" / `claude mcp add -e HIVE_HOME=…`)
 hive tools export --format mcp|anthropic|openai|openai-responses [--profile P] [--prefix X] [--node N] [-o FILE]
-hive nodes       [--connection C] [--json]
+hive nodes       [--connection C] [--json]   ((v8.1) one row, no --connection, a hub-local connection here: prints the
+                                             hint `hive nodes --connection hub-local`)
 hive actions     [--node N] [--json]
 hive call ACTION [key=value ...] [--json '{…}'] [--node N] [--timeout S] [--approval ID] [--raw]   (values JSON-parsed when valid, else string)
-hive sh NODE -- COMMAND…  [--shell S] [--cwd D] [--timeout S]
+hive sh NODE -- COMMAND…  [--shell S] [--cwd D] [--timeout S] [--approval AP_ID]
+     ((v8.1) --approval retries an approved call; after approval_required, sh and call print the retry line)
 hive push NODE LOCAL REMOTE [--overwrite]       hive pull NODE REMOTE LOCAL [--overwrite]   (resumable, progress bar on stderr; LocalFS unconfined)
 hive logs NODE (JOB_ID | --service NAME) [-f] [--tail N] [--raw]
      (v1 `hive fetch` removed: use `hive call net.download …` / `hive call model.pull repo=… ` + `hive logs NODE JOB -f`)
@@ -3427,8 +3447,14 @@ hive service install node|hub [--method auto|systemd|launchd|schtasks|watchdog] 
      (systemd: user unit by default; --system = system unit with User=$SUDO_USER, refused when SUDO_USER is empty unless
       allow_root:true; Windows installs at logon only, owner decision §23)
 hive service uninstall node|hub [--stop-services]      hive service status node|hub
+hive service define NAME (--preset P [--model M] [--arg K=V …] | --argv 'PROG ARGS' | --command 'SHELL LINE') [--port N]
+                    [--endpoint URL] [--cwd D] [--autostart] [--no-start] [--wait S (30)] [--param K=V …] [--node N]
+                    [--approval AP_ID]
+     ((v8.1) a thin wrapper over the service.define action; --model -> preset arg `model` (vllm, sglang) or
+      `model_path` (llamacpp))
+hive guide [TOPIC] [--list]                                 ((v8.1) prints guides.topic_text, the text of the agents' guide tool)
 hive tls-pin CERT.pem                                       (v3: replaces `hive cert gen/fingerprint`, D51)
-hive doctor      [node|hub|client] [--no-network] [--deep]
+hive doctor      [node|hub|client] [--no-network] [--deep]   ((v8.1) without a kind: node and hub when both configs exist)
 hive audit tail  [-n 50] [--node | --hub] [--follow]
 hive dist build  [--out hive.pyz]
 hive version
@@ -3436,7 +3462,7 @@ hive _shim --spec PATH   hive _download --spec PATH   hive _update        (inter
 ```
 Global flags: `--connection C`, `--json` (machine output; errors as JSON on stderr), `-v`.
 `--token T` flags work but print "visible in ps and shell history; prefer --token-env/--token-file".
-Config-changing commands restart the running daemon gracefully (§8.6; `--no-restart` prints "restart to apply").
+Config-changing commands restart the running daemon gracefully (§8.6; `--no-restart` prints "restart to apply"). (v8.1) They print "applied (restarted the <kind>)", or "will apply on next start" when nothing runs, or, for a foreground run without a terminal that stopped, "start it again: hive <kind> run".
 All agent- or node-supplied text the CLI prints (approvals, audit tail, logs, call, sh) goes through `util.escape_terminal` (`hive logs` applies `clean_terminal_text` first, unless `--raw`).
 Exit codes: 0 ok; 1 action error; 2 usage/config error; 3 auth error (unauthorized/forbidden/policy_denied); 4 unavailable/timeout. Errors print `code: message` and `Hint: …`. Exception (v3): `hive sh` exits with the remote exit code (0–255); Hive-level failures exit 125 (message on stderr), timeouts 124, and a call that yielded to a job exits 124 after printing the job id.
 
@@ -3481,7 +3507,7 @@ Every launcher (systemd `ExecStart`, the schtasks Action, launchd `ProgramArgume
   [Install]
   WantedBy=default.target
   ```
-  `KillMode=process`: jobs/services live in their own sessions under shims and must survive node restarts. `Restart=on-failure` (v5, D55): exit 75 and crashes restart, a graceful stop (exit 0) does not. User mode prints `loginctl enable-linger $USER`. No systemd (containers) → falls back to `watchdog`.
+  `KillMode=process`: jobs/services live in their own sessions under shims and must survive node restarts. `Restart=on-failure` (v5, D55): exit 75 and crashes restart, a graceful stop (exit 0) does not. User mode prints `loginctl enable-linger $USER`. No systemd (containers) → falls back to `watchdog` ((v8.1) its notes say so in desktop terms: it runs now and restarts the daemon, but does not come back after a reboot unless the printed line goes into a login script, desktop autostart or a pod start command).
 - **Windows Scheduled Task** (owner decision: at logon): XML registered with `schtasks /Create /TN "Hive Node" /XML <file> /F`, then `schtasks /Run`. LogonTrigger for the current user (GPU, user env and profile available); Principal LeastPrivilege + InteractiveToken; Settings `ExecutionTimeLimit=PT0S` (default 72 h would kill the node), `RestartOnFailure PT1M ×999` (v6: only a backstop for a launcher that fails to start; Task Scheduler is not relied on to restart after a non-zero *exit code* — the Action is always the supervising launcher, `launcher_argv(kind, config, windowless=True, supervise=True)`, whose loop (§13.1 `supervise`) exits 0 after a graceful stop, relaunches at once on 75 and relaunches with 5→60 s backoff after a crash or a failed start, in every spawn mode), `DisallowStartIfOnBatteries=false`, `StopIfGoingOnBatteries=false`, `MultipleInstancesPolicy=IgnoreNew`, **`Priority=5`** (v2: Task Scheduler's default 7 is below-normal CPU priority with low I/O and memory priority, which every child including model servers would inherit); Action = `launcher_argv("node", config, windowless=True, supervise=True)` (pythonw; logs to `logs/node.log`) with `WorkingDirectory` = the data dir (v6). Signing out ends the task and every process in the session (documented: lock the screen, do not sign out). Jobs and services survive `schtasks /End` through the spawn modes of §10.1 (D40; in `job` mode the node escapes the task's job once at start). The installer captures the current `PATH` into `policy.exec.path_prepend` unless `--no-capture-path` (task environments lack user PATH changes). (v1's `--system` BootTrigger-as-SYSTEM variant is deferred, §24; a "run whether logged on or not" S4U variant likewise.)
 - **launchd**: `~/Library/LaunchAgents/ai.hive.<kind>.plist` (`RunAtLoad`, `KeepAlive` = `{"SuccessfulExit": false}` (v5, D55: restart after non-zero exits only), `ProgramArguments`, `EnvironmentVariables` with `HIVE_HOME` and PATH incl. `/opt/homebrew/bin:/usr/local/bin` + captured PATH, `StandardOutPath`/`StandardErrorPath` → data dir logs, `WorkingDirectory` = data dir (v6), `ProcessType=Interactive`); `launchctl bootstrap gui/<uid> <plist>`; uninstall `bootout`.
 - **watchdog** (RunPod/containers): writes `<data>/run-<kind>.sh` (0700):
