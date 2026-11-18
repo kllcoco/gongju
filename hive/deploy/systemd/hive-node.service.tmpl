@@ -1,0 +1,26 @@
+# Reference template: `hive service install node` renders this unit itself from util.launcher_argv()
+# (design §20.1). Placeholders: {data_dir} {exec_start} {hive_home} {path}. One quoted Environment= line per
+# variable; `%` is written as `%%` and `\` / `"` are backslash-escaped (v8).
+# User unit: ~/.config/systemd/user/hive-node.service (+ `loginctl enable-linger $USER`).
+# System unit (--system): /etc/systemd/system/hive-node.service with User=$SUDO_USER and WantedBy=multi-user.target.
+[Unit]
+Description=Hive Node (agent control endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={data_dir}
+ExecStart={exec_start}
+Environment="PYTHONUNBUFFERED=1"
+Environment="HIVE_HOME={hive_home}"
+Environment="PATH={path}"
+# D55: exit 0 = stopped on purpose (hive node stop) -> stays stopped; 75 (restart) and crashes -> restart
+Restart=on-failure
+RestartSec=5
+# jobs/services run in their own sessions under shims and must survive node restarts
+KillMode=process
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

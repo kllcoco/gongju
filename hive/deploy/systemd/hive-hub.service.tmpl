@@ -1,0 +1,26 @@
+# Reference template: `hive service install hub` renders this unit itself from util.launcher_argv()
+# (design §20.1). Placeholders: {data_dir} {exec_start} {hive_home} {path}. One quoted Environment= line per
+# variable; `%` is written as `%%` and `\` / `"` are backslash-escaped (v8).
+# User unit: ~/.config/systemd/user/hive-hub.service (+ `loginctl enable-linger $USER`).
+# System unit (--system): /etc/systemd/system/hive-hub.service with User=$SUDO_USER and WantedBy=multi-user.target.
+[Unit]
+Description=Hive Hub (agent gateway)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={data_dir}
+ExecStart={exec_start}
+Environment="PYTHONUNBUFFERED=1"
+Environment="HIVE_HOME={hive_home}"
+Environment="PATH={path}"
+# D55: exit 0 = stopped on purpose (hive hub stop) -> stays stopped; 75 (restart) and crashes -> restart
+Restart=on-failure
+RestartSec=5
+# the hub keeps no child processes; KillMode=process matches the node unit
+KillMode=process
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

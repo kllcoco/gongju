@@ -1,0 +1,27 @@
+# Caddy in front of a Hive hub on a VPS (design §2 (b), §5.7, §5.9): Let's Encrypt certificate, forwarded to the
+# hub's loopback-only proxy port. Never point a reverse proxy at the main port: requests arriving on
+# listen.proxy_port are treated as proxied (client IP from the rightmost X-Forwarded-For, throttled per client).
+#
+# hub config (excerpt):
+#   "listen": {"host": "127.0.0.1", "port": 7700, "proxy_port": 7709,
+#              "allowed_hosts": ["hive.example.com"]},
+#   "public_url": "https://hive.example.com"
+#
+# Then: sudo systemctl reload caddy; hive doctor hub (checks that forwarded requests carry X-Forwarded-For).
+
+hive.example.com {
+	encode zstd gzip
+	# Caddy appends the client address to X-Forwarded-For by default
+	reverse_proxy 127.0.0.1:7709 {
+		# relay polls wait up to 25 s and the model gateway may stream for a long time
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+		flush_interval -1
+	}
+	# request bodies up to the hub's listen.max_body_bytes (48 MiB)
+	request_body {
+		max_size 48MB
+	}
+}

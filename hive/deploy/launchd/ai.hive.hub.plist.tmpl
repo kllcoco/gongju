@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Reference template: `hive service install hub` renders this plist itself (plistlib) from util.launcher_argv()
+     (design §20.1). Installed as ~/Library/LaunchAgents/ai.hive.hub.plist, loaded with
+     `launchctl bootstrap gui/<uid> <plist>`, removed with `launchctl bootout gui/<uid>/ai.hive.hub`.
+     Placeholders: {program_arguments} {hive_home} {path} {data_dir}. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.hive.hub</string>
+	<key>ProgramArguments</key>
+	<array>
+		{program_arguments}
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<!-- D55: restart only after a non-zero exit (75 = restart requested, crashes); 0 = stopped on purpose -->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HIVE_HOME</key>
+		<string>{hive_home}</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:{path}</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>{data_dir}/logs/launchd.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>{data_dir}/logs/launchd.err.log</string>
+	<key>WorkingDirectory</key>
+	<string>{data_dir}</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>

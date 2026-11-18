@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!-- Reference template: `hive service install node` renders this XML itself (design §20.1) and registers it with
+     schtasks /Create /TN "Hive Node" /XML <file> /F, then schtasks /Run /TN "Hive Node".
+     Starts at logon of the installing user (owner decision §23); Priority 5 (the default 7 is below-normal CPU, low
+     I/O and memory priority, inherited by every model server); no execution time limit; RestartOnFailure is only a
+     backstop: the Action is the supervising launcher (pythonw, node run with the config and the supervise flag), which relaunches the
+     node after exit 75 or a crash and ends the task after a graceful stop (exit 0, D55).
+     Placeholders: {description} {task_name} {user} {command} {arguments} {data_dir}. -->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>{description}</Description>
+    <URI>\{task_name}</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{data_dir}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
