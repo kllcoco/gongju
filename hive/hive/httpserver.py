@@ -524,6 +524,19 @@ def tailscale_info() -> Tuple[str, List[str], str]:
     return ip, names, note
 
 
+LISTEN_BACKLOG_MAX = 1024
+
+
+def listen_backlog(conns: Any) -> int:
+    """listen() backlog: about 4 x max_connections, at least 64, at most LISTEN_BACKLOG_MAX (the kernel caps it at
+    net.core.somaxconn anyway). Verification round 4: with 64, a local connect flood (~1000/s) overflowed the accept
+    queue and owner SYNs waited for a 1 s retransmit although the accept thread's eviction kept up."""
+    n = 64
+    if conns is not None:
+        n = int(getattr(conns, "pre_cap", 32)) + int(getattr(conns, "auth_cap", 32))
+    return max(64, min(LISTEN_BACKLOG_MAX, 4 * n))
+
+
 class _BoundedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """ThreadingHTTPServer with a shared connection semaphore and no FQDN lookup at bind."""
 
@@ -536,6 +549,7 @@ class _BoundedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.address_family = fam
         self.api = api
         self.kind = kind          # "main" | "tailnet" | "proxy"
+        self.request_queue_size = listen_backlog(getattr(api, "_conns", None))
         super().__init__(addr, socketserver.BaseRequestHandler, bind_and_activate=False)
         if fam == socket.AF_INET6:
             try:

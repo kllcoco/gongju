@@ -32,6 +32,7 @@ SEARCH_SKIP = (".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_ca
 LIST_CAP = 100_000
 COPY_CAP = 100_000
 REGEX_LINE_CAP = 1024                  # audit round 4: regex mode matches the first 1 KiB of a line
+REGEX_SEARCH_MAX_S = 120.0              # verification round 4: regex fs.search stops (partial) after this
 REGEX_BATCH_CHARS = 1 << 20            # lines sent to the regex worker per exchange
 REGEX_BATCH_LINES = 8192
 TEXT_CAP = 500
@@ -675,6 +676,8 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
     needle = pattern.lower() if icase else pattern
     root = ctx.policy.resolve_path(p.get("path") or ".", must_exist=True)
     deadline = _deadline(ctx)
+    if regex:   # verification round 4: one regex search burns at most REGEX_SEARCH_MAX_S of a worker's CPU
+        deadline = min(deadline, time.monotonic() + REGEX_SEARCH_MAX_S)
     worker = _start_regex_worker(ctx, pattern, icase, deadline) if regex else None
     try:
         return _search_loop(ctx, p, root, pattern, needle, icase, names_only, worker, deadline, t0)

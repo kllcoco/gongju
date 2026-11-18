@@ -533,14 +533,15 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
     multiply), must not contain a quantifier or ``|``; back-references and verbose mode (``x`` flag) are refused."""
     problems: List[str] = []
     unbounded = 0
-    stack: List[Dict[str, Any]] = []          # open groups: {"inner_q": bool, "alt": bool, "mult": repeat count}
+    stack: List[Dict[str, Any]] = []          # open groups: {"inner_q", "inner_unb", "alt": bool, "mult": count}
     i, n = 0, len(pattern)
     prev_atom_end = False                     # an atom precedes (so a quantifier char quantifies it)
     last_quant = False
 
-    def mark_quant() -> None:
+    def mark_quant(unb: bool) -> None:
         for g in stack:
             g["inner_q"] = True
+            g["inner_unb"] = g.get("inner_unb", False) or unb
 
     while i < n:
         c = pattern[i]
@@ -571,7 +572,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
                 j = pattern.find(")", i)
                 i = n if j < 0 else j + 1
                 continue
-            stack.append({"inner_q": False, "alt": False, "mult": 1})
+            stack.append({"inner_q": False, "inner_unb": False, "alt": False, "mult": 1})
             i += 1
             if i < n and pattern[i] == "?":       # (?:  (?P<n>  (?=  (?!  (?<=  (?i) …: skip the marker
                 i += 1
@@ -593,7 +594,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
             prev_atom_end, last_quant = False, False
             continue
         if c == ")":
-            g = stack.pop() if stack else {"inner_q": False, "alt": False, "mult": 1}
+            g = stack.pop() if stack else {"inner_q": False, "inner_unb": False, "alt": False, "mult": 1}
             i += 1
             # quantifier after the group?
             q_unbounded, q_any, j, upper = _read_quant(pattern, i)
@@ -604,7 +605,9 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
                     unbounded += 1
                 if (q_unbounded or mult > MAX_GROUP_REPEAT) and (g["inner_q"] or g["alt"]):
                     problems.append("nested quantifier")
-                mark_quant()
+                elif upper > 1 and g["inner_unb"]:   # verification round 4: (?:a+){10}, (?:a{0,30}){0,10}
+                    problems.append("nested quantifier")
+                mark_quant(q_unbounded)
                 i = j
                 last_quant = True
             else:
@@ -612,6 +615,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
             # the group's own contents count as quantified/alternated for enclosing groups
             if stack:
                 stack[-1]["inner_q"] = stack[-1]["inner_q"] or g["inner_q"]
+                stack[-1]["inner_unb"] = stack[-1]["inner_unb"] or g["inner_unb"]
                 stack[-1]["alt"] = stack[-1]["alt"] or g["alt"]
                 stack[-1]["mult"] = max(stack[-1]["mult"], min(mult, REPEAT_INF))
             prev_atom_end = True
@@ -627,7 +631,7 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
             if q_any:
                 if q_unbounded:
                     unbounded += 1
-                mark_quant()
+                mark_quant(q_unbounded)
                 i = j
                 last_quant = True
                 continue
@@ -639,9 +643,15 @@ def _scan_regex(pattern: str) -> Tuple[int, List[str]]:
 REPEAT_INF = 1 << 30
 
 
+# Verification round 4: a bounded repeat whose count can vary by more than this (``a{0,300}``, ``.{0,199}``)
+# backtracks like an unbounded one, so the safety rules treat it as unbounded (``x{40}``, ``\d{1,3}`` stay bounded)
+LARGE_REPEAT_RANGE = 16
+
+
 def _read_quant(p: str, i: int) -> Tuple[bool, bool, int, int]:
     """(unbounded, is_quantifier, end index, upper bound) of a quantifier at p[i] (incl. a lazy/possessive
-    suffix); the upper bound is REPEAT_INF when unbounded."""
+    suffix); the upper bound is REPEAT_INF when unbounded. A ``{m,n}`` with n - m > LARGE_REPEAT_RANGE counts as
+    unbounded (verification round 4)."""
     n = len(p)
     if i >= n:
         return False, False, i, 1
@@ -651,14 +661,17 @@ def _read_quant(p: str, i: int) -> Tuple[bool, bool, int, int]:
     elif c == "?":
         unb, j, upper = False, i + 1, 1
     elif c == "{":
-        m = re.match(r"\{(\d*)(,?)(\d*)\}", p[i:])
+        m = re.match(r"\{(\d{0,12})(,?)(\d{0,12})\}", p[i:i + 40])
         if not m or (not m.group(1) and not m.group(3)):
             return False, False, i, 1
         unb = bool(m.group(2)) and not m.group(3)
+        lower = int(m.group(1) or 0)
         if unb:
             upper = REPEAT_INF
         else:
             upper = min(REPEAT_INF, int(m.group(3) or m.group(1)))
+            if upper - lower > LARGE_REPEAT_RANGE:
+                unb, upper = True, REPEAT_INF
         j = i + m.end()
     else:
         return False, False, i, 1
@@ -754,7 +767,7 @@ def _overlap_problem(pattern: str, flags: int = 0) -> Optional[str]:
                 if inner:
                     return inner
                 cs = _charset(body, icase, dotall, P)
-                if hi == maxrep or hi >= REPEAT_INF:
+                if hi == maxrep or hi >= REPEAT_INF or hi - lo > LARGE_REPEAT_RANGE:
                     if st["inter"] is not None and st["inter"] & cs:
                         if st["adjacent"]:
                             return "adjacent unbounded quantifiers over overlapping characters"

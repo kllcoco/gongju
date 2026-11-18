@@ -129,6 +129,56 @@ class TestJsonContainerCap(unittest.TestCase):
 
 
 
+class TestBoundedRepeats(unittest.TestCase):
+    def test_large_ranges_count_as_unbounded(self):
+        from hive import fsops
+        for bad in (r"a{0,300}a{0,300}a{0,300}c", r"a{0,65535}a{0,65535}c", r"[ab]{0,99}[ab]{0,99}[ab]{0,99}[ab]{0,99}c",
+                    r"\w{0,99}\d{0,99}\w{0,99}\d{0,99}x", r".{0,199}.{0,199}.{0,199}!", r"(?:a{0,30}){0,10}c",
+                    r"(?:a+){10}c", r"(?:a+){2}c", r"a{,300}a{,300}c", r"a{0,99}b{0,99}c{0,99}d{0,99}e{0,99}"):
+            with self.subTest(pattern=bad):
+                with self.assertRaises(HiveError) as cm:
+                    fsops.check_regex(bad)
+                self.assertEqual(cm.exception.code, "bad_request")
+        for ok in (r"x{3}y{2,4}", r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", r"(\d{1,3}\.){3}\d{1,3}", r"[0-9a-f]{40}",
+                   r"\d{4}-\d{2}-\d{2}", r".{1,100}", r"x{0,1000}y", r"(?:ab){0,30}c", r"a{0,16}a{0,16}c"):
+            with self.subTest(pattern=ok):
+                self.assertIsNotNone(fsops.check_regex(ok))
+
+    def test_regex_search_deadline_capped(self):
+        from hive.actions import files
+        self.assertLessEqual(files.REGEX_SEARCH_MAX_S, 120)
+
+
+class TestListenBacklog(unittest.TestCase):
+    def test_backlog_scales_with_max_connections(self):
+        from hive.httpserver import _ConnTable, listen_backlog
+        self.assertEqual(listen_backlog(_ConnTable(64)), 256)
+        self.assertEqual(listen_backlog(_ConnTable(256)), 1024)
+        self.assertEqual(listen_backlog(_ConnTable(4096)), 1024)
+        self.assertEqual(listen_backlog(_ConnTable(4)), 64)
+        s = Server(max_connections=256)
+        self.addCleanup(s.stop)
+        self.assertEqual({x.request_queue_size for x in s.api._servers}, {1024})
+
+    def test_connect_burst_is_queued(self):
+        # 600 connects at once without accept-thread help: none refused / reset, the owner is still answered
+        s = Server()
+        self.addCleanup(s.stop)
+        socks = []
+        try:
+            for _ in range(600):
+                socks.append(socket.create_connection(("127.0.0.1", s.port), timeout=5))
+            t0 = time.monotonic()
+            rq = urllib.request.Request(f"http://127.0.0.1:{s.port}/v1/echo",
+                                        headers={"Authorization": f"Bearer {T['owner']}"})
+            with urllib.request.urlopen(rq, timeout=10) as r:
+                self.assertEqual(r.status, 200)
+            self.assertLess(time.monotonic() - t0, 5.0)
+        finally:
+            for c in socks:
+                c.close()
+
+
 class TestHubBodies(_HubMcp):
     def test_mcp_and_call_refuse_container_soup(self):
         body = b"[" + b"[]," * (1 << 20) + b"[]]"
