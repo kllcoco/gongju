@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hive-agent"
+dynamic = ["version"]
+description = "Hive (蜂巢): let AI agents operate your own machines — commands, files, jobs, model servers — safely"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["mcp", "agents", "remote", "llm", "vllm", "ollama"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Environment :: Console",
+]
+
+[project.optional-dependencies]
+full = ["psutil"]
+
+[project.scripts]
+hive = "hive.cli:main"
+
+[tool.setuptools]
+packages = ["hive", "hive.actions"]
+
+[tool.setuptools.dynamic]
+version = { attr = "hive.__version__" }

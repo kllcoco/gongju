@@ -1,9 +1,10 @@
 """argparse CLI ``hive`` (design §19, WP6).
 
-WP6a part: ``init node|hub|client``, ``node run|status|stop|restart|pause|resume|panic|token …|secret …``, ``call``,
-``sh``, ``mcp`` (stdio), ``tools export``, ``nodes``, ``actions``, ``version``. The remaining commands (hub, gateway,
-approvals, service install, doctor, push/pull, logs, join, mcp-config, tls-pin, audit, dist) arrive with WP6b and
-answer "not available yet" (exit 2).
+``init node|hub|client``, ``join``, ``node …`` (run/status/stop/restart/pause/resume/panic/token/secret), ``hub …``
+(run/stop/restart/status/list/add-node/add-agent/remove-node/remove-agent/rotate-token/ack-node/restart-node),
+``gateway token|url``, ``approvals …``, ``mcp`` (stdio), ``mcp-config``, ``tools export``, ``nodes``, ``actions``,
+``call``, ``sh``, ``push``/``pull``, ``logs``, ``service install|uninstall|status``, ``tls-pin``, ``doctor``,
+``audit tail``, ``dist build``, ``version``.
 
 Exit codes (§19): 0 ok; 1 action error; 2 usage/config error; 3 auth error (unauthorized/forbidden/policy_denied);
 4 unavailable/timeout. ``hive sh`` exits with the remote exit code (0–255), 125 for Hive-level failures, 124 for
@@ -14,9 +15,11 @@ This module is one of the two places allowed to print and to use ``util.iso()`` 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import getpass
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -28,8 +31,6 @@ from .errors import HiveError, conflict
 
 EXIT_OK, EXIT_ACTION, EXIT_USAGE, EXIT_AUTH, EXIT_UNAVAILABLE = 0, 1, 2, 3, 4
 SH_FAILURE, SH_TIMEOUT = 125, 124
-WP6B = ("hub", "gateway", "approvals", "service", "doctor", "push", "pull", "logs", "join", "mcp-config",
-        "tls-pin", "audit", "dist")
 TOKEN_WARNING = "warning: --token is visible in ps and shell history; prefer --token-env/--token-file"
 HUB_REVOKE_LINE = "if a hub routes agents here, also run on the hub: hive approvals revoke --all --hub"
 
@@ -939,6 +940,1483 @@ def cmd_tools_export(args: argparse.Namespace, out: Out) -> int:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# WP6b: join
+
+def _join_code(args: argparse.Namespace) -> str:
+    code = args.code
+    if code == "-":
+        code = (sys.stdin.readline() if sys.stdin is not None else "").strip()
+    elif not code:
+        code = (os.environ.get("HIVE_JOIN") or "").strip()
+    if not code:
+        raise CliError("no join code", hint="HIVE_JOIN='hvj1.…' hive join   (or: echo CODE | hive join -)")
+    if args.code and args.code != "-":
+        sys.stderr.write("warning: a join code on the command line is visible in ps and shell history; prefer "
+                         "HIVE_JOIN='…' hive join\n")
+    return code
+
+
+def _detect_pod(args: argparse.Namespace) -> bool:
+    if args.no_pod:
+        return False
+    if args.pod or os.environ.get("HIVE_TOPOLOGY") == "pod":
+        return True
+    try:
+        from . import sysinfo
+        return sysinfo.cloud_info().get("provider") in ("runpod", "vast", "autodl")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _join_hub_check(jd: dict, relay_proxy: Optional[str]) -> Optional[str]:
+    """Reach the hub before the relay token is ever sent (system CAs or the join-code pin, §20.4); returns a warning
+    text when it cannot be reached (the config is still written: the node retries)."""
+    from types import SimpleNamespace
+    from . import relay
+    from .config import _relay_insecure_ok
+    url = str(jd.get("u") or "")
+    try:
+        cfg = SimpleNamespace(hub_url=url, tls_pin=jd.get("p"), ca_file=None, proxy=relay_proxy or "auto",
+                              allow_insecure=_relay_insecure_ok(url))
+        tr = relay.relay_transport(cfg, token=None, timeout=15)
+        try:
+            tr.request("GET", "/v1/health")
+        finally:
+            tr.close()
+    except HiveError as e:
+        if e.code == "policy_denied" or (e.details or {}).get("reason") == "tls_pin":
+            raise
+        return f"{e.code}: {e.message}"
+    return None
+
+
+def cmd_join(args: argparse.Namespace, out: Out) -> int:
+    """``hive join [CODE | -] …`` (= init node --join CODE [--pod] [--wsl] + optional service install, §19)."""
+    from . import config
+    from .dist import decode_join
+    code = _join_code(args)
+    try:
+        jd = decode_join(code)
+    except HiveError as e:
+        raise CliError(f"invalid join code: {e.message}", hint=e.hint)
+    paths = config.default_paths()
+    cfg_path = paths["node_config"]
+    exists = cfg_path.exists() and not args.force
+    pod = _detect_pod(args)
+    relay_proxy = args.relay_proxy or os.environ.get("HIVE_RELAY_PROXY") or None
+    proxy = args.proxy if args.proxy is not None else (os.environ.get("HIVE_PROXY") or None)
+    if not exists and not args.yes and sys.stdin is not None and sys.stdin.isatty():
+        _ask_consent(args, "node")
+    warn = _join_hub_check(jd, relay_proxy)
+    if warn:
+        out.line(f"warning: the hub at {jd.get('u')} is not reachable now ({warn}); the node keeps retrying")
+    if exists:
+        ignored = [f for f, v in (("--preset", args.preset is not None), ("--wsl", args.wsl), ("--pod", args.pod),
+                                  ("--mirror", args.mirror is not None), ("--proxy", args.proxy is not None),
+                                  ("--models-dir", args.models_dir is not None)) if v]
+        if ignored:
+            out.line(f"note: {', '.join(ignored)} applies only when creating a config; use --force to rewrite")
+    try:
+        cfg, toks = config.init_node(
+            name=(args.name.lower() if args.name else None) if not exists else None,
+            preset=args.preset or "standard", topology="pod" if (pod and not exists) else None,
+            relay_role=args.relay_role if exists else (args.relay_role or "operator"), relay_proxy=relay_proxy,
+            join=code, proxy=None if exists else proxy, mirror=None if exists else args.mirror,
+            models_dir=None if exists else args.models_dir, wsl=bool(args.wsl) and not exists,
+            consent_by="join", force=args.force)
+    except HiveError as e:
+        out.error(e.code, e.message, e.hint)
+        return EXIT_USAGE
+    if toks:
+        hf = os.environ.get("HIVE_HF_ENDPOINT")
+
+        def fix(raw: dict) -> None:
+            raw["consent"] = {"by": "join", "at": util.iso_utc(), "text": "consent given by join code"}
+            if hf:
+                raw.setdefault("models", {})["hf_endpoint"] = hf
+        config.edit_config(cfg_path, fix, kind="node")
+        cfg = config.load_node_config(str(cfg_path))
+        out.line(f"node '{cfg.name}' joined {cfg.relay.hub_url} (config {cfg_path})")
+    else:
+        out.line(f"relay settings of node '{cfg.name}' updated in {cfg_path} (listen, roots, proxy and tokens kept)")
+    out.line(f"the hub may do on this machine what role {cfg.relay.role} allows"
+             + ("; --relay-role files to narrow" if cfg.relay.role == "operator" else ""))
+    if pod and not exists:
+        out.line("pod topology applied (data under /workspace survives pod restarts)")
+    if exists:
+        _restart_daemon("node", out, no_restart=args.no_restart)
+    if args.install:
+        from . import install
+        try:
+            res = install.install("node", cfg_path, method="watchdog" if pod else "auto")
+        except HiveError as e:
+            out.error(e.code, e.message, e.hint)
+            return exit_code_for(e)
+        _print_install(res, out)
+    elif toks:
+        out.line("next: hive node run   (foreground)   or   hive service install node")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: hub
+
+def _hub_config_path(args: argparse.Namespace) -> Path:
+    from .config import default_paths
+    return Path(os.path.expanduser(getattr(args, "config", None) or str(default_paths()["hub_config"])))
+
+
+def _hub_config(args: argparse.Namespace) -> Any:
+    from .config import load_hub_config
+    path = _hub_config_path(args)
+    if not path.exists():
+        raise CliError(f"no hub config at {path}", hint="run: hive init hub")
+    try:
+        return load_hub_config(str(path))
+    except HiveError as e:
+        raise CliError(f"{e.code}: {e.message}", hint=e.hint)
+
+
+def _hub_edit(args: argparse.Namespace, fn: Any) -> None:
+    from . import config
+    config.edit_config(_hub_config_path(args), fn, kind="hub")
+
+
+def _hub_client(args: argparse.Namespace) -> Any:
+    """Owner client of the hub on this machine (``hub-local``, §14.4) unless --connection names another."""
+    from .client import connect
+    return connect(getattr(args, "connection", None) or "hub-local")
+
+
+def _owner_request(client: Any, method: str, path: str, body: Optional[dict] = None) -> Any:
+    tr = getattr(client.target, "transport", None)
+    if tr is None:
+        raise CliError("this connection cannot reach owner routes")
+    return tr.request(method, path, body)
+
+
+def _hub_holder(cfg: Any) -> Optional[dict]:
+    return util.FileLock(Path(cfg.data_dir) / "hub.lock").holder()
+
+
+def _restart_hub(args: argparse.Namespace, out: Out) -> None:
+    _restart_daemon("hub", out, no_restart=getattr(args, "no_restart", False))
+
+
+def cmd_hub_run(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub run``."""
+    from .hub import run_hub
+    return run_hub(args.config, relaunched=args.relaunched, supervise=args.supervise)
+
+
+def cmd_hub_stop(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub stop`` (control.json "stop": exit 0, stays stopped, D55)."""
+    cfg = _hub_config(args)
+    d = Path(cfg.data_dir)
+    holder = _hub_holder(cfg)
+    if holder is None:
+        out.line("hub is not running")
+        return EXIT_OK
+    _write_control(d, "stop")
+    end = time.monotonic() + 30
+    while time.monotonic() < end:
+        if not util.pid_alive(int(holder.get("pid") or 0), holder.get("ctime")):
+            out.line("hub stopped")
+            return EXIT_OK
+        time.sleep(0.2)
+    out.error("timeout", "hub still running after 30 s", "check hive hub status")
+    return EXIT_UNAVAILABLE
+
+
+def cmd_hub_restart(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub restart`` (install.restart("hub"), §8.6)."""
+    from . import install
+    try:
+        install.restart("hub")
+    except HiveError as e:
+        out.error(e.code, e.message, e.hint or "stop it with hive hub stop and start it again with hive hub run")
+        return exit_code_for(e)
+    out.line("hub restarted")
+    return EXIT_OK
+
+
+def _node_notes(r: dict) -> str:
+    notes = []
+    if r.get("identity_changed"):
+        notes.append(f"IDENTITY CHANGED (check, then: hive hub ack-node {r.get('name')})")
+    if r.get("outdated"):
+        notes.append("outdated" + (" (auto-update)" if r.get("auto_update") else " (upgrade by hand)"))
+    return "; ".join(notes)
+
+
+def cmd_hub_status(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub status`` (via hub-local; marks outdated nodes and identity_changed)."""
+    client = None
+    try:
+        client = _hub_client(args)
+        who = client.whoami()
+        rows = client.nodes()
+    except HiveError as e:
+        if e.code != "unavailable":
+            raise
+        cfg = _hub_config(args)
+        h = _hub_holder(cfg)
+        if out.as_json:
+            out.data({"running": h is not None, "holder": h})
+        elif h is not None:
+            out.line(f"hub '{cfg.name}' holds its lock (pid {h.get('pid')}) but does not answer on hub-local")
+        else:
+            out.line(f"hub '{cfg.name}' is not running (start it: hive hub run, or hive service install hub)")
+        return EXIT_OK
+    finally:
+        if client is not None:
+            client.close()
+    if out.as_json:
+        out.data({"running": True, "server": who.get("server"), "nodes": rows})
+        return EXIT_OK
+    srv = who.get("server") or {}
+    out.foreign(f"hub '{srv.get('name')}' running (version {srv.get('version')}), {len(rows)} node(s)")
+    if rows:
+        out.line(_table([[r.get("name"), "online" if r.get("online") else "offline", r.get("mode"),
+                          r.get("os_label"), r.get("version"), _node_notes(r)] for r in rows],
+                        ["NAME", "STATE", "MODE", "OS", "VERSION", "NOTE"]))
+    return EXIT_OK
+
+
+def cmd_hub_list(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub list`` (configured nodes and tokens)."""
+    cfg = _hub_config(args)
+    nodes = [{"name": n.name, "mode": n.mode, "url": n.url, "tags": n.tags, "aliases": n.aliases,
+              "description": n.description} for n in cfg.nodes]
+    toks = [{"name": t.name, "kind": t.kind, "role": t.role, "classes": t.classes, "nodes": t.nodes,
+             "models": t.models, "approval": bool(t.require_approval), "expires": t.expires} for t in cfg.tokens]
+    if out.as_json:
+        out.data({"nodes": nodes, "tokens": toks})
+        return EXIT_OK
+    out.line(f"nodes ({len(nodes)}):")
+    if nodes:
+        out.line(_table([[n["name"], n["mode"], n["url"] or "-", ",".join(n["tags"]), ",".join(n["aliases"])]
+                         for n in nodes], ["NAME", "MODE", "URL", "TAGS", "ALIASES"]))
+    out.line(f"tokens ({len(toks)}):")
+    out.line(_table([[t["name"], t["kind"], ",".join(t["classes"]) if t["classes"] is not None else (t["role"] or "-"),
+                      ",".join(t["models"]) if t["kind"] == "models" else ",".join(t["nodes"] or []),
+                      "cautious" if t["approval"] else "-", t["expires"] or "-"] for t in toks],
+                    ["NAME", "KIND", "ROLE/CLASSES", "NODES/MODELS", "APPROVAL", "EXPIRES"]))
+    return EXIT_OK
+
+
+def _valid_new_name(name: str, what: str) -> str:
+    n = (name or "").lower()
+    if not util.valid_name(n):
+        raise CliError(f"invalid {what} name {name!r}", hint="lowercase letters, digits, . _ - (max 64)")
+    return n
+
+
+def _taken(cfg: Any, name: str) -> bool:
+    return any(n.name == name or name in (n.aliases or []) for n in cfg.nodes)
+
+
+def _pyz_sha() -> Optional[str]:
+    try:
+        from . import dist
+        return dist.pyz_sha256(dist.build_pyz())
+    except Exception:  # noqa: BLE001 - the printed block then names `hive dist build`
+        return None
+
+
+def _relay_block(cfg: Any, name: str, token: str, args: argparse.Namespace) -> List[str]:
+    from . import dist
+    info = dist.add_node_instructions(cfg, name, token, via=getattr(args, "via", None), pyz_sha256_hex=_pyz_sha(),
+                                      host=getattr(args, "host", None))
+    return list(info["lines"])
+
+
+def cmd_hub_add_node(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub add-node NAME --relay [--via] | --direct URL …``."""
+    cfg = _hub_config(args)
+    name = _valid_new_name(args.name, "node")
+    if _taken(cfg, name):
+        raise CliError(f"a node named {name!r} exists", hint=f"hive hub remove-node {name} first, or "
+                                                            f"hive hub rotate-token {name}")
+    if bool(args.relay) == bool(args.direct):
+        raise CliError("give --relay or --direct URL")
+    tags = _split(args.tags)
+    entry: Dict[str, Any] = {"name": name, "tags": tags, "description": args.description or ""}
+    lines: List[str] = []
+    if args.relay:
+        if any(getattr(args, k, None) for k in ("token", "token_file", "token_env", "generate", "tls_pin")):
+            raise CliError("--token*/--generate/--tls-pin go with --direct")
+        token = util.new_token()
+        lines = _relay_block(cfg, name, token, args)        # before writing: a bad_request leaves no entry behind
+        entry.update(mode="relay", token_sha256=util.hash_token(token))
+    else:
+        if args.via:
+            raise CliError("--via goes with --relay")
+        url = args.direct.rstrip("/")
+        if not url.lower().startswith(("http://", "https://")):
+            raise CliError("--direct needs an http(s):// URL", hint="e.g. http://desk.tail1234.ts.net:7701")
+        if args.generate:
+            token = util.new_token()
+            lines = [f"on the node '{name}', run (only the hash crosses machines):",
+                     f"  hive node token add hub-{cfg.name} --kind hub --sha256 {util.hash_token(token)}"]
+        else:
+            token = _read_token_arg(args, out) or ""
+            if not token:
+                raise CliError("--direct needs the node's hub token", hint="--token-file F, --token-env VAR or "
+                                                                           "--generate")
+        entry.update(mode="direct", url=url, token=token)
+        if args.tls_pin:
+            entry["tls_pin"] = args.tls_pin
+
+    def fn(raw: dict) -> None:
+        ns = raw.setdefault("nodes", [])
+        if any(isinstance(n, dict) and n.get("name") == name for n in ns):
+            raise conflict(f"a node named {name!r} exists")
+        ns.append(entry)
+    _hub_edit(args, fn)
+    out.line(f"node '{name}' added ({entry['mode']})")
+    for line in lines:
+        out.line(line)
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
+def _hub_urls(cfg: Any, *, here: bool = True) -> List[Tuple[str, str]]:
+    """(label, base URL) of the hub for other machines and, ``here``, for this machine (§8.7 URLs)."""
+    lst = cfg.listen
+    scheme = "https" if lst.tls.cert else "http"
+    port = int(lst.port)
+    out: List[Tuple[str, str]] = []
+    host = str(lst.host)
+    if host == "tailscale":
+        try:
+            from .httpserver import tailscale_info
+            ip, names, _note = tailscale_info()
+        except Exception:  # noqa: BLE001
+            ip, names = None, []
+        if ip:
+            out.append(("tailnet", f"{scheme}://{ip}:{port}"))
+        for n in names[:1]:
+            out.append(("magicdns", f"{scheme}://{n.rstrip('.')}:{port}"))
+    elif host in ("0.0.0.0", "::", "*"):
+        try:
+            hn = socket.gethostname()
+        except OSError:
+            hn = ""
+        if hn:
+            out.append(("lan", f"{scheme}://{hn}:{port}"))
+    elif not util.is_loopback_host(host):
+        out.append(("listen", f"{scheme}://{'[' + host + ']' if ':' in host else host}:{port}"))
+    if cfg.public_url:
+        out.append(("public", str(cfg.public_url).rstrip("/")))
+    if here:
+        out.append(("local", f"{scheme}://127.0.0.1:{port}"))
+    return out
+
+
+def _hub_local_nodes(cfg: Any) -> List[str]:
+    """Hub nodes on the hub's own machine (T5): loopback/own-tailnet/own-hostname direct URLs, `wsl-host:<hub host>`
+    tags."""
+    from urllib.parse import urlsplit
+    host = socket.gethostname().lower()
+    own: List[str] = []
+    try:
+        from .httpserver import tailscale_info
+        own = [tailscale_info()[0]]
+    except Exception:  # noqa: BLE001
+        own = []
+    out = []
+    for n in cfg.nodes:
+        h = ""
+        try:
+            h = (urlsplit(n.url or "").hostname or "").lower()
+        except ValueError:
+            h = ""
+        local = bool(n.mode == "direct" and h and (util.is_loopback_host(h) or h in own or h == host or
+                                                   h.startswith(host + ".")))
+        if any(str(t).lower() == f"wsl-host:{host}" for t in (n.tags or [])):
+            local = True
+        if local:
+            out.append(n.name)
+    return out
+
+
+def _role_has_exec(role: Optional[str], classes: Optional[List[str]] = None) -> bool:
+    from .auth import ROLE_PRESETS
+    if classes is not None:
+        return "exec" in classes
+    return "exec" in ROLE_PRESETS.get(role or "operator", set())
+
+
+def _token_entry_args(args: argparse.Namespace, *, kind: str = "agent") -> Dict[str, Any]:
+    from .auth import CAUTIOUS_ACTIONS
+    entry: Dict[str, Any] = {"kind": kind, "role": args.role or "operator"}
+    nodes = ["*"] if (args.nodes or "*").strip() == "*" else _split(args.nodes)
+    if not nodes:
+        raise CliError("--nodes is empty", hint="'*' or a comma-separated list of node names/globs")
+    entry["nodes"] = nodes
+    if args.deny:
+        entry["deny_actions"] = _split(args.deny)
+    if args.approval and args.cautious:
+        raise CliError("give --approval or --cautious, not both")
+    if args.approval:
+        entry["require_approval"] = _split(args.approval)
+    elif args.cautious:
+        entry["require_approval"] = list(CAUTIOUS_ACTIONS)
+    if args.expires:
+        try:
+            util.parse_iso(args.expires)
+        except HiveError:
+            raise CliError(f"invalid --expires {args.expires!r}", hint="YYYY-MM-DD")
+        entry["expires"] = args.expires
+    return entry
+
+
+def _mcp_remote_line(base: str, token: str) -> str:
+    return (f'claude mcp add --transport http hive "{base}/mcp?wait_budget=110" --header '
+            f'"Authorization: Bearer {token}"')
+
+
+def cmd_hub_add_agent(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub add-agent NAME …``: prints the token once, the init client command and MCP snippets."""
+    cfg = _hub_config(args)
+    name = _valid_new_name(args.name, "token")
+    if any(t.name == name for t in cfg.tokens):
+        raise CliError(f"a token named {name!r} exists", hint=f"hive hub remove-agent {name} first, or "
+                                                             f"hive hub rotate-token {name}")
+    entry = _token_entry_args(args)
+    token = util.new_token()
+    entry.update(name=name, sha256=util.hash_token(token))
+
+    def fn(raw: dict) -> None:
+        toks = raw.setdefault("tokens", [])
+        if any(isinstance(t, dict) and t.get("name") == name for t in toks):
+            raise conflict(f"a token named {name!r} exists")
+        toks.append(entry)
+    _hub_edit(args, fn)
+    urls = [u for lab, u in _hub_urls(cfg, here=False) if lab != "magicdns"] or \
+        [u for _lab, u in _hub_urls(cfg, here=True)]
+    base = urls[0]
+    out.line(f"agent token '{name}' added (role {entry['role']}, nodes {','.join(entry['nodes'])}"
+             + (", approvals required" if entry.get("require_approval") else "") + ")")
+    out.line("token (shown once; save it in a file on the agent's machine, never in an agent config):")
+    out.line(token)
+    out.line("")
+    out.line("on the agent's machine:")
+    out.line(f"  1. save the token to ~/.hive/tokens/{cfg.name}.token")
+    out.line(f"  2. hive init client --name {cfg.name} --url {base} --token-file ~/.hive/tokens/{cfg.name}.token "
+             f"--default")
+    out.line("  3. MCP for Claude Desktop/Cursor: hive mcp-config --client claude-desktop   (Claude Code: "
+             "--client claude-code)")
+    if len(urls) > 1:
+        out.line("  other hub addresses: " + ", ".join(urls[1:]))
+    https = [u for u in urls if u.startswith("https://")]
+    if https and cfg.listen.mcp_http:
+        out.line("remote MCP (Claude Code over HTTP; the only case where a token appears in an agent config):")
+        out.line("  " + _mcp_remote_line(https[0], token))
+    if _role_has_exec(entry.get("role")) and not entry.get("require_approval"):
+        local = [n for n in _hub_local_nodes(cfg) if any(fnmatch.fnmatchcase(n, g) for g in entry["nodes"])]
+        if local:
+            out.line(f"warning: this token can run commands on {', '.join(local)} (the hub's machine): an "
+                     "exec-capable agent on the hub machine can act as the hub (all nodes, approvals, auto-update "
+                     "pods); consider --cautious")
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
+def cmd_hub_remove_node(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub remove-node NAME``."""
+    cfg = _hub_config(args)
+    name = args.name.lower()
+    if not any(n.name == name for n in cfg.nodes):
+        out.error("not_found", f"no node named {name!r}", "hive hub list")
+        return EXIT_ACTION
+
+    def fn(raw: dict) -> None:
+        raw["nodes"] = [n for n in raw.get("nodes") or [] if not (isinstance(n, dict) and n.get("name") == name)]
+        if raw.get("default_node") == name:
+            raw["default_node"] = None
+    _hub_edit(args, fn)
+    out.line(f"node '{name}' removed (its relay token no longer works)")
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
+def cmd_hub_remove_agent(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub remove-agent NAME``."""
+    cfg = _hub_config(args)
+    name = args.name.lower()
+    tok = [t for t in cfg.tokens if t.name == name]
+    if not tok:
+        out.error("not_found", f"no token named {name!r}", "hive hub list")
+        return EXIT_ACTION
+    if tok[0].kind == "owner":
+        out.error("conflict", "this is the hub's owner token", "the local CLI needs it")
+        return EXIT_ACTION
+
+    def fn(raw: dict) -> None:
+        raw["tokens"] = [t for t in raw.get("tokens") or [] if not (isinstance(t, dict) and t.get("name") == name)]
+    _hub_edit(args, fn)
+    out.line(f"token '{name}' removed")
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
+def cmd_hub_rotate_token(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub rotate-token NAME``: a relay node gets a fresh join block (the revocation path of a leaked code);
+    a direct node a new hub token (only its hash goes to the node); an agent/models token a new token."""
+    cfg = _hub_config(args)
+    name = args.name.lower()
+    node = [n for n in cfg.nodes if n.name == name]
+    tok = [t for t in cfg.tokens if t.name == name]
+    token = util.new_token()
+    lines: List[str] = []
+    if node:
+        n = node[0]
+        if n.mode == "relay":
+            lines = _relay_block(cfg, name, token, args)
+
+            def fn(raw: dict) -> None:
+                for e in raw.get("nodes") or []:
+                    if isinstance(e, dict) and e.get("name") == name:
+                        e["token_sha256"] = util.hash_token(token)
+        else:
+            lines = [f"on the node '{name}', replace the hub token (only the hash crosses machines):",
+                     f"  hive node token revoke hub-{cfg.name}",
+                     f"  hive node token add hub-{cfg.name} --kind hub --sha256 {util.hash_token(token)}"]
+
+            def fn(raw: dict) -> None:
+                for e in raw.get("nodes") or []:
+                    if isinstance(e, dict) and e.get("name") == name:
+                        e["token"] = token
+    elif tok:
+        if tok[0].kind == "owner":
+            raise CliError("the owner token is rotated with: hive init hub --force")
+        lines = ["new token (shown once; replace it in the token file on the agent's/app's machine):", token]
+
+        def fn(raw: dict) -> None:
+            for e in raw.get("tokens") or []:
+                if isinstance(e, dict) and e.get("name") == name:
+                    e["sha256"] = util.hash_token(token)
+    else:
+        out.error("not_found", f"no node or token named {name!r}", "hive hub list")
+        return EXIT_ACTION
+    _hub_edit(args, fn)
+    out.line(f"'{name}': the old token no longer works")
+    for line in lines:
+        out.line(line)
+    _restart_hub(args, out)
+    return EXIT_OK
+
+
+def _show_pending(out: Out, name: str, pending: dict) -> None:
+    out.foreign(f"pending registration for '{name}': from {pending.get('ip')} at {pending.get('at')}, hostname "
+                f"{pending.get('hostname') or '-'}, pod {pending.get('pod_id') or '-'}, key "
+                f"{str(pending.get('sha256') or '')[:19]}…")
+
+
+def _ack_offline(cfg: Any, name: str, args: argparse.Namespace, out: Out) -> int:
+    """ack-node with the hub down: edit relay_ids.json under hub.lock (§19)."""
+    d = Path(cfg.data_dir)
+    if not any(n.name == name and n.mode == "relay" for n in cfg.nodes):
+        out.error("not_found", f"no relay node named {name!r}", "hive hub list")
+        return EXIT_ACTION
+    lock = util.FileLock(d / "hub.lock")
+    if not lock.acquire(note="ack-node"):
+        out.error("unavailable", "the hub holds its lock but does not answer on hub-local", "try again")
+        return EXIT_UNAVAILABLE
+    try:
+        path = d / "state" / "relay_ids.json"
+        data = util.read_json(path, {}) or {}
+        rec = ((data.get("nodes") or {}).get(name)) if isinstance(data, dict) else None
+        if not isinstance(rec, dict) or not rec.get("pending_sha256"):
+            out.line(f"no pending registration for '{name}'")
+            return EXIT_OK
+        pending = dict(rec.get("pending") or {}, sha256=rec["pending_sha256"])
+        _show_pending(out, name, pending)
+        seen, at = rec.get("bound_seen_at"), pending.get("at")
+        if seen and at and str(seen) > str(at):
+            out.error("conflict", "the bound instance registered after this attempt",
+                      f"rotate the token instead: hive hub rotate-token {name}")
+            return EXIT_ACTION
+        if not _confirm(f"Bind '{name}' to this new instance?", yes=args.yes):
+            out.line("not changed")
+            return EXIT_USAGE
+        rec.update(key_sha256=rec["pending_sha256"], pending_sha256=None, pending=None, bound_at=util.iso_utc(),
+                   bound_seen_at=None)
+        util.write_json_atomic(path, data, private=True)
+        out.line(f"'{name}' bound to the new instance (takes effect when the hub starts)")
+        return EXIT_OK
+    finally:
+        lock.release()
+
+
+def cmd_hub_ack_node(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub ack-node NAME [--yes]`` (POST /v1/hub/nodes/{name}/ack over hub-local, §7.1)."""
+    name = args.name.lower()
+    client = None
+    try:
+        client = _hub_client(args)
+        prev = _owner_request(client, "POST", f"/v1/hub/nodes/{name}/ack", {})
+        pending = prev.get("pending")
+        if not pending:
+            out.line(f"no pending registration for '{name}'")
+            return EXIT_OK
+        _show_pending(out, name, pending)
+        if not _confirm(f"Bind '{name}' to this new instance (check the IP/hostname is your pod)?", yes=args.yes):
+            out.line("not changed")
+            return EXIT_USAGE
+        res = _owner_request(client, "POST", f"/v1/hub/nodes/{name}/ack", {"pending_sha256": pending.get("sha256")})
+    except HiveError as e:
+        if e.code == "unavailable" and (e.details or {}).get("reason") in ("connect", "dns", None):
+            return _ack_offline(_hub_config(args), name, args, out)
+        raise
+    finally:
+        if client is not None:
+            client.close()
+    if res.get("bound"):
+        out.line(f"'{name}' bound to the new instance")
+        return EXIT_OK
+    out.error("conflict", str(res.get("refused") or "not bound"), f"or: hive hub rotate-token {name}")
+    return EXIT_ACTION
+
+
+# seams for the --outdated waits (tests use a fake clock)
+_now = time.monotonic
+_sleep = time.sleep
+
+
+def cmd_hub_restart_node(args: argparse.Namespace, out: Out) -> int:
+    """``hive hub restart-node NAME | --outdated`` (relay refresh "restart" via the hub owner route, D49)."""
+    if bool(args.name) == bool(args.outdated):
+        raise CliError("give NAME or --outdated")
+    client = _hub_client(args)
+    try:
+        if args.name:
+            res = _owner_request(client, "POST", f"/v1/hub/nodes/{args.name.lower()}/restart", {})
+            if res.get("queued"):
+                out.line(f"restart queued for '{args.name}' (applies at its next poll)")
+                return EXIT_OK
+            out.error("unavailable", f"'{args.name}' is offline (or its identity changed); nothing queued")
+            return EXIT_UNAVAILABLE
+        cfg = _hub_config(args)
+        relay_names = [n.name for n in cfg.nodes if n.mode == "relay"]
+        offline_after = float(cfg.relay.offline_after or 75)
+        end = _now() + offline_after
+        rows: List[dict] = []
+        while True:
+            rows = [r for r in client.nodes() if r.get("name") in relay_names]
+            missing = [n for n in relay_names if not any(r.get("name") == n and r.get("online") for r in rows)]
+            if not missing or _now() >= end:
+                break
+            out.line(f"waiting for relay nodes to come online: {', '.join(missing)}")
+            _sleep(5)
+        outdated = [r for r in rows if r.get("outdated") and r.get("online")]
+        queued = []
+        for r in outdated:
+            if not r.get("auto_update"):
+                out.line(f"{r.get('name')}: outdated (version {r.get('version')}), auto_update off: upgrade by hand")
+                continue
+            res = _owner_request(client, "POST", f"/v1/hub/nodes/{r.get('name')}/restart", {})
+            if res.get("queued"):
+                queued.append(r.get("name"))
+                out.line(f"{r.get('name')}: restart queued")
+        if not queued:
+            out.line("no auto-updating outdated relay node to restart")
+            return EXIT_OK
+        end = _now() + 180
+        left = list(queued)
+        while left and _now() < end:
+            _sleep(5)
+            cur = {r.get("name"): r for r in client.nodes()}
+            left = [n for n in left if not (cur.get(n, {}).get("online") and not cur.get(n, {}).get("outdated"))]
+        if left:
+            out.line("still outdated or offline: " + ", ".join(str(n) for n in left))
+            return EXIT_UNAVAILABLE
+        out.line("all restarted nodes are up to date")
+        return EXIT_OK
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: gateway (§8.7)
+
+def _gateway_side(args: argparse.Namespace) -> str:
+    from .config import default_paths
+    if args.hub and args.node:
+        raise CliError("give --hub or --node, not both")
+    if args.node:
+        return "node"
+    if args.hub or default_paths()["hub_config"].exists():
+        return "hub"
+    return "node"
+
+
+def cmd_gateway_token_add(args: argparse.Namespace, out: Out) -> int:
+    """``hive gateway token add NAME --models 'node/service,…' [--hub|--node] [--expires DATE]``."""
+    from . import config
+    side = _gateway_side(args)
+    name = _valid_new_name(args.name, "token")
+    models = _split(args.models)
+    if not models:
+        raise CliError("--models is empty", hint="e.g. --models 'desk-wsl/qwen,pod-a/*'" if side == "hub"
+                       else "e.g. --models 'qwen,ollama'")
+    for m in models:
+        if side == "hub" and m.count("/") != 1:
+            raise CliError(f"hub gateway globs are node/service: {m!r}", hint="e.g. desk-wsl/qwen or pod-a/*")
+        if side == "node" and "/" in m:
+            raise CliError(f"node gateway globs are service names: {m!r}", hint="e.g. qwen or *")
+    token = util.new_token()
+    entry: Dict[str, Any] = {"name": name, "sha256": util.hash_token(token), "kind": "models", "models": models}
+    if args.expires:
+        try:
+            util.parse_iso(args.expires)
+        except HiveError:
+            raise CliError(f"invalid --expires {args.expires!r}", hint="YYYY-MM-DD")
+        entry["expires"] = args.expires
+    if side == "hub":
+        cfg = _hub_config(args)
+        if any(t.name == name for t in cfg.tokens):
+            raise CliError(f"a token named {name!r} exists", hint=f"hive gateway token revoke {name}")
+
+        def fn(raw: dict) -> None:
+            raw.setdefault("tokens", []).append(entry)
+        _hub_edit(args, fn)
+    else:
+        cfg = _node_config(args)
+        if any(t.name == name for t in cfg.auth.tokens):
+            raise CliError(f"a token named {name!r} exists", hint=f"hive gateway token revoke {name} --node")
+
+        def fn(raw: dict) -> None:
+            raw.setdefault("auth", {}).setdefault("tokens", []).append(entry)
+        config.edit_config(Path(cfg._path), fn, kind="node")
+    out.line(f"gateway token '{name}' for {', '.join(models)} ({side})")
+    out.line("API key (shown once; paste it only into the app's settings, never into a chat):")
+    out.line(token)
+    first = models[0]
+    if side == "hub" and "*" not in first:
+        node, svc = first.split("/", 1)
+        out.line(f"app settings: hive gateway url {node} {svc}")
+    elif side == "node" and "*" not in first:
+        out.line(f"app settings: hive gateway url self {first} --node")
+    else:
+        out.line("app settings: hive gateway url NODE SERVICE" + (" --node" if side == "node" else ""))
+    _restart_daemon(side, out, no_restart=args.no_restart)
+    return EXIT_OK
+
+
+def cmd_gateway_token_list(args: argparse.Namespace, out: Out) -> int:
+    """``hive gateway token list [--hub|--node]``."""
+    side = _gateway_side(args)
+    toks = (_hub_config(args).tokens if side == "hub" else _node_config(args).auth.tokens)
+    rows = [{"name": t.name, "models": t.models, "expires": t.expires} for t in toks if t.kind == "models"]
+    if out.as_json:
+        out.data(rows)
+    else:
+        out.line(_table([[r["name"], ",".join(r["models"]), r["expires"] or "-"] for r in rows],
+                        ["NAME", "MODELS", "EXPIRES"]))
+    return EXIT_OK
+
+
+def cmd_gateway_token_revoke(args: argparse.Namespace, out: Out) -> int:
+    """``hive gateway token revoke NAME [--hub|--node]``."""
+    from . import config
+    side = _gateway_side(args)
+    name = args.name.lower()
+    if side == "hub":
+        cfg = _hub_config(args)
+        toks = cfg.tokens
+    else:
+        cfg = _node_config(args)
+        toks = cfg.auth.tokens
+    if not any(t.name == name and t.kind == "models" for t in toks):
+        out.error("not_found", f"no gateway token named {name!r}", "hive gateway token list")
+        return EXIT_ACTION
+
+    def drop(lst: List[Any]) -> List[Any]:
+        return [t for t in lst if not (isinstance(t, dict) and t.get("name") == name and t.get("kind") == "models")]
+    if side == "hub":
+        def fn(raw: dict) -> None:
+            raw["tokens"] = drop(raw.get("tokens") or [])
+        _hub_edit(args, fn)
+    else:
+        def fn(raw: dict) -> None:
+            a = raw.setdefault("auth", {})
+            a["tokens"] = drop(a.get("tokens") or [])
+        config.edit_config(Path(cfg._path), fn, kind="node")
+    out.line(f"gateway token '{name}' revoked")
+    _restart_daemon(side, out, no_restart=args.no_restart)
+    return EXIT_OK
+
+
+def _gateway_models(base: str, token: str) -> List[str]:
+    """Model ids from ``GET <base>/v1/models`` (best effort)."""
+    from urllib.parse import urlsplit
+    from .transport import HttpTransport
+    u = urlsplit(base)
+    root = f"{u.scheme}://{u.netloc}"
+    tr = HttpTransport(root, token, timeout=15, proxy="auto")
+    try:
+        st, _h, body = tr.request("GET", u.path.rstrip("/") + "/v1/models", raw=True)
+    finally:
+        tr.close()
+    if int(st) != 200:
+        raise HiveError("unavailable", f"GET {u.path}/v1/models answered {st}")
+    data = json.loads(body.decode("utf-8", "replace"))
+    return [str(m.get("id")) for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")][:10]
+
+
+def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
+    """``hive gateway url NODE SERVICE [--connection C] [--token-file F] [--node]`` (§8.7 URLs)."""
+    from .config import default_paths
+    svc = args.service
+    if not re.match(r"^[a-z0-9][a-z0-9._-]{0,63}\Z", svc or ""):
+        raise CliError(f"invalid service name {svc!r}")
+    node = args.node_name.lower()
+    bases: List[Tuple[str, str]] = []
+    if args.node:
+        cfg = _node_config(args)
+        scheme = "https" if cfg.listen.tls.cert else "http"
+        bases.append(("apps on this PC", f"{scheme}://127.0.0.1:{cfg.listen.port}/openai/self/{svc}"))
+    elif args.connection:
+        from .config import load_client_config
+        cc = load_client_config()
+        conn = cc.connections.get(args.connection)
+        if conn is None:
+            raise CliError(f"no connection named {args.connection!r}", hint="hive init client …")
+        bases.append(("via your connection", f"{conn.url.rstrip('/')}/openai/{node}/{svc}"))
+    elif default_paths()["hub_config"].exists():
+        cfg = _hub_config(args)
+        labels = {"tailnet": "apps on your tailnet (recommended)",
+                  "magicdns": "alternative (MagicDNS name; not through a system proxy)",
+                  "lan": "apps on your LAN", "listen": "apps that reach the hub",
+                  "public": "browser apps on https pages / devices off the tailnet",
+                  "local": "apps on this PC"}
+        for lab, base in _hub_urls(cfg, here=True):
+            bases.append((labels[lab], f"{base}/openai/{node}/{svc}"))
+            if lab == "local":
+                docker = base.replace("127.0.0.1", "host.docker.internal")
+                bases.append(("apps in Docker Desktop on this PC", f"{docker}/openai/{node}/{svc}"))
+        if str(cfg.listen.host) == "tailscale" and not any(b[0].startswith("apps on your tailnet") for b in bases):
+            out.line("note: cannot read this machine's tailnet IP (is tailscale up?); start it for the tailnet URL")
+    else:
+        raise CliError("no hub config on this machine", hint="run it on the hub, or pass --connection C (a hub "
+                                                             "connection) or --node (this node's own gateway)")
+    model = "<model name>"
+    if args.token_file:
+        try:
+            tok = Path(os.path.expanduser(args.token_file)).read_text(encoding="utf-8-sig").strip().splitlines()[0]
+            probe = [b for lab, b in bases if lab == "apps on this PC"] or [bases[0][1]]
+            ids = _gateway_models(probe[0], tok)
+            if ids:
+                model = ids[0]
+                out.foreign("served models: " + ", ".join(ids))
+        except (OSError, IndexError, HiveError, ValueError) as e:
+            out.line(f"note: could not list the served models ({getattr(e, 'message', e)})")
+    for label, base in bases:
+        out.line(f"{label}:")
+        out.line(f"  Provider: OpenAI-compatible · Base URL: {base}/v1 · API key: <your gateway token> · Model: "
+                 f"{model}")
+        out.line(f"  Apps that add /v1 themselves (e.g. Cherry Studio): Base URL {base}")
+    if any(lab.startswith("apps on your tailnet") for lab, _b in bases):
+        out.line("if the app uses a system proxy (Clash …), add 100.64.0.0/10 and *.ts.net to its proxy bypass")
+    out.line("browser apps on an https:// page need the https (public) URL or a http://127.0.0.1 URL on the same "
+             "machine; a model_endpoints name such as ollama or lmstudio works as SERVICE too")
+    out.line("no token yet? hive gateway token add APP --models '" + (f"{svc}'" if args.node else f"{node}/{svc}'")
+             + (" --node" if args.node else ""))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: approvals (owner routes over this-pc-owner / hub-local)
+
+def _approval_places(args: argparse.Namespace) -> List[Tuple[str, str]]:
+    """[(where, connection)] for --node/--hub or every place on this machine."""
+    from .config import load_client_config
+    try:
+        cc = load_client_config()
+        conns = cc.connections
+    except HiveError:
+        conns = {}
+    places = []
+    if not getattr(args, "hub", False) and "this-pc-owner" in conns:
+        places.append(("node", "this-pc-owner"))
+    if not getattr(args, "node", False) and "hub-local" in conns:
+        places.append(("hub", "hub-local"))
+    if not places:
+        want = "node" if getattr(args, "node", False) else "hub" if getattr(args, "hub", False) else "node or hub"
+        raise CliError(f"no {want} on this machine (client.json has no this-pc-owner/hub-local connection)",
+                       hint="run this on the machine where the node or hub runs")
+    return places
+
+
+def _place_client(conn: str) -> Any:
+    from .client import connect
+    return connect(conn)
+
+
+def _not_running(where: str) -> str:
+    return f"{where} not running"
+
+
+def cmd_approvals_list(args: argparse.Namespace, out: Out) -> int:
+    """``hive approvals list [--node|--hub]``."""
+    rows: List[dict] = []
+    errors = 0
+    for where, conn in _approval_places(args):
+        c = _place_client(conn)
+        try:
+            res = _owner_request(c, "GET", "/v1/approvals")
+            for r in res.get("approvals") or []:
+                rows.append(dict(r, _where=where))
+        except HiveError as e:
+            errors += 1
+            out.line(f"{where}: {_not_running(where) if e.code == 'unavailable' else e.code + ': ' + e.message}")
+        finally:
+            c.close()
+    if out.as_json:
+        out.data(rows)
+        return EXIT_OK
+    if not rows:
+        out.line("no pending approvals")
+        return EXIT_OK if not errors or rows else EXIT_OK
+    for r in rows:
+        exp = r.get("expires")
+        out.foreign(f"{r.get('id')}  [{r.get('_where')}] {r.get('requester')} → {r.get('action')} on "
+                    f"{r.get('node') or '-'}  ({r.get('status')}, expires {exp})")
+        summ = r.get("summary")
+        if summ:
+            s = summ if isinstance(summ, str) else json.dumps(summ, ensure_ascii=False)
+            if len(s) > 300:
+                s = s[:300] + f" [TRUNCATED, {len(s) - 300} bytes hidden]"
+            out.foreign("    " + s)
+    out.line("decide: hive approvals approve ID [--for 30m]   |   hive approvals deny ID")
+    return EXIT_OK
+
+
+def _find_approval(args: argparse.Namespace, aid: str) -> Tuple[str, str, dict]:
+    if not re.match(r"^ap_[A-Za-z0-9_-]{6,40}\Z", aid or ""):
+        raise CliError(f"invalid approval id {aid!r}", hint="ids look like ap_…")
+    down = []
+    for where, conn in _approval_places(args):
+        c = _place_client(conn)
+        try:
+            res = _owner_request(c, "GET", "/v1/approvals?include_done=1")
+        except HiveError as e:
+            if e.code == "unavailable":
+                down.append(where)
+                continue
+            raise
+        finally:
+            c.close()
+        for r in res.get("approvals") or []:
+            if r.get("id") == aid:
+                return where, conn, r
+    if down and len(down) == len(_approval_places(args)):
+        raise HiveError("unavailable", " and ".join(_not_running(w) for w in down),
+                        hint="the approval lives in the running daemon")
+    raise HiveError("not_found", f"approval {aid} not found", hint="hive approvals list")
+
+
+def _page(out: Out, lines: List[str]) -> None:
+    """Print review lines (escaped), paged by 40 when interactive."""
+    tty = sys.stdin is not None and sys.stdin.isatty() and sys.stdout.isatty()
+    for i, line in enumerate(lines):
+        out.foreign(str(line))
+        if tty and i and i % 40 == 39 and i + 1 < len(lines):
+            try:
+                if input("-- more (Enter, q to stop) --").strip().lower() == "q":
+                    out.line(f"[{len(lines) - i - 1} more lines not shown]")
+                    return
+            except EOFError:
+                return
+
+
+def _parse_for(v: Optional[str]) -> Optional[int]:
+    if not v:
+        return None
+    m = re.match(r"^(\d+)\s*([mh]?)\Z", v.strip().lower())
+    if not m:
+        raise CliError(f"invalid --for {v!r}", hint="e.g. 30m or 2h")
+    n = int(m.group(1)) * (60 if m.group(2) == "h" else 1)
+    if n < 1:
+        raise CliError("--for must be at least 1m")
+    return n
+
+
+def _decide(args: argparse.Namespace, out: Out, approve: bool) -> int:
+    grant = _parse_for(getattr(args, "for_", None)) if approve else None
+    where, conn, rec = _find_approval(args, args.id)
+    if rec.get("status") != "pending":
+        out.error("conflict", f"approval {args.id} is {rec.get('status')}")
+        return EXIT_ACTION
+    out.foreign(f"{rec.get('id')} on {where}: {rec.get('requester')} wants {rec.get('action')} on "
+                f"{rec.get('node') or '-'}")
+    review = rec.get("review") if isinstance(rec.get("review"), dict) else {}
+    lines = review.get("lines") if isinstance(review.get("lines"), list) else None
+    if lines is None:
+        summ = rec.get("summary")
+        lines = (summ if isinstance(summ, str) else json.dumps(summ, ensure_ascii=False, indent=2)).splitlines()
+    _page(out, lines)
+    verb = "Approve" + (f" (and allow {rec.get('action')} for {grant} min)" if grant else "") if approve else "Deny"
+    if not _confirm(f"{verb} this call?", yes=args.yes):
+        out.line("nothing decided")
+        return EXIT_USAGE
+    body: Dict[str, Any] = {}
+    if grant:
+        body["grant_minutes"] = grant
+    c = _place_client(conn)
+    try:
+        res = _owner_request(c, "POST", f"/v1/approvals/{args.id}/{'approve' if approve else 'deny'}", body)
+    finally:
+        c.close()
+    out.line(f"{args.id}: {res.get('status')}" + (f"; grant {(res.get('grant') or {}).get('id')}" if grant else ""))
+    if approve:
+        out.line("the agent can now retry the same call with this approval_id")
+    return EXIT_OK
+
+
+def cmd_approvals_approve(args: argparse.Namespace, out: Out) -> int:
+    """``hive approvals approve ID [--for 30m] [--yes]`` (prints the full review before y/N)."""
+    return _decide(args, out, True)
+
+
+def cmd_approvals_deny(args: argparse.Namespace, out: Out) -> int:
+    """``hive approvals deny ID [--yes]``."""
+    return _decide(args, out, False)
+
+
+def cmd_approvals_grants(args: argparse.Namespace, out: Out) -> int:
+    """``hive approvals grants [--node|--hub]``."""
+    rows = []
+    for where, conn in _approval_places(args):
+        c = _place_client(conn)
+        try:
+            for g in _owner_request(c, "GET", "/v1/approvals/grants").get("grants") or []:
+                rows.append(dict(g, _where=where))
+        except HiveError as e:
+            if e.code != "unavailable":
+                raise
+            out.line(_not_running(where))
+        finally:
+            c.close()
+    if out.as_json:
+        out.data(rows)
+        return EXIT_OK
+    out.line(_table([[g.get("id"), g.get("_where"), g.get("identity"), g.get("action"), g.get("node"), g.get("until")]
+                     for g in rows], ["GRANT", "WHERE", "TOKEN", "ACTION", "NODE", "UNTIL"]))
+    return EXIT_OK
+
+
+def cmd_approvals_revoke(args: argparse.Namespace, out: Out) -> int:
+    """``hive approvals revoke [ID | --all] [--node|--hub]``."""
+    if bool(args.id) == bool(args.all):
+        raise CliError("give a grant ID or --all")
+    body: Dict[str, Any] = {"all": True} if args.all else {"id": args.id}
+    total = 0
+    code = EXIT_OK
+    for where, conn in _approval_places(args):
+        c = _place_client(conn)
+        try:
+            total += int(_owner_request(c, "POST", "/v1/approvals/grants/revoke", body).get("revoked") or 0)
+        except HiveError as e:
+            if e.code != "unavailable":
+                raise
+            out.line(_not_running(where))
+            code = EXIT_UNAVAILABLE
+        finally:
+            c.close()
+    out.line(f"revoked {total} grant(s)")
+    return code if total == 0 else EXIT_OK
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: mcp-config (§18.4)
+
+def _desktop_config_path() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+    if os.name == "nt":
+        return Path(os.environ.get("APPDATA") or Path.home()) / "Claude" / "claude_desktop_config.json"
+    return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+def _write_mcp_json(path: Path, server: dict, out: Out) -> None:
+    data: Dict[str, Any] = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig") or "{}")
+        except (OSError, ValueError) as e:
+            raise CliError(f"cannot read {path}: {e}", hint="fix or remove it, then run again")
+        if not isinstance(data, dict):
+            raise CliError(f"{path} is not a JSON object")
+        try:
+            Path(str(path) + ".bak").write_bytes(path.read_bytes())
+        except OSError:
+            pass
+    data.setdefault("mcpServers", {})["hive"] = server
+    path.parent.mkdir(parents=True, exist_ok=True)
+    util.atomic_write_bytes(path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+    out.line(f"wrote {path} (restart the app to load it)")
+
+
+def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
+    """``hive mcp-config [--client …] [--connection NAME | --local] [--remote] [--write] [--allow-owner]``."""
+    from .client import connect
+    from .config import load_client_config
+    cc = load_client_config()
+    if args.local:
+        conn = "this-pc"
+    elif args.connection:
+        conn = args.connection
+    else:
+        conn = cc.default or ""
+        if not conn:
+            raise CliError("client.json has no default connection", hint="pass --connection NAME or --local")
+        out.line(f"using the default connection '{conn}' (pass --connection NAME for another)")
+    if conn not in cc.connections:
+        raise CliError(f"no connection named {conn!r} in client.json",
+                       hint="hive init node (this-pc) or hive init client --name … --url …")
+    kind = None
+    try:
+        c = connect(conn)
+        try:
+            kind = ((c.whoami() or {}).get("identity") or {}).get("kind")
+        finally:
+            c.close()
+    except HiveError as e:
+        if conn in ("this-pc-owner", "hub-local"):
+            kind = "owner"
+        else:
+            out.line(f"note: could not check the token ({e.code}: {e.message}); the snippet is printed anyway")
+    if kind == "owner" and not args.allow_owner:
+        out.error("forbidden", f"connection '{conn}' uses an owner token",
+                  "agents should use an agent token; see this-pc (hive mcp-config --local), or pass --allow-owner")
+        return EXIT_AUTH
+    client = args.client or "claude-desktop"
+    if args.remote:
+        conn_obj = cc.connections[conn]
+        tok = None
+        try:
+            from .client import _read_token_file
+            tok = conn_obj.token or (_read_token_file(conn_obj.token_file, getattr(cc, "_path", None))
+                                     if conn_obj.token_file else None)
+        except Exception:  # noqa: BLE001
+            tok = None
+        base = conn_obj.url.rstrip("/")
+        out.line("warning: this puts the token into the agent's config (the only case where Hive does that); "
+                 "prefer stdio (drop --remote)")
+        if client == "claude-code":
+            out.line(_mcp_remote_line(base, tok or "<token>"))
+        else:
+            out.line(json.dumps({"mcpServers": {"hive": {"type": "http", "url": f"{base}/mcp?wait_budget=45",
+                                                         "headers": {"Authorization": f"Bearer {tok or '<token>'}"}}}},
+                                indent=2))
+        return EXIT_OK
+    cmd = _console_command()
+    if "-m" in cmd and sys.version_info < (3, 11):
+        out.line("warning: Hive is not installed as a command; the snippet uses python -m hive, which puts the MCP "
+                 "client's folder on sys.path. Install Hive with pip (pip install ./hive) for a safer snippet.")
+    margs = cmd[1:] + ["mcp", "--connection", conn]
+    if client == "claude-code":
+        line = "claude mcp add hive -- " + " ".join(_shq(a) for a in [cmd[0]] + margs + ["--wait-budget", "110"])
+        out.line(line)
+        return EXIT_OK
+    server = {"command": cmd[0], "args": margs}
+    if args.write:
+        if client == "cursor":
+            _write_mcp_json(Path.home() / ".cursor" / "mcp.json", server, out)
+        elif client == "claude-desktop":
+            _write_mcp_json(_desktop_config_path(), server, out)
+        else:
+            raise CliError("--write works with --client claude-desktop or cursor")
+        return EXIT_OK
+    out.line(json.dumps({"mcpServers": {"hive": server}}, indent=2))
+    if client == "cursor":
+        out.line("(put this into .cursor/mcp.json, or pass --write for ~/.cursor/mcp.json)")
+    elif client == "claude-desktop":
+        out.line(f"(Claude Desktop: {_desktop_config_path()}; or pass --write)")
+    return EXIT_OK
+
+
+def _shq(s: str) -> str:
+    if os.name == "nt":
+        return f'"{s}"' if (" " in s or not s) else s
+    import shlex
+    return shlex.quote(s)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: service install / uninstall / status, tls-pin, doctor, audit, dist
+
+def _print_install(res: Any, out: Out) -> None:
+    if out.as_json:
+        out.data({"method": res.method, "files": res.files, "commands": res.commands, "notes": res.notes})
+        return
+    out.line(f"method: {res.method}")
+    for f in res.files:
+        out.line(f"file: {f}")
+    for c in res.commands:
+        out.line("run: " + " ".join(_shq(str(a)) for a in c))
+    for n in res.notes:
+        out.line(n)
+
+
+def cmd_service_install(args: argparse.Namespace, out: Out) -> int:
+    """``hive service install node|hub [--method …] [--system] [--dry-run] [--no-capture-path]``."""
+    from . import install
+    from .config import default_paths
+    path = Path(os.path.expanduser(args.config)) if args.config else \
+        default_paths()["node_config" if args.kind == "node" else "hub_config"]
+    if not path.exists():
+        raise CliError(f"no {args.kind} config at {path}", hint=f"run: hive init {args.kind}")
+    res = install.install(args.kind, path, method=args.method, system=args.system, dry_run=args.dry_run,
+                          capture_path=not args.no_capture_path)
+    _print_install(res, out)
+    return EXIT_OK
+
+
+def cmd_service_uninstall(args: argparse.Namespace, out: Out) -> int:
+    """``hive service uninstall node|hub [--stop-services]``."""
+    from . import install
+    res = install.uninstall(args.kind, method=args.method, system=args.system, dry_run=args.dry_run,
+                            stop_services=args.stop_services)
+    _print_install(res, out)
+    return EXIT_OK
+
+
+def cmd_service_status(args: argparse.Namespace, out: Out) -> int:
+    """``hive service status node|hub``."""
+    from . import install
+    st = install.status(args.kind)
+    if out.as_json:
+        out.data(st)
+        return EXIT_OK
+    out.line(f"{args.kind}: " + (f"installed ({st.get('method')}{', system' if st.get('system') else ''})"
+                                 if st.get("installed") else "not installed")
+             + f"; {'running (pid ' + str(st.get('pid')) + ')' if st.get('running') else 'not running'}"
+             + (f"; {st.get('active')}" if st.get("active") else ""))
+    for f in st.get("files") or []:
+        out.line(f"file: {f}")
+    return EXIT_OK
+
+
+def cmd_tls_pin(args: argparse.Namespace, out: Out) -> int:
+    """``hive tls-pin CERT.pem``: the ``sha256:…`` pin of a certificate (D51)."""
+    import ssl
+    from .transport import cert_pin
+    try:
+        text = Path(os.path.expanduser(args.cert)).read_text(encoding="ascii", errors="replace")
+        der = ssl.PEM_cert_to_DER_cert(text)
+    except (OSError, ValueError) as e:
+        raise CliError(f"cannot read a PEM certificate from {args.cert}: {e}")
+    print(cert_pin(der))
+    return EXIT_OK
+
+
+def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
+    """``hive doctor [node|hub|client] [--no-network] [--deep]`` (exit 1 when a check fails)."""
+    from . import doctor
+    from .config import default_paths
+    kind = args.kind
+    if kind is None:
+        p = default_paths()
+        kind = "node" if p["node_config"].exists() else "hub" if p["hub_config"].exists() else "client"
+    rows = doctor.run(kind, network=not args.no_network, deep=args.deep)
+    if out.as_json:
+        out.data(rows)
+    else:
+        for r in rows:
+            mark = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL"}.get(str(r.get("status")), "?   ")
+            out.foreign(f"[{mark}] {r.get('check')}: {r.get('detail')}")
+            if r.get("fix") and r.get("status") != "ok":
+                out.foreign(f"       fix: {r.get('fix')}")
+        n = {s: sum(1 for r in rows if r.get("status") == s) for s in ("ok", "warn", "fail")}
+        out.line(f"{kind}: {n['ok']} ok, {n['warn']} warnings, {n['fail']} failures")
+    return EXIT_ACTION if any(r.get("status") == "fail" for r in rows) else EXIT_OK
+
+
+def _audit_dir(args: argparse.Namespace) -> Path:
+    from .config import default_paths
+    p = default_paths()
+    if args.hub or (not args.node and not p["node_config"].exists() and p["hub_config"].exists()):
+        cfg = _hub_config(args)
+        return Path(cfg.data_dir) / "audit"
+    cfg = _node_config(args)
+    return _data_dir(cfg) / "audit"
+
+
+def _audit_line(r: dict) -> str:
+    ts = r.get("ts") or ""
+    try:
+        ts = util.iso(util.parse_iso(ts))
+    except Exception:  # noqa: BLE001
+        pass
+    who = r.get("identity") or "-"
+    if r.get("agent"):
+        who += f"({r.get('agent')})"
+    res = "ok" if r.get("ok") else (r.get("code") or "error")
+    what = r.get("action") or ""
+    extra = r.get("extra") if isinstance(r.get("extra"), dict) else {}
+    tail = ""
+    if extra:
+        tail = " " + json.dumps(extra, ensure_ascii=False, separators=(",", ":"), default=str)[:300]
+    return (f"{ts} {r.get('kind')} {who} {r.get('via') or '-'} {r.get('ip') or '-'} {r.get('node') or '-'} "
+            f"{what} {res} {r.get('ms') or 0}ms{tail}")
+
+
+def cmd_audit_tail(args: argparse.Namespace, out: Out) -> int:
+    """``hive audit tail [-n 50] [--node|--hub] [--follow]`` (read locally; no remote action reads audit, D16)."""
+    from .audit import AuditLog
+    d = _audit_dir(args)
+    log_ = AuditLog(d, enabled=False)
+    rows = log_.tail(max(1, int(args.n)))
+    seen = set()
+    for r in rows:
+        seen.add(r.get("id"))
+        if out.as_json:
+            print(json.dumps(r, ensure_ascii=True, default=str))
+        else:
+            out.foreign(_audit_line(r))
+    if not args.follow:
+        return EXIT_OK
+    try:
+        while True:
+            _sleep(1.0)
+            for r in log_.tail(200):
+                if r.get("id") in seen:
+                    continue
+                seen.add(r.get("id"))
+                if out.as_json:
+                    print(json.dumps(r, ensure_ascii=True, default=str), flush=True)
+                else:
+                    out.foreign(_audit_line(r))
+            if len(seen) > 100000:
+                seen = set(list(seen)[-1000:])
+    except KeyboardInterrupt:
+        return EXIT_OK
+
+
+def cmd_dist_build(args: argparse.Namespace, out: Out) -> int:
+    """``hive dist build [--out hive.pyz]``."""
+    from . import dist
+    data = dist.build_pyz()
+    path = Path(os.path.expanduser(args.out))
+    util.atomic_write_bytes(path, data)
+    try:
+        os.chmod(str(path), 0o755)
+    except OSError:
+        pass
+    out.line(f"{path} ({util.human_bytes(len(data))})")
+    out.line(f"sha256 {dist.pyz_sha256(data)}")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# WP6b: push / pull / logs
+
+class _Bar:
+    """A one-line progress bar on stderr (≤ 5 updates/s)."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.last = 0.0
+        self.tty = sys.stderr.isatty()
+
+    def __call__(self, done: int, total: int) -> None:
+        now = time.monotonic()
+        if now - self.last < 0.2 and done < total:
+            return
+        self.last = now
+        pct = (100.0 * done / total) if total else 100.0
+        text = f"{self.label}: {util.human_bytes(done)}/{util.human_bytes(total)} ({pct:.0f}%)"
+        sys.stderr.write(("\r" + text) if self.tty else (text + "\n"))
+        sys.stderr.flush()
+
+    def end(self) -> None:
+        if self.tty:
+            sys.stderr.write("\n")
+
+
+def _transfer(args: argparse.Namespace, out: Out, src: str, dst: str) -> int:
+    client = _connect(args, owner_default=True)
+    bar = _Bar(f"{args.node}")
+    try:
+        res = client.transfer(src, dst, overwrite=args.overwrite, progress=bar)
+    finally:
+        bar.end()
+        client.close()
+    if out.as_json:
+        out.data(res)
+    else:
+        out.line(f"{util.human_bytes(int(res.get('bytes') or 0))} copied in {float(res.get('duration_s') or 0):.1f}s"
+                 + (f" (resumed from {util.human_bytes(int(res['resumed_from']))})" if res.get("resumed_from")
+                    else "") + f", sha256 {res.get('sha256')}")
+    return EXIT_OK
+
+
+def _node_spec(n: str) -> str:
+    return "self" if n in (".", "-", "local", "self") else n.lower()
+
+
+def cmd_push(args: argparse.Namespace, out: Out) -> int:
+    """``hive push NODE LOCAL REMOTE [--overwrite]`` (resumable; LocalFS unconfined)."""
+    return _transfer(args, out, "local:" + os.path.abspath(os.path.expanduser(args.local)),
+                     f"{_node_spec(args.node)}:{args.remote}")
+
+
+def cmd_pull(args: argparse.Namespace, out: Out) -> int:
+    """``hive pull NODE REMOTE LOCAL [--overwrite]``."""
+    return _transfer(args, out, f"{_node_spec(args.node)}:{args.remote}",
+                     "local:" + os.path.abspath(os.path.expanduser(args.local)))
+
+
+def cmd_logs(args: argparse.Namespace, out: Out) -> int:
+    """``hive logs NODE (JOB_ID | --service NAME) [-f] [--tail N] [--raw]``."""
+    from .textlog import clean_terminal_text
+    if bool(args.job_id) == bool(args.service):
+        raise CliError("give a JOB_ID or --service NAME")
+    node = _node_spec(args.node)
+    client = _connect(args, owner_default=True)
+
+    def show(text: str) -> None:
+        if not text:
+            return
+        t = text if args.raw else clean_terminal_text(text)
+        _write(sys.stdout, util.escape_terminal(t))
+        sys.stdout.flush()
+    try:
+        action, key, ident = ("job.logs", "job_id", args.job_id) if args.job_id else \
+            ("service.logs", "name", args.service)
+        params: Dict[str, Any] = {key: ident, "tail_lines": max(1, min(5000, int(args.tail)))}
+        if args.raw:
+            params["raw"] = True
+        r = client.call(action, params, node=node)
+        show(r.get("text") or "")
+        if not args.follow:
+            return EXIT_OK
+        offset = r.get("next_offset")
+        while True:
+            if args.job_id and r.get("state") in ("exited", "killed", "timeout", "failed", "lost") and \
+                    not r.get("text"):
+                return EXIT_OK
+            p = {key: ident, "wait": 10}
+            if isinstance(offset, int):
+                p["offset"] = offset
+            if args.raw:
+                p["raw"] = True
+            r = client.call(action, p, node=node)
+            show(r.get("text") or "")
+            if isinstance(r.get("next_offset"), int):
+                offset = r["next_offset"]
+    except KeyboardInterrupt:
+        return EXIT_OK
+    finally:
+        client.close()
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # parser
 
 def _common(p: argparse.ArgumentParser) -> None:
@@ -952,7 +2430,7 @@ def _jsonflag(p: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The ``hive`` argument parser (WP6a commands)."""
+    """The ``hive`` argument parser (§19)."""
     ap = argparse.ArgumentParser(prog="hive", description="Hive (蜂巢): let AI agents operate your machines.")
     ap.add_argument("--connection", help="client.json connection")
     ap.add_argument("--json", dest="as_json", action="store_true", help="machine output")
@@ -1091,6 +2569,188 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefix")
     p.add_argument("--node")
     p.add_argument("-o", "--output")
+
+    # ---- WP6b
+    p = leaf(sub, "join", cmd_join, help="join a hub as a relay node (join code from HIVE_JOIN, an argument or -)")
+    p.add_argument("code", nargs="?", help="join code (default: env HIVE_JOIN; - reads stdin)")
+    p.add_argument("--name")
+    p.add_argument("--preset", choices=["readonly", "standard", "cautious", "full"])
+    p.add_argument("--relay-role", choices=["readonly", "files", "operator"])
+    p.add_argument("--relay-proxy", help="URL or off (default: env HIVE_RELAY_PROXY, else auto)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--pod", action="store_true")
+    g.add_argument("--no-pod", action="store_true")
+    p.add_argument("--wsl", action="store_true")
+    p.add_argument("--mirror", choices=["cn", "none"])
+    p.add_argument("--proxy", help="URL or off (default: env HIVE_PROXY)")
+    p.add_argument("--models-dir")
+    p.add_argument("--install", action="store_true", help="also install the node as a service")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--no-restart", action="store_true")
+
+    hub = sub.add_parser("hub", help="the hub on this computer").add_subparsers(dest="what")
+    p = leaf(hub, "run", cmd_hub_run, help="run the hub in the foreground")
+    p.add_argument("--config")
+    p.add_argument("--relaunched", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--supervise", action="store_true", help=argparse.SUPPRESS)
+    for name, fn in (("stop", cmd_hub_stop), ("restart", cmd_hub_restart), ("status", cmd_hub_status),
+                     ("list", cmd_hub_list)):
+        p = leaf(hub, name, fn)
+        p.add_argument("--config")
+    p = leaf(hub, "add-node", cmd_hub_add_node, help="add a relay or direct node")
+    p.add_argument("name")
+    p.add_argument("--relay", action="store_true")
+    p.add_argument("--via", choices=["tailnet", "public"])
+    p.add_argument("--host", help="the hub address remote machines use (when it listens on a wildcard/loopback)")
+    p.add_argument("--direct", metavar="URL")
+    p.add_argument("--token-file")
+    p.add_argument("--token-env")
+    p.add_argument("--token")
+    p.add_argument("--generate", action="store_true", help="create the hub token here; print its hash for the node")
+    p.add_argument("--tls-pin")
+    p.add_argument("--tags")
+    p.add_argument("--description")
+    p.add_argument("--config")
+    p.add_argument("--no-restart", action="store_true")
+    p = leaf(hub, "add-agent", cmd_hub_add_agent, help="add an agent token")
+    p.add_argument("name")
+    p.add_argument("--role", choices=["readonly", "files", "operator"])
+    p.add_argument("--nodes", help="'*' or a comma-separated list")
+    p.add_argument("--deny")
+    p.add_argument("--approval")
+    p.add_argument("--cautious", action="store_true")
+    p.add_argument("--expires")
+    p.add_argument("--config")
+    p.add_argument("--no-restart", action="store_true")
+    for name, fn in (("remove-node", cmd_hub_remove_node), ("remove-agent", cmd_hub_remove_agent),
+                     ("rotate-token", cmd_hub_rotate_token)):
+        p = leaf(hub, name, fn)
+        p.add_argument("name")
+        p.add_argument("--config")
+        p.add_argument("--no-restart", action="store_true")
+        if name == "rotate-token":
+            p.add_argument("--via", choices=["tailnet", "public"])
+            p.add_argument("--host")
+    p = leaf(hub, "ack-node", cmd_hub_ack_node, help="accept a relay node's new instance key")
+    p.add_argument("name")
+    p.add_argument("--yes", action="store_true")
+    p.add_argument("--config")
+    p = leaf(hub, "restart-node", cmd_hub_restart_node, help="restart (and auto-update) relay nodes")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--outdated", action="store_true")
+    p.add_argument("--config")
+
+    gw = sub.add_parser("gateway", help="the OpenAI-compatible model gateway").add_subparsers(dest="what")
+    gtok = gw.add_parser("token", help="gateway (models) tokens").add_subparsers(dest="what2")
+    p = leaf(gtok, "add", cmd_gateway_token_add)
+    p.add_argument("name")
+    p.add_argument("--models", required=True, help="'node/service,…' on a hub; 'service,…' on a node")
+    p.add_argument("--expires")
+    for q in (p,):
+        q.add_argument("--hub", action="store_true")
+        q.add_argument("--node", action="store_true")
+        q.add_argument("--config")
+        q.add_argument("--no-restart", action="store_true")
+    p = leaf(gtok, "list", cmd_gateway_token_list)
+    p.add_argument("--hub", action="store_true")
+    p.add_argument("--node", action="store_true")
+    p.add_argument("--config")
+    p = leaf(gtok, "revoke", cmd_gateway_token_revoke)
+    p.add_argument("name")
+    p.add_argument("--hub", action="store_true")
+    p.add_argument("--node", action="store_true")
+    p.add_argument("--config")
+    p.add_argument("--no-restart", action="store_true")
+    p = leaf(gw, "url", cmd_gateway_url, help="print the Base URLs for an app")
+    p.add_argument("node_name", metavar="NODE")
+    p.add_argument("service", metavar="SERVICE")
+    p.add_argument("--token-file", help="a gateway token file: also list the served model ids")
+    p.add_argument("--node", action="store_true", help="this node's own gateway (http://127.0.0.1:<port>)")
+    p.add_argument("--config")
+
+    ap_ = sub.add_parser("approvals", help="approve or deny gated calls").add_subparsers(dest="what")
+    for name, fn in (("list", cmd_approvals_list), ("grants", cmd_approvals_grants)):
+        p = leaf(ap_, name, fn)
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--node", action="store_true")
+        g.add_argument("--hub", action="store_true")
+    for name, fn in (("approve", cmd_approvals_approve), ("deny", cmd_approvals_deny)):
+        p = leaf(ap_, name, fn)
+        p.add_argument("id")
+        if name == "approve":
+            p.add_argument("--for", dest="for_", metavar="DURATION", help="also allow this action for a while, "
+                                                                          "e.g. 30m")
+        p.add_argument("--yes", action="store_true")
+        g = p.add_mutually_exclusive_group()
+        g.add_argument("--node", action="store_true")
+        g.add_argument("--hub", action="store_true")
+    p = leaf(ap_, "revoke", cmd_approvals_revoke)
+    p.add_argument("id", nargs="?")
+    p.add_argument("--all", action="store_true")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--node", action="store_true")
+    g.add_argument("--hub", action="store_true")
+
+    p = leaf(sub, "mcp-config", cmd_mcp_config, help="print (or write) an MCP client config snippet")
+    p.add_argument("--client", choices=["claude-desktop", "claude-code", "cursor", "generic"])
+    p.add_argument("--local", action="store_true")
+    p.add_argument("--remote", action="store_true")
+    p.add_argument("--write", action="store_true")
+    p.add_argument("--allow-owner", action="store_true")
+
+    svc = sub.add_parser("service", help="start the node/hub with the OS").add_subparsers(dest="what")
+    p = leaf(svc, "install", cmd_service_install)
+    p.add_argument("kind", choices=["node", "hub"])
+    p.add_argument("--method", choices=["auto", "systemd", "launchd", "schtasks", "watchdog"], default="auto")
+    p.add_argument("--system", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-capture-path", action="store_true")
+    p.add_argument("--config")
+    p = leaf(svc, "uninstall", cmd_service_uninstall)
+    p.add_argument("kind", choices=["node", "hub"])
+    p.add_argument("--stop-services", action="store_true")
+    p.add_argument("--method", choices=["auto", "systemd", "launchd", "schtasks", "watchdog"], default="auto")
+    p.add_argument("--system", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p = leaf(svc, "status", cmd_service_status)
+    p.add_argument("kind", choices=["node", "hub"])
+
+    p = leaf(sub, "tls-pin", cmd_tls_pin, json_flag=False, help="print the sha256 pin of a PEM certificate")
+    p.add_argument("cert")
+    p = leaf(sub, "doctor", cmd_doctor, help="check this machine's setup")
+    p.add_argument("kind", nargs="?", choices=["node", "hub", "client"])
+    p.add_argument("--no-network", action="store_true")
+    p.add_argument("--deep", action="store_true")
+    aud = sub.add_parser("audit", help="read the local audit log").add_subparsers(dest="what")
+    p = leaf(aud, "tail", cmd_audit_tail)
+    p.add_argument("-n", type=int, default=50)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--node", action="store_true")
+    g.add_argument("--hub", action="store_true")
+    p.add_argument("--follow", "-f", action="store_true")
+    p.add_argument("--config")
+    dst = sub.add_parser("dist", help="distribution").add_subparsers(dest="what")
+    p = leaf(dst, "build", cmd_dist_build)
+    p.add_argument("--out", default="hive.pyz")
+
+    p = leaf(sub, "push", cmd_push, help="copy a local file to a node (resumable)")
+    p.add_argument("node")
+    p.add_argument("local")
+    p.add_argument("remote")
+    p.add_argument("--overwrite", action="store_true")
+    p = leaf(sub, "pull", cmd_pull, help="copy a file from a node (resumable)")
+    p.add_argument("node")
+    p.add_argument("remote")
+    p.add_argument("local")
+    p.add_argument("--overwrite", action="store_true")
+    p = leaf(sub, "logs", cmd_logs, json_flag=False, help="show or follow a job's or service's log")
+    p.add_argument("node")
+    p.add_argument("job_id", nargs="?")
+    p.add_argument("--service")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("--tail", type=int, default=100)
+    p.add_argument("--raw", action="store_true")
     return ap
 
 
@@ -1129,9 +2789,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_sh(rest[1:], gl)
     if cmd in ("_shim", "_download", "_update"):
         sys.stderr.write(f"hive: {cmd} is internal; run it as python -m hive {cmd}\n")
-        return EXIT_USAGE
-    if cmd in WP6B:
-        sys.stderr.write(f"hive {cmd}: not available yet in this build (WP6b)\n")
         return EXIT_USAGE
     ap = build_parser()
     try:
