@@ -6,13 +6,15 @@ function raises only ``HiveError``; OS errors are mapped by the handlers (``os_e
 from __future__ import annotations
 
 import codecs
+import collections
 import contextlib
-import difflib
 import errno
+import itertools
 import logging
 import os
 import re
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -310,6 +312,56 @@ def _line_of(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1 if "\n" in text else text.count("\r", 0, index) + 1
 
 
+# Verification round 4 (DoS): Python 3.9's str.find/count/replace/``in`` cost O(n*m) on a needle such as
+# 'A'*k+'B'+'A'*k and hold the GIL for the whole call (3.10+ switched long needles to a linear two-way search).
+# On 3.9 an agent-supplied needle of SLOW_FIND_NEEDLE chars or more is searched with sre instead: a pure-literal
+# pattern compiles to a literal prefix with a KMP overlap table, which is linear.
+_FIND_IS_LINEAR = sys.version_info >= (3, 10)
+SLOW_FIND_NEEDLE = 32
+
+
+def _literal_rx(needle: str) -> Optional["re.Pattern[str]"]:
+    """A compiled pure-literal pattern (bypassing ``re``'s cache, which would keep up to 512 large needles)."""
+    try:
+        import sre_compile  # Python 3.9 only here (deprecated from 3.11); the re module's own compiler
+        return sre_compile.compile(re.escape(needle), 0)
+    except Exception:  # noqa: BLE001 - fall back to the str methods
+        return None
+
+
+class LiteralSearch:
+    """Linear exact-substring search for agent-supplied needles on every supported Python (see above):
+    ``find``/``count``/``replace``/``contains`` with the semantics of the str methods (non-overlapping,
+    leftmost first)."""
+
+    def __init__(self, needle: str):
+        self.needle = needle
+        self._rx = None
+        if not _FIND_IS_LINEAR and len(needle) >= SLOW_FIND_NEEDLE:
+            self._rx = _literal_rx(needle)
+
+    def find(self, hay: str, start: int = 0) -> int:
+        if self._rx is None:
+            return hay.find(self.needle, start)
+        m = self._rx.search(hay, start)
+        return m.start() if m else -1
+
+    def contains(self, hay: str) -> bool:
+        if self._rx is None:
+            return self.needle in hay
+        return self._rx.search(hay) is not None
+
+    def count(self, hay: str) -> int:
+        if self._rx is None:
+            return hay.count(self.needle)
+        return sum(1 for _m in self._rx.finditer(hay))
+
+    def replace(self, hay: str, new: str) -> str:
+        if self._rx is None:
+            return hay.replace(self.needle, new)
+        return self._rx.sub(lambda _m: new, hay)
+
+
 def normalize_newlines(text: str, old: str, new: str) -> Tuple[str, str]:
     """CRLF files: an ``old`` written with bare LF is matched (and ``new`` written) with CRLF (§9.7)."""
     if "\r\n" in text and "\n" in old and "\r\n" not in old:
@@ -318,51 +370,122 @@ def normalize_newlines(text: str, old: str, new: str) -> Tuple[str, str]:
     return old, new
 
 
-def apply_edit(text: str, old: str, new: str, replace_all: bool) -> Tuple[str, int, List[int]]:
-    """Exact replacement: (new text, replacements, start lines of the matches). 0 matches -> not_found with
-    ``details.closest``; more than one without ``replace_all`` -> conflict with ``details.lines``."""
+EDIT_MAX_LINES = 100                   # line numbers reported for a conflict / replace_all
+
+
+def apply_edit(text: str, old: str, new: str, replace_all: bool,
+               deadline: Optional[float] = None) -> Tuple[str, int, List[int]]:
+    """Exact replacement: (new text, replacements, start lines of the first EDIT_MAX_LINES matches). 0 matches ->
+    not_found with ``details.closest`` (None when ``deadline`` passed while looking); more than one without
+    ``replace_all`` -> conflict with ``details.lines``."""
+    return apply_edit_at(text, old, new, replace_all, deadline)[:3]   # type: ignore[return-value]
+
+
+def apply_edit_at(text: str, old: str, new: str, replace_all: bool,
+                  deadline: Optional[float] = None) -> Tuple[str, int, List[int], int]:
+    """``apply_edit`` plus the character offset of the first match (the edited region starts there in the new
+    text too). Verification round 4 (DoS): linear in the file size whatever the match count (the line of every
+    match used to be counted from offset 0) and on Python 3.9 (``LiteralSearch``)."""
     if not old:
         raise bad_request("old_text must not be empty")
     old, new = normalize_newlines(text, old, new)
-    idx: List[int] = []
-    pos = text.find(old)
-    while pos >= 0:
-        idx.append(pos)
-        pos = text.find(old, pos + len(old))
-    if not idx:
-        closest = closest_window(text, old)
+    # cheap necessary conditions first (a long needle compiles to sre on Python 3.9: linear but ~1 µs per char)
+    possible = len(old) <= len(text) and (len(old) < SLOW_FIND_NEEDLE or (old[:16] in text and old[-16:] in text))
+    search = LiteralSearch(old) if possible else None
+    first = search.find(text) if search is not None else -1
+    if first < 0:
+        closest = closest_window(text, old, deadline)
         raise not_found("old_text was not found in the file", closest=closest,
                         hint="old_text must match exactly (whitespace and line breaks included); details.closest "
                              "shows the most similar lines")
-    lines = [_line_of(text, i) for i in idx]
-    if len(idx) > 1 and not replace_all:
-        raise conflict(f"old_text matches {len(idx)} times (lines {', '.join(map(str, lines[:20]))})",
-                       lines=lines[:100], hint="add surrounding lines to old_text to make it unique, or set "
-                                               "replace_all=true")
+    assert search is not None
+    nl = "\n" if "\n" in text else "\r"
+    lines: List[int] = []
+    line, prev, pos = 1, 0, first
+    while pos >= 0 and len(lines) < EDIT_MAX_LINES:
+        line += text.count(nl, prev, pos)
+        prev = pos
+        lines.append(line)
+        pos = search.find(text, pos + len(old))
+    count = len(lines) if pos < 0 else search.count(text)
+    if count > 1 and not replace_all:
+        raise conflict(f"old_text matches {count} times (lines {', '.join(map(str, lines[:20]))})",
+                       lines=lines, hint="add surrounding lines to old_text to make it unique, or set "
+                                         "replace_all=true")
     if replace_all:
-        return text.replace(old, new), len(idx), lines
-    i = idx[0]
-    return text[:i] + new + text[i + len(old):], 1, lines
+        return search.replace(text, new), count, lines, first
+    return text[:first] + new + text[first + len(old):], 1, lines, first
 
 
-def closest_window(text: str, old: str) -> dict:
-    """``{"start_line","lines":[numbered]}``: the most similar window of len(old lines) (±2 lines of context)."""
-    tl = [_strip_eol(x) for x in split_lines(text)]
-    ol = [_strip_eol(x) for x in split_lines(old)] or [old]
+_EOL_SPLIT_RE = re.compile(r"\r\n|\r|\n")
+CLOSEST_MAX_LINES = 200                # old_text lines compared (verification round 4: bounded work)
+CLOSEST_MAX_CHARS = 8192               # old_text / window chars compared
+CLOSEST_CHAR_BUDGET = 4 << 20          # total window chars compared per call
+CLOSEST_MAX_POSITIONS = 1 << 20        # window positions scored by shared lines
+
+
+def _text_lines(text: str) -> List[str]:
+    """Lines without their endings (same split as ``split_lines``, at C speed)."""
+    parts = _EOL_SPLIT_RE.split(text)
+    if parts and parts[-1] == "":
+        parts.pop()
+    return parts
+
+
+def _bag_ratio(a: "collections.Counter[str]", la: int, b: "collections.Counter[str]", lb: int) -> float:
+    """``difflib.SequenceMatcher.quick_ratio`` from two character counts: linear, an upper bound of ratio()."""
+    if not la + lb:
+        return 1.0
+    return 2.0 * sum((a & b).values()) / (la + lb)
+
+
+def closest_window(text: str, old: str, deadline: Optional[float] = None) -> Optional[dict]:
+    """``{"start_line","lines":[numbered],"ratio"}``: the most similar window of len(old lines) (±2 lines of
+    context), or None when ``deadline`` (time.monotonic) passes first.
+
+    Verification round 4 (DoS): difflib's ratio() is cubic on repetitive text (an 800-line old_text took 15 s, a
+    1 MB one never finished). Now bounded: only the first CLOSEST_MAX_LINES lines / CLOSEST_MAX_CHARS chars of
+    old_text count; windows are ranked by how many of their lines (whitespace-stripped) occur in old_text
+    (prefix sums, linear), ties broken by a character-count similarity (``quick_ratio``) within
+    CLOSEST_CHAR_BUDGET chars in all; the deadline is checked between the steps and every 64 windows."""
+    def late() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    tl = _text_lines(text)
     if not tl:
         return {"start_line": 1, "lines": [], "ratio": 0.0}
+    ol = _text_lines(old[:CLOSEST_MAX_CHARS])[:CLOSEST_MAX_LINES] or [""]
     k = max(1, min(len(ol), len(tl)))
+    ol = ol[:k]
     target = "\n".join(ol)
-    sm = difflib.SequenceMatcher(None, autojunk=False)
-    sm.set_seq2(target)
-    best, best_i = -1.0, 0
+    want = {x.strip() for x in ol}
+    want.discard("")
     windows = len(tl) - k + 1
-    step = max(1, windows // 20000)          # bound the work on huge files
-    for i in range(0, windows, step):
-        sm.set_seq1("\n".join(tl[i:i + k]))
-        if sm.real_quick_ratio() <= best or sm.quick_ratio() <= best:
-            continue
-        r = sm.ratio()
+    step = max(1, windows // CLOSEST_MAX_POSITIONS)
+    positions = range(0, windows, step)
+    if late():
+        return None
+    if want:
+        pre = list(itertools.accumulate((x.strip() in want for x in tl), initial=0))
+        if late():
+            return None
+        scores = [pre[i + k] - pre[i] for i in positions]
+        top = max(scores)
+        cands = [positions[j] for j, s in enumerate(scores) if s == top]
+    else:
+        cands = list(positions)
+    per = min(CLOSEST_MAX_CHARS, len(target) + 64) + len(target)
+    n_max = max(16, CLOSEST_CHAR_BUDGET // max(1, per))
+    if len(cands) > n_max:
+        stride = len(cands) / n_max
+        cands = [cands[int(j * stride)] for j in range(n_max)]
+    tcount = collections.Counter(target)
+    best, best_i = -1.0, cands[0]
+    for j, i in enumerate(cands):
+        if j % 64 == 63 and late():
+            return None
+        win = "\n".join(x[:CLOSEST_MAX_CHARS] for x in tl[i:i + k])[:CLOSEST_MAX_CHARS]
+        r = _bag_ratio(collections.Counter(win), len(win), tcount, len(target))
         if r > best:
             best, best_i = r, i
     lo = max(0, best_i - 2)
@@ -371,12 +494,34 @@ def closest_window(text: str, old: str) -> dict:
     return {"start_line": lo + 1, "lines": lines, "ratio": round(max(best, 0.0), 3)}
 
 
-def snippet(text: str, line: int, new_lines: int, context: int = 3) -> str:
-    """Numbered lines around an edit (``line`` .. ``line+new_lines-1`` ± context)."""
-    tl = [_strip_eol(x) for x in split_lines(text)]
-    lo = max(1, line - context)
-    hi = min(len(tl), line + max(new_lines, 1) - 1 + context)
-    return "\n".join(f"{n:6d}\t{display_text(tl[n - 1])[:LONG_LINE]}" for n in range(lo, hi + 1))
+def _line_start(text: str, pos: int) -> int:
+    """Offset of the start of the line holding ``pos``."""
+    return max(text.rfind("\n", 0, pos), text.rfind("\r", 0, pos)) + 1
+
+
+def snippet(text: str, line: int, new_lines: int, context: int = 3, offset: Optional[int] = None) -> str:
+    """Numbered lines around an edit (``line`` .. ``line+new_lines-1`` ± context). With ``offset`` (a character
+    offset on ``line``), only that region of ``text`` is split (verification round 4: a 16 MB file of short lines
+    took seconds to split for every edit)."""
+    if offset is None:
+        tl = [_strip_eol(x) for x in split_lines(text)]
+        lo = max(1, line - context)
+        hi = min(len(tl), line + max(new_lines, 1) - 1 + context)
+        return "\n".join(f"{n:6d}\t{display_text(tl[n - 1])[:LONG_LINE]}" for n in range(lo, hi + 1))
+    start = _line_start(text, min(max(0, offset), len(text)))
+    lo = line
+    while lo > max(1, line - context) and start > 0:
+        end = start - 2 if text.startswith("\r\n", start - 2) else start - 1
+        start = _line_start(text, end)
+        lo -= 1
+    want = (line - lo) + max(new_lines, 1) + context
+    stop = len(text)
+    for j, m in enumerate(_EOL_SPLIT_RE.finditer(text, start)):
+        if j + 1 >= want:
+            stop = m.end()
+            break
+    tl = _text_lines(text[start:stop])[:want]
+    return "\n".join(f"{lo + j:6d}\t{display_text(x)[:LONG_LINE]}" for j, x in enumerate(tl))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -871,4 +1016,4 @@ def json_depth_ok(obj: Any, limit: int = 64) -> bool:
 
 __all__ = ["check_regex", "detect_encoding", "read_lines", "apply_edit", "closest_window", "walk", "is_hidden",
            "long_path", "PartTracker", "os_errors", "decode_bytes", "encode_text", "split_lines", "snippet",
-           "normalize_newlines", "entry_allowed", "display_text", "binary_error", "json_depth_ok", "open_regular"]
+           "normalize_newlines", "apply_edit_at", "LiteralSearch", "entry_allowed", "display_text", "binary_error", "json_depth_ok", "open_regular"]

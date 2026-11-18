@@ -90,6 +90,90 @@ class TestEdit(unittest.TestCase):
         self.assertEqual(fsops.apply_edit("a\nb\n", "a\nb", "c\nd", False)[0], "c\nd\n")
 
 
+class TestEditDoSVerification4(unittest.TestCase):
+    """Verification round 4 (DoS): fs.edit's not_found / conflict / replace_all paths and literal search are linear
+    (closest_window was cubic in old_text lines, line numbers were matches x file size, Python 3.9's str.find is
+    O(n*m) on 'A'*k+'B'+'A'*k). Generous bounds: these used to take seconds to hours."""
+
+    def timed(self, fn, bound=1.0):
+        t = time.monotonic()
+        try:
+            out = fn()
+        except HiveError as e:
+            out = e
+        self.assertLess(time.monotonic() - t, bound)
+        return out
+
+    def test_closest_window_bounded(self):
+        e = self.timed(lambda: fsops.apply_edit("a\n" * 8192, "b\n" * 800, "x", False))       # 16 KB / 1.6 KB
+        self.assertEqual(e.code, "not_found")
+        self.assertIsNotNone(e.details["closest"])
+        e = self.timed(lambda: fsops.apply_edit("a\n" * 8192, "\n" * (1 << 20), "x", False))  # 1 MB old_text
+        self.assertEqual(e.code, "not_found")
+        r = self.timed(lambda: fsops.closest_window("a\n" * (1 << 20), "\n" * (1 << 20) + "x"))
+        self.assertTrue(200 <= len(r["lines"]) <= 204)      # 200 compared lines ± 2 of context
+        self.assertIsNone(fsops.closest_window("a\nb\n" * 1000, "c\n" * 50, deadline=time.monotonic() - 1))
+        e = self.timed(lambda: fsops.apply_edit("a\nb\n", "zzz", "x", False, deadline=time.monotonic() - 1))
+        self.assertEqual(e.code, "not_found")
+        self.assertIsNone(e.details["closest"])
+
+    def test_closest_window_quality(self):
+        text = "".join(f"def f{i}(x):\n    return x + {i}\n\n" for i in range(2000))
+        r = fsops.closest_window(text, "def f1234(x):\n    retrun x + 1234")
+        self.assertIn("3703: def f1234(x):", r["lines"])
+        r = fsops.closest_window(text, "    def f777(x):\n        return x + 777")    # indentation differs
+        self.assertIn("2332: def f777(x):", r["lines"])
+
+    def test_many_matches_linear(self):
+        text = "a\n" * (8 << 20)                                                       # 16 MB, 8M matches
+        e = self.timed(lambda: fsops.apply_edit(text, "a", "b", False))
+        self.assertEqual(e.code, "conflict")
+        self.assertEqual(e.details["lines"], list(range(1, 101)))
+        self.assertIn("matches 8388608 times", e.message)
+        new, count, lines = self.timed(lambda: fsops.apply_edit(text, "a", "b", True))
+        self.assertEqual((count, lines[:3], len(lines), new[:4]), (8 << 20, [1, 2, 3], 100, "b\nb\n"))
+
+    def test_long_needle_linear(self):
+        k = 50_000
+        old = "A" * k + "B" + "A" * k                                                  # 100 KB, 2 MB file
+        new, count, lines = self.timed(lambda: fsops.apply_edit("A" * 2_000_000 + old + "\n", old, "x", False))
+        self.assertEqual((new, count, lines), ("A" * 2_000_000 + "x\n", 1, [1]))
+        e = self.timed(lambda: fsops.apply_edit("A" * 2_000_000, old, "x", False))
+        self.assertEqual(e.code, "not_found")
+        e = self.timed(lambda: fsops.apply_edit("A" * 2_000_000 + old + old, old, "x", False))
+        self.assertEqual(e.code, "conflict")
+        new, count, _l = self.timed(lambda: fsops.apply_edit("A" * 2_000_000 + old + old, old, "x", True))
+        self.assertEqual((new, count), ("A" * 2_000_000 + "xx", 2))
+        from hive.actions import files
+        needle = "A" * 250 + "B" + "A" * 249
+        hits = self.timed(lambda: list(files._literal_hits(["A" * (16 << 20), "x" + needle], needle, False,
+                                                            time.monotonic() + 60)))
+        self.assertEqual(hits, [1])
+
+    def test_literal_search_matches_str(self):
+        import random
+        import re
+        rnd = random.Random(4)
+        for _ in range(300):
+            hay = "".join(rnd.choice("ab\n") for _ in range(rnd.randint(0, 60)))
+            needle = "".join(rnd.choice("ab") for _ in range(rnd.randint(1, 4)))
+            for force in (False, True):
+                ls = fsops.LiteralSearch(needle)
+                if force:
+                    ls._rx = re.compile(re.escape(needle))
+                self.assertEqual((ls.find(hay), ls.find(hay, 3), ls.count(hay), ls.contains(hay),
+                                  ls.replace(hay, "\\1")),
+                                 (hay.find(needle), hay.find(needle, 3), hay.count(needle), needle in hay,
+                                  hay.replace(needle, "\\1")))
+
+    def test_snippet_offset(self):
+        for text in ("l1\nl2\nl3\nl4\nl5\nNEW\nl7\nl8\nl9\nl10\n", "a\r\nb\r\nNEW\r\nc\r\n",
+                     "NEW", "x\nNEW", "1\n2\n3\n4\nNEW\nmore\n"):
+            off = text.index("NEW")
+            line = fsops._line_of(text, off)
+            self.assertEqual(fsops.snippet(text, line, 1, offset=off), fsops.snippet(text, line, 1))
+
+
 class TestCheckRegex(unittest.TestCase):
     def test_rejections(self):
         for bad in ("(a+)+", "(a|b)*", "(a*)*", "(?:x+y)+", "((ab)*c)+", "(a{2,3})*", "(a|b){2,}", "(a)\\1",

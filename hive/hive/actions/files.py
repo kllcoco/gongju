@@ -612,14 +612,15 @@ def fs_edit(ctx: ActionContext, p: dict) -> dict:
             raise conflict(f"'{path}' changed since it was read (version mismatch)",
                            hint="file changed since you read it; re-read")
         text, codec, errors = fsops.decode_bytes(data, encoding)
-        new_text, count, lines = fsops.apply_edit(text, p["old_text"], p["new_text"], bool(p.get("replace_all")))
+        new_text, count, lines, first = fsops.apply_edit_at(text, p["old_text"], p["new_text"],
+                                                             bool(p.get("replace_all")), deadline=_deadline(ctx))
         out_bytes = fsops.encode_text(new_text, encoding, codec, errors)
         if len(out_bytes) > lim.max_write_bytes:
             raise too_large(f"the edited file would be {len(out_bytes)} bytes",
                             hint=f"max write size on this node is {lim.max_write_bytes} bytes")
         _atomic_write(path, out_bytes)
     _old, new_norm = fsops.normalize_newlines(text, p["old_text"], p["new_text"])
-    snip = fsops.snippet(new_text, lines[0] if lines else 1, len(fsops.split_lines(new_norm)) or 1)
+    snip = fsops.snippet(new_text, lines[0] if lines else 1, len(fsops.split_lines(new_norm)) or 1, offset=first)
     ctx.audit_extra.update(path=str(path), replacements=count)
     return {"path": str(path), "replacements": count, "version": hashlib.sha256(out_bytes).hexdigest(),
             "snippet": snip}
@@ -722,10 +723,11 @@ def _regex_hits(worker: Any, lines: List[str]) -> Iterable[int]:
 
 
 def _literal_hits(lines: List[str], needle: str, icase: bool, deadline: float) -> Iterable[int]:
+    search = fsops.LiteralSearch(needle)     # verification round 4: linear on Python 3.9 too
     for i, line in enumerate(lines):
         if i % 2000 == 0 and time.monotonic() > deadline:
             raise _WorkerStopped("timeout")
-        if needle in (line.lower() if icase else line):
+        if search.contains(line.lower() if icase else line):
             yield i
 
 
