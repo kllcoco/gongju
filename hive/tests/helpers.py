@@ -220,8 +220,48 @@ def start_node_server(**cfg: Any) -> Tuple[str, str, Any]:
 
 
 def start_hub(nodes: Sequence[Any] = (), **cfg: Any) -> Tuple[str, Dict[str, str], Any]:
-    """(url, tokens, hub) (SkipTest until WP5 merges)."""
-    raise unittest.SkipTest("hub not available yet (WP5); see docs/PHASE0_NOTES.md (helpers wiring)")
+    """(url, tokens, hub): a real Hub + its ApiServer on 127.0.0.1:0 (WP5b ``hub.build_server``).
+
+    ``nodes`` are raw hub ``nodes[]`` entries (dicts, §14.3). Tokens: ``"owner"`` (kind owner) and ``"agent"`` (agent
+    ``test-agent``, operator; ``agent_entry=`` overrides fields such as ``require_approval``/``role``/``nodes``);
+    ``extra_tokens=[(key, entry_without_sha256), …]`` adds more (the plaintext is returned under ``key``). Other
+    keyword arguments deep-merge into the hub config. ``hub.test_stop()`` stops server and hub.
+    """
+    from hive import config, hub as hubmod
+    agent_entry = cfg.pop("agent_entry", {})
+    extra = cfg.pop("extra_tokens", [])
+    home = Path(tempfile.mkdtemp(prefix="hivehub-")).resolve()
+    owner, agent = util.new_token(), util.new_token()
+    toks = {"owner": owner, "agent": agent}
+    entries = [{"name": "owner", "sha256": util.hash_token(owner), "kind": "owner"},
+               dict({"name": "test-agent", "sha256": util.hash_token(agent), "kind": "agent", "role": "operator"},
+                    **agent_entry)]
+    for key, entry in extra:
+        t = util.new_token()
+        toks[key] = t
+        entries.append(dict(entry, sha256=util.hash_token(t)))
+    raw: Dict[str, Any] = {
+        "version": 1, "name": "test-hub", "consent": {"by": "test@host", "at": util.iso_utc(), "text": "test"},
+        "allow_root": True, "data_dir": str(home / "hub"),
+        "listen": {"host": "127.0.0.1", "port": 0}, "network": {"proxy": "off", "use_system_proxy": False},
+        "tokens": entries, "nodes": [dict(n) for n in nodes],
+    }
+    raw = _deep_merge(raw, cfg)
+    path = home / "hub" / "config.json"
+    util.write_json_atomic(path, raw, private=True)
+    conf = config.load_hub_config(str(path))
+    h = hubmod.Hub(conf, config_path=path)
+    h.start()
+    server = hubmod.build_server(h)
+    bound = server.start()
+    h.server = server
+
+    def stop() -> None:
+        server.stop()
+        h.stop()
+        shutil.rmtree(str(home), ignore_errors=True)
+    h.test_stop = stop
+    return f"http://127.0.0.1:{bound[0][1]}", toks, h
 
 
 # ---------------------------------------------------------------------------------------------------------------

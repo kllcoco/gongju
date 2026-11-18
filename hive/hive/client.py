@@ -168,10 +168,53 @@ class HttpTarget(Target):
 
 
 class HubTarget(Target):
-    """In-process Hub + Identity target (WP5b)."""
+    """In-process Hub + Identity + request ip (hub-hosted ``/v1/tools`` and ``/mcp``, §15.2). kind ``"hub"``."""
 
-    def __init__(self, *args: Any, **kwargs: Any):
-        raise unsupported("client.HubTarget not available yet (WP5b)")
+    def __init__(self, hub: Any, identity: Any, ip: str = ""):
+        if hub is None or identity is None:
+            raise bad_request("HubTarget needs a hub and an identity")
+        self.hub = hub
+        self.identity = identity
+        self.ip = ip or ""
+        self.kind = "hub"
+        self.connection: Optional[str] = None
+
+    def call(self, action: str, params: Optional[dict], *, node: Optional[str] = None,
+             timeout: Optional[float] = None, request_id: Optional[str] = None,
+             approval_id: Optional[str] = None) -> dict:
+        """Hub.call envelope -> result (with its ``masked`` flag) or HiveError."""
+        env = self.hub.call(self.identity, action, params or {}, node=node, timeout=timeout, request_id=request_id,
+                            approval_id=approval_id, ip=self.ip)
+        if env.get("ok"):
+            r = env.get("result")
+            return r if isinstance(r, dict) else {"result": r}
+        raise HiveError.from_dict(env.get("error"))
+
+    def cancel(self, request_id: str) -> bool:
+        """Cancel a routed call of this identity."""
+        return bool(self.hub.cancel(request_id, self.identity))
+
+    def whoami(self) -> dict:
+        """GET /v1/whoami body."""
+        return self.hub.whoami(self.identity)
+
+    def nodes(self) -> List[dict]:
+        """NodeSummary rows visible to the identity."""
+        return self.hub.nodes_for(self.identity)
+
+    def actions_info(self, node: Optional[str] = None) -> dict:
+        """The whole /v1/actions body."""
+        return self.hub.actions_for(self.identity, node)
+
+    def actions(self, node: Optional[str] = None) -> List[dict]:
+        """Action rows."""
+        return list(self.actions_info(node).get("actions") or [])
+
+    def close(self) -> None:
+        """Nothing to close."""
+
+    def __repr__(self) -> str:
+        return f"HubTarget({getattr(self.hub, 'name', '?')!r}, {getattr(self.identity, 'name', '?')!r})"
 
 
 class Client:
