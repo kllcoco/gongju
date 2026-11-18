@@ -1601,3 +1601,70 @@ X-W7. **README:** upgrade/uninstall rewritten (venv pip first, `service uninstal
     `pip install` leftovers (`build/`, `*.egg-info`). `tests/test_readme.py`'s `sh` parser knows `--approval`.
     Regression tests: `tests/test_walkthrough.py` (incl. a real pty `node run` that survives `node token add` with the
     same pid), plus assertions in `test_cli_wp6b.py`.
+
+### Security audit (approvals, services, jobs, policy, HTTP)
+
+X-S1. **Approval review cwd (finding 1, HIGH; `presets.py`, `approvals.py`):** `presets._review_cwd(policy, cwd)`
+    replaces `_resolve_cwd` and never falls back to the workdir for a given cwd: it resolves the cwd like
+    `check_cwd` does at run time (`~`/variables, relative -> workdir, realpath; through `resolve_path` without
+    `must_exist`), shows it verbatim as `cwd: <given> (= <real>)` plus "(does not exist here yet)" or "(not usable
+    here: <reason>)" (none given: `<workdir> (node workdir)`), and binds the command words against it (a script in a
+    missing folder is `absent`). Contract change: node-side reviews of shell.run/job.start/service.define/
+    service.start/service.restart carry a fifth key `cwd` (the real path; hub reviews do not); `ApprovalStore.require`
+    copies it into the record (`rec["cwd"]`) and, on consume, compares it with the fresh review's `cwd`: different
+    or missing -> the record is used up and `conflict` "the working folder of the approved command changed; request
+    approval again" (`details.changed=[<approved cwd>]`). DESIGN §5.6, T16 (v8.1).
+X-S2. **Approved fingerprints survive restarts (finding 2, HIGH; `approvals.py`, `services.py`, `jobs.py`,
+    `policy.py`):** `FileHolds.fingerprints(hold_id) -> {real path: approved fingerprint}`. Service run state key
+    `approved_files` (persisted in runtime.json; `_new_rs` default `{}`): `define` replaces it with its own hold's
+    fingerprints (`{}` without a hold); a manual start/restart (`_spawn` with ctx -> `_set_approved`) re-fingerprints
+    the earlier entries (an ungated/owner start re-approves what it runs) and merges the call's hold over them.
+    `_system_spawn` (supervisor respawn, backoff, autostart, same-boot restart) calls `_hold_approved`: the stored
+    fingerprints are verified and held with `FileHolds.acquire` under the system identity (without `rt.holds`: plain
+    compare); mismatch -> no spawn, `_fail(name, APPROVED_CHANGED_ERROR)` (state `failed`, `last_error` "approved file
+    changed; approve a start again"); the hold goes to `_spawn(hold=…)` (new kwarg) and is released if the spawn did
+    not take it. `_rehold` (adoption after a node restart) acquires against the stored fingerprints; a 1.0.0 run state
+    without them (held paths, empty `approved_files`) is migrated with the current content; on a mismatch nothing is
+    held, `held_paths=[]`, `last_error` = the error + " (changed while the node was down: …)", the process keeps
+    running and its next respawn is refused. `policy_view()` adds `code_files` (every defined service's
+    `approved_files` keys; the view cache is reset when they change) and `_service_code_patterns` adds them as exact
+    paths, so gated identities cannot write a bound file while the definition exists (rule `exec_path`, "code of a
+    managed service"; `test_services.test_restart_binds_script_argument` now expects that after the stop and frees the
+    path on remove). Jobs: records store `approved_files` with `held_paths`; `_rehold` acquires against them (1.0.0
+    records: current content); a mismatch -> not held, `held_paths=[]`, `rec["warning"]`, and `error` =
+    "warning: approved file changed while the node was down: …" when no error was set. DESIGN §5.4 step 7, §5.6, T16
+    (crash-restart residual closed for bound files) (v8.1).
+X-S3. **cd in compound commands (finding 3, MEDIUM; `presets.py`, `hub.py`):** `presets.bindable_words(argv_or_command,
+    shell=, os_name=) -> (words to bind, moved)`: like `candidate_words`, but after a word for which
+    `presets.changes_cwd(w)` holds (basename, case-insensitive, `.exe` stripped, in `CWD_CHANGERS` = cd, pushd, popd,
+    chdir, set-location, sl, push-location, pop-location; or an option matching `-C…`, `--directory[=…]`,
+    `--chdir[=…]`, `-chdir=…`, `--work-tree[=…]`, `--git-dir[=…]`) every later *relative* candidate
+    (`presets.relative_word`: not `~`, `/`, `\` or a drive path) goes to `moved` and is not bound.
+    `presets.moved_items(moved, is_file)` names the path-like ones and those naming a file in the cwd as
+    "<word> (cwd may change)" in the not-bound header (so `bash` and the `cd` target are left out). The node review
+    and `Hub._review` share it; `Hub._split` now returns `(words, moved)`, `Hub._bind_words` returns
+    `(words, cwd, moved)`, and the hub checks non-path-like moved words with one `fs.stat` each (`Hub._is_file`,
+    request id suffix `.b900`). `candidate_words` is unchanged. DESIGN §5.6 (v8.1).
+X-S4. **Exec paths (finding 4, MEDIUM; `policy.py`):** `DEFAULT_EXEC_PATHS` adds `~/.local/share/jupyter/**`,
+    `~/Library/Jupyter/**`, `~/AppData/Roaming/jupyter/**`, `~/.bashrc.d/**`, `~/.zshrc.d/**`, `~/.zlogout`,
+    `~/.oh-my-zsh/custom/**`, `~/.xsession`, `~/.pam_environment`, `~/.config/plasma-workspace/**`,
+    `~/.kde*/Autostart/**`, `~/.kde*/env/**`, `~/.config/i3/**`, `~/.config/sway/**`, `~/.config/hypr/**`,
+    `~/.Rprofile`, `~/.Renviron`, `~/.gdbinit`, `~/.emacs`, `~/.emacs.d/**`, `~/.config/emacs/**`, `~/.vim/**`,
+    `~/.tmux.conf`, `~/.config/tmux/**`, `~/.wezterm.lua`, `~/.config/wezterm/**`, `~/.hgrc`, `**/.hg/hgrc`,
+    `**/.yarnrc.yml`, `~/.config/direnv/**`, `~/.config/systemd/*.conf`, `~/.config/systemd/*.conf.d/**`.
+    DESIGN §5.5, overview item 7 (v8.1). The allowlist idea (writable dot-paths for gated identities) is not taken:
+    it would break ordinary project dotfiles (`.gitignore`, `.env.example`) for files tokens.
+X-S5. **Job visibility (finding 5, LOW; `jobs.py`, `actions/jobs.py`):** `jobs.job_owner(identity)` (the stored
+    `owner`, `display_name`), `jobs.sees_all_jobs(identity)`: true for kinds owner/system/node and for identities
+    that are not `exec_gated` (§5.2 rule, or the hub/relay `exec_gated` flag). Otherwise job.list filters by owner
+    (`JobManager.list(owner=)`) and job.status/job.logs/job.stop first call `JobManager.check_visible(job_id, owner)`
+    -> `not_found` like an unknown id (`_rec(job_id, owner)`; the hint lists only the caller's recent jobs). Services
+    stay shared (documented in SECURITY.md "Honest limits"). DESIGN §9.5 (v8.1).
+X-S6. **Host header (finding 6, INFO; `httpserver.py`):** `httpserver.valid_host_header(v)`: `host[:1-5 digits]`
+    with host a name/IPv4 (`[A-Za-z0-9_][A-Za-z0-9._-]*`) or a bracketed IPv6 literal (optional `%zone`); a request
+    with a Host header that does not match -> 400 `bad_request` "invalid Host header" (hint "send Host as
+    name[:port]") before `_client`/`_check_host`. DESIGN §6 (T7, route checks) (v8.1).
+    Regression tests: `tests/test_sec_audit.py` (findings 1, 2, 3, 5), `test_policy.TestDenyWrite` (4),
+    `test_httpserver.test_v81_strict_host_header` (6), `test_hub.TestHubFileBinding.test_v81_cd_unbinds_later_relative_words`
+    (3, hub side), updated `test_shell` (cd header, review `cwd` key), `test_phase2_review` (`Hub._split` tuple),
+    `test_services` (`code_files`, bound file stays protected while defined).
