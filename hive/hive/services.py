@@ -49,6 +49,9 @@ AUTOSTART_STAGGER_S = 2.0
 STATUS_TAIL_UNHEALTHY = 40
 PAUSED_ERROR = "stopped while paused (panic or crash); start it again with service_control"
 REBOOT_ERROR = "not restarted after reboot (autostart=false); use service_control start, or set autostart=true"
+# v8.1 (external review): a crash restart, autostart or re-hold found an approved file changed (the run state keeps the
+# approved {path: fingerprint} of the last approval that bound files for this service)
+APPROVED_CHANGED_ERROR = "approved file changed; approve a start again"
 EXEC_DISABLED_ERROR = "exec disabled by node policy"
 DOCKER_WAIT_ERROR = "waiting for the Docker daemon (start Docker Desktop)"
 WSL_ERROR = ("services cannot be supervised across wsl.exe (no Linux pid, health, GPU attribution or adoption after "
@@ -435,7 +438,7 @@ class ServiceManager:
         return {"v": 1, "desired": "stopped", "state": "stopped", "health": "none", "shim_pid": None,
                 "shim_ctime": None, "child_pid": None, "child_ctime": None, "started_at": None, "boot_key": None,
                 "restarts": [], "last_exit_code": None, "last_error": None, "next_restart_at": None,
-                "held_paths": [], "adopted": False}
+                "held_paths": [], "adopted": False, "approved_files": {}}
 
     def _set(self, name: str, **kw: Any) -> None:
         with self._lock:
@@ -593,16 +596,94 @@ class ServiceManager:
 
     # ------------------------------------------------------------------------------------------- holds
     def _rehold(self, name: str, rs: Dict[str, Any]) -> None:
+        """Adoption after a node restart: hold the approved files again, checked against the STORED approved
+        fingerprints (v8.1); a file changed while the node was down -> no hold, ``last_error`` says so, and the next
+        respawn refuses to run it (the running process is left alone)."""
         paths = rs.get("held_paths") or []
         holds = getattr(self.rt, "holds", None)
+        approved = rs.get("approved_files")
+        if not isinstance(approved, dict):
+            approved = {}
+        if paths and not approved:
+            # a 1.0.0 run state (no approved_files): only the current content is known; keep it from now on
+            from .approvals import file_fingerprint
+            approved = {}
+            for p in paths:
+                try:
+                    approved[p] = file_fingerprint(p)
+                except OSError:
+                    approved[p] = "unreadable"
+            rs["approved_files"] = approved
+            self._view = None
         if not paths or holds is None:
             return
         try:
-            from .approvals import file_fingerprint
-            hid = holds.acquire({p: file_fingerprint(p) for p in paths}, policy=self._system_eff())
+            hid = holds.acquire({p: approved.get(p) for p in paths}, policy=self._system_eff())
             rs["_hold"] = hid
+        except HiveError as e:
+            rs["held_paths"] = []
+            if e.code == "conflict":
+                rs["last_error"] = APPROVED_CHANGED_ERROR + " (changed while the node was down: " + \
+                    ", ".join(str(x) for x in (e.details.get("changed") or [])[:4]) + ")"
+            log.warning("service %s: could not hold its approved files again: %s", name, e.message)
         except Exception as e:  # noqa: BLE001
+            rs["held_paths"] = []
             log.warning("service %s: could not hold its approved files again: %s", name, e)
+
+    def _hold_approved(self, name: str) -> Tuple[bool, Optional[str]]:
+        """(ok, hold id) for a system spawn (crash restart, autostart, same-boot restart): the stored approved
+        fingerprints are verified and held in one step (v8.1); no approved files -> (True, None)."""
+        with self._lock:
+            approved = dict((self._rs.get(name) or {}).get("approved_files") or {})
+        if not approved:
+            return True, None
+        holds = getattr(self.rt, "holds", None)
+        try:
+            eff = self._system_eff()
+        except HiveError:
+            return False, None
+        if holds is not None:
+            try:
+                return True, holds.acquire(approved, policy=eff)
+            except HiveError:
+                return False, None
+        from .approvals import file_fingerprint
+        for p, want in approved.items():
+            try:
+                cur = file_fingerprint(str(eff.resolve_path(p)),
+                                       prefer_stat=bool(want and str(want).startswith("stat:")))
+            except Exception:  # noqa: BLE001
+                return False, None
+            if cur != want:
+                return False, None
+        return True, None
+
+    def _set_approved(self, name: str, ctx: Optional["ActionContext"]) -> None:
+        """A manual start/define with the calling identity (v8.1): the approved fingerprints become those of the
+        call's hold (an approval that bound files), merged over the earlier ones re-fingerprinted now (an ungated
+        or owner start re-approves what it runs; gated identities cannot change those paths meanwhile, they are
+        in the service code patterns)."""
+        from .approvals import file_fingerprint
+        holds = getattr(self.rt, "holds", None)
+        hold = getattr(ctx, "hold", None) if ctx is not None else None
+        new: Dict[str, Optional[str]] = {}
+        with self._lock:
+            old = dict((self._rs.get(name) or {}).get("approved_files") or {})
+        for p, want in old.items():
+            try:
+                new[p] = file_fingerprint(p, prefer_stat=bool(want and str(want).startswith("stat:")))
+            except OSError:
+                new[p] = "unreadable"
+        if hold and holds is not None:
+            try:
+                new.update(holds.fingerprints(hold))
+            except Exception:  # noqa: BLE001
+                pass
+        with self._lock:
+            rs = self._rs.get(name)
+            if rs is not None:
+                rs["approved_files"] = new
+            self._view = None
 
     def _release_hold(self, name: str) -> None:
         with self._lock:
@@ -779,7 +860,7 @@ class ServiceManager:
         return "failed"
 
     def _spawn(self, name: str, *, eff: Any, ctx: Optional["ActionContext"] = None, count_restart: bool = False,
-               manual: bool = False) -> None:
+               manual: bool = False, hold: Optional[str] = None) -> None:
         """Pre-spawn checks and the shim spawn (caller holds the service op lock)."""
         with self._lock:
             d = dict(self._defs.get(name) or {})
@@ -863,7 +944,9 @@ class ServiceManager:
             if manual:
                 raise
             return
-        hold = getattr(ctx, "hold", None) if ctx is not None else None
+        if ctx is not None:
+            self._set_approved(name, ctx)
+            hold = getattr(ctx, "hold", None)
         held: List[str] = []
         holds = getattr(self.rt, "holds", None)
         if hold and holds is not None:
@@ -872,7 +955,8 @@ class ServiceManager:
                 held = holds.paths(hold)
             except Exception:  # noqa: BLE001
                 held = []
-            ctx.hold = None
+            if ctx is not None:
+                ctx.hold = None
         now_iso = util.iso_utc()
         kind = self._health_kind(d)
         with self._lock:
@@ -935,7 +1019,19 @@ class ServiceManager:
             except HiveError as e:
                 self._fail(name, e.message)
                 return
-            self._spawn(name, eff=eff, count_restart=count_restart)
+            ok, hid = self._hold_approved(name)
+            if not ok:      # v8.1: never run a bound file the owner did not approve (crash restart, autostart)
+                self._fail(name, APPROVED_CHANGED_ERROR)
+                log.warning("service %s: %s", name, APPROVED_CHANGED_ERROR)
+                return
+            try:
+                self._spawn(name, eff=eff, count_restart=count_restart, hold=hid)
+            finally:
+                with self._lock:
+                    taken = bool(hid) and (self._rs.get(name) or {}).get("_hold") == hid
+                holds = getattr(self.rt, "holds", None)
+                if hid and not taken and holds is not None:
+                    holds.release(hid)
 
     # ------------------------------------------------------------------------------------------- supervisor
     def _supervisor(self) -> None:
@@ -1813,6 +1909,13 @@ class ServiceManager:
             changed = sorted(k for k in set(existing) | set(definition)
                              if k not in ignore and existing.get(k) != definition.get(k))
         created = existing is None
+        holds = getattr(self.rt, "holds", None)
+        approved: Dict[str, Optional[str]] = {}
+        if ctx.hold and holds is not None:
+            try:
+                approved = holds.fingerprints(ctx.hold)
+            except Exception:  # noqa: BLE001
+                approved = {}
         with self._op(name):
             with self._lock:
                 self._defs[name] = definition
@@ -1821,6 +1924,9 @@ class ServiceManager:
                     nrs.update(_gen=0, _health={"last_check": None, "latency_ms": None, "consecutive_failures": 0,
                                                 "last_error": None})
                     self._rs[name] = nrs
+                # v8.1: a new definition replaces the approved fingerprints with those its own approval bound
+                # (none for an ungated define); autostart and crash restarts check them
+                self._rs[name]["approved_files"] = approved
                 self._view = None
             self._save_defs()
             self._save_rs(name)
@@ -1898,8 +2004,9 @@ class ServiceManager:
         return out
 
     def policy_view(self) -> dict:
-        """``{"endpoints": [...], "code_dirs": [...]}`` of the defined services (cached; rebuilt when services.json
-        changes or a define/remove happens)."""
+        """``{"endpoints": [...], "code_dirs": [...], "code_files": [...]}`` of the defined services (cached; rebuilt
+        when services.json changes or a define/remove/approved start happens). v8.1: ``code_files`` are the files the
+        services' approvals bound (run state ``approved_files``), not writable by gated identities."""
         try:
             mt = self.defs_path.stat().st_mtime
         except OSError:
@@ -1915,6 +2022,11 @@ class ServiceManager:
             eff = None
         with self._lock:
             defs = [dict(d) for d in self._defs.values()]
+            files: List[str] = []
+            for n in self._defs:
+                for f in (self._rs.get(n) or {}).get("approved_files") or {}:
+                    if f not in files:
+                        files.append(str(f))
         eps: List[str] = []
         dirs: List[str] = []
         for d in defs:
@@ -1923,7 +2035,7 @@ class ServiceManager:
             for cd in self._code_dirs(d, node_path, eff):
                 if cd not in dirs:
                     dirs.append(cd)
-        view = {"endpoints": eps, "code_dirs": dirs}
+        view = {"endpoints": eps, "code_dirs": dirs, "code_files": files}
         self._view, self._view_mtime = view, mt
         return view
 

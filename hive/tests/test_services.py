@@ -330,7 +330,7 @@ class TestEndpoints(SvcCase):
         self.assertEqual([(r["name"], r["source"], r["api"]) for r in rows], [("ollama", "service", "ollama")])
 
     def test_policy_view(self):
-        self.assertEqual(self.sm.policy_view(), {"endpoints": [], "code_dirs": []})
+        self.assertEqual(self.sm.policy_view(), {"endpoints": [], "code_dirs": [], "code_files": []})
         venv = self.n.home / ".venvs" / "vllm" / "bin"
         venv.mkdir(parents=True)
         py = venv / "python"
@@ -349,7 +349,7 @@ class TestEndpoints(SvcCase):
             self.n.rt.effective(CAUTIOUS).resolve_path(str(comfy / "custom_nodes" / "a.py"), write=True)
         self.n.rt.effective(OPERATOR).resolve_path(str(comfy / "custom_nodes" / "a.py"), write=True)
         self.n.ok("service.remove", {"name": "v"})
-        self.assertEqual(self.sm.policy_view(), {"endpoints": [], "code_dirs": []})
+        self.assertEqual(self.sm.policy_view(), {"endpoints": [], "code_dirs": [], "code_files": []})
 
     def test_code_dir_home_warning(self):
         r = self.define(name="h", argv=SLEEPER, cwd=str(self.n.home), health="none", start=False)
@@ -650,6 +650,12 @@ class TestServiceApprovals(SvcCase):
         with self.assertRaises(HiveError):
             self.n.rt.effective(CAUTIOUS).resolve_path(str(svc), write=True)
         self.n.ok("service.stop", {"name": "r", "wait": 20})
+        # v8.1 (external review): a bound file stays unwritable for gated identities while the definition exists
+        # (service code patterns), not only while held; removing the service frees it
+        with self.assertRaises(HiveError) as cm:
+            self.n.rt.effective(CAUTIOUS).resolve_path(str(svc), write=True)
+        self.assertEqual(cm.exception.details.get("rule"), "exec_path")
+        self.n.ok("service.remove", {"name": "r", "wait": 20})
         self.n.rt.effective(CAUTIOUS).resolve_path(str(svc), write=True)
 
 

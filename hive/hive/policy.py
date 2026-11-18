@@ -817,6 +817,11 @@ class EffectivePolicy:
             if self.p._is_root_or_ancestor(key):
                 continue
             out.append(_escape_glob(key) + "/**")
+        for f in view.get("code_files") or ():   # v8.1: the files a service's approval bound
+            try:
+                out.append(_escape_glob(self.p._norm(str(f))))
+            except Exception:  # noqa: BLE001
+                continue
         return out
 
     def _deny_reason(self, key: str, real: str, *, write: bool) -> Optional[HiveError]:

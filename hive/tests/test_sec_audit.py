@@ -4,10 +4,13 @@ Exec paths (finding 4) are in test_policy, the Host header (finding 6) in test_h
 from __future__ import annotations
 
 import os
+import time
 import unittest
+from unittest import mock
 
-from hive import presets, proctree
-from tests.wp2util import CAUTIOUS, OPERATOR, OWNER, PY, Node, ident
+from hive import presets, proctree, services
+from hive.errors import HiveError
+from tests.wp2util import CAUTIOUS, OPERATOR, OWNER, PY, Node, ident, wait_for
 
 HAS_BASH = proctree.shell_path("bash") is not None
 POSIX = os.name != "nt"
@@ -107,7 +110,8 @@ class TestJobVisibility(unittest.TestCase):
         ro = ident(("read",), name="ro")
         with Node() as n:
             own = n.ok("job.start", {"argv": [PY, "-c", "print('OWNER-PRIVATE-OUTPUT')"]}, identity=OWNER)["job_id"]
-            env = n.run_approved("job.start", {"argv": [PY, "-c", "import time; print('CAUTIOUS-OUT'); time.sleep(30)"]})
+            env = n.run_approved("job.start", {"argv": [PY, "-c",
+                                                        "import time; print('CAUTIOUS-OUT', flush=True); time.sleep(30)"]})
             self.assertTrue(env["ok"], env)
             mine = env["result"]["job_id"]
             self.assertTrue(n.rt.jobs.wait_final(own, 15))
@@ -122,7 +126,7 @@ class TestJobVisibility(unittest.TestCase):
             self.assertEqual(n.err("job.stop", {"job_id": own}, identity=CAUTIOUS)["code"], "not_found")
             # the cautious agent's own job: visible to it, not to the readonly token
             self.assertIn(mine, [j["job_id"] for j in n.ok("job.list", {}, identity=CAUTIOUS)["jobs"]])
-            self.assertIn("CAUTIOUS-OUT", str(n.ok("job.logs", {"job_id": mine, "wait": 5}, identity=CAUTIOUS)))
+            wait_for(lambda: "CAUTIOUS-OUT" in str(n.ok("job.logs", {"job_id": mine}, identity=CAUTIOUS)), 10)
             self.assertNotIn(mine, [j["job_id"] for j in n.ok("job.list", {}, identity=ro)["jobs"]])
             self.assertEqual(n.err("job.logs", {"job_id": mine}, identity=ro)["code"], "not_found")
             # owner and an ungated operator keep seeing (and stopping) every job
@@ -141,6 +145,117 @@ class TestJobVisibility(unittest.TestCase):
         self.assertFalse(sees_all_jobs(ident(("read", "write"), name="files")))
         self.assertFalse(sees_all_jobs(ident(name="hub", kind="hub", via="hub", exec_gated=True)))
         self.assertTrue(sees_all_jobs(ident(name="hub", kind="hub", via="hub")))
+
+
+class TestApprovedFilesSurviveRestarts(unittest.TestCase):
+    """Audit finding 2: a crash restart / re-hold ran (or accepted) a bound file the owner never approved."""
+
+    def setUp(self):
+        for attr, val in (("TICK", 0.2), ("NO_HEALTH_ALIVE_S", 0.5)):
+            p = mock.patch.object(services, attr, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self.n = Node()
+        self.n.__enter__()
+        self.addCleanup(self.n.__exit__, None, None, None)
+        (self.n.home / "lib").mkdir()
+        (self.n.home / "svc").mkdir()
+        self.x = self.n.home / "lib" / "x.py"
+
+    def rs(self, name):
+        return self.n.rt.services.runtime(name)
+
+    def test_crash_restart_refuses_changed_script(self):
+        self.x.write_text("import time\nprint('benign v1', flush=True)\ntime.sleep(1.5)\nraise SystemExit(1)\n")
+        p = {"name": "x", "argv": [PY, str(self.x)], "cwd": "~/svc", "restart": "on-failure", "health": "none",
+             "restart_delay": 1}
+        env = self.n.run_approved("service.define", p)
+        self.assertTrue(env["ok"], env)
+        self.assertEqual(list(self.rs("x")["approved_files"]), [os.path.realpath(str(self.x))])
+        # the gated agent cannot rewrite it, neither while it runs nor between runs (service code while defined)
+        e = self.n.err("fs.write", {"path": str(self.x), "content": "print('EVIL')"}, identity=CAUTIOUS)
+        self.assertIn(e["code"], ("policy_denied", "conflict"))
+        wait_for(lambda: self.rs("x")["state"] in ("backoff", "stopped", "failed"), 20)
+        # someone else (or anything while the node was down) changes it: the respawn must not run it
+        self.x.write_text("print('EVIL v2 - never approved', flush=True)\n")
+        wait_for(lambda: self.rs("x")["state"] == "failed", 20)
+        self.assertEqual(self.rs("x")["last_error"], services.APPROVED_CHANGED_ERROR)
+        time.sleep(0.5)
+        log = self.n.ok("service.logs", {"name": "x"})
+        self.assertIn("benign v1", str(log))
+        self.assertNotIn("EVIL", str(log))
+        self.assertEqual(self.n.rt.holds.held_keys(), [])
+        # a new approved start binds the new content and runs it
+        env = self.n.run_approved("service.start", {"name": "x"})
+        self.assertTrue(env["ok"], env)
+        wait_for(lambda: "EVIL v2" in str(self.n.ok("service.logs", {"name": "x"})), 20)
+
+    def test_unchanged_script_restarts(self):
+        self.x.write_text("import time\nprint('run', flush=True)\ntime.sleep(0.8)\nraise SystemExit(1)\n")
+        p = {"name": "y", "argv": [PY, str(self.x)], "restart": "on-failure", "health": "none", "restart_delay": 1}
+        self.assertTrue(self.n.run_approved("service.define", p)["ok"])
+        wait_for(lambda: len(self.rs("y")["restarts"]) >= 1, 20)
+        self.assertNotEqual(self.rs("y")["last_error"], services.APPROVED_CHANGED_ERROR)
+
+    def test_rehold_after_node_restart_checks_stored_fingerprints(self):
+        self.x.write_text("import time\nprint('MARK-STARTED', flush=True)\ntime.sleep(5)\nraise SystemExit(1)\n")
+        p = {"name": "z", "argv": [PY, str(self.x)], "restart": "on-failure", "health": "none", "restart_delay": 1}
+        self.assertTrue(self.n.run_approved("service.define", p)["ok"])
+        wait_for(lambda: self.rs("z")["held_paths"], 10)
+        wait_for(lambda: "MARK-STARTED" in str(self.n.ok("service.logs", {"name": "z"})), 10)   # python has read x.py
+        self.n.stop_runtime()
+        self.x.write_text("print('EVIL while the node was down')\n")
+        self.n.rt = self.n.make_runtime()
+        rs = self.rs("z")
+        self.assertTrue(rs["adopted"])
+        self.assertTrue(rs["last_error"].startswith(services.APPROVED_CHANGED_ERROR), rs["last_error"])
+        self.assertEqual(rs["held_paths"], [])
+        # it exits with 1 (on-failure): the supervisor must not run the changed file
+        wait_for(lambda: self.rs("z")["state"] == "failed", 30)
+        self.assertEqual(self.rs("z")["last_error"], services.APPROVED_CHANGED_ERROR)
+        self.assertNotIn("EVIL", str(self.n.ok("service.logs", {"name": "z"})))
+
+    def test_autostart_checks_stored_fingerprints(self):
+        self.x.write_text("import time\ntime.sleep(60)\n")
+        p = {"name": "a", "argv": [PY, str(self.x)], "health": "none", "autostart": True}
+        self.assertTrue(self.n.run_approved("service.define", p)["ok"])
+        self.n.ok("service.stop", {"name": "a", "wait": 20})
+        self.n.stop_runtime()
+        self.x.write_text("print('EVIL at boot')\n")
+        with mock.patch.object(services.util, "same_boot", return_value=False):
+            self.n.rt = self.n.make_runtime()
+            wait_for(lambda: self.rs("a")["state"] == "failed", 20)
+        self.assertEqual(self.rs("a")["last_error"], services.APPROVED_CHANGED_ERROR)
+        self.assertNotIn("EVIL", str(self.n.ok("service.logs", {"name": "a"})))
+
+    def test_owner_start_reapproves_current_content(self):
+        self.x.write_text("import time\ntime.sleep(60)\n")
+        self.assertTrue(self.n.run_approved("service.define", {"name": "o", "argv": [PY, str(self.x)],
+                                                               "health": "none"})["ok"])
+        self.n.ok("service.stop", {"name": "o", "wait": 20})
+        self.x.write_text("import time\ntime.sleep(61)\n")       # the owner edits their service
+        self.n.ok("service.start", {"name": "o"}, identity=OWNER)
+        from hive.approvals import file_fingerprint
+        real = os.path.realpath(str(self.x))
+        self.assertEqual(self.rs("o")["approved_files"], {real: file_fingerprint(real)})
+
+    def test_job_rehold_after_node_restart_checks_stored_fingerprints(self):
+        self.x.write_text("import time\nprint('MARK-STARTED', flush=True)\ntime.sleep(60)\n")
+        env = self.n.run_approved("job.start", {"argv": [PY, str(self.x)]})
+        self.assertTrue(env["ok"], env)
+        jid = env["result"]["job_id"]
+        wait_for(lambda: "MARK-STARTED" in str(self.n.ok("job.logs", {"job_id": jid})), 10)    # python has read x.py
+        rec = self.n.rt.jobs.record(jid)
+        self.assertEqual(list(rec["approved_files"]), [os.path.realpath(str(self.x))])
+        self.n.stop_runtime()
+        self.x.write_text("print('changed')\n")
+        self.n.rt = self.n.make_runtime()
+        rec = self.n.rt.jobs.record(jid)
+        self.assertTrue(rec["adopted"])
+        self.assertIn("approved file changed while the node was down", rec["error"])
+        self.assertEqual(rec["held_paths"], [])
+        self.n.ok("fs.write", {"path": str(self.x), "content": "x = 1\n"}, identity=CAUTIOUS)   # not held
+        self.n.ok("job.stop", {"job_id": jid, "force": True})
 
 
 if __name__ == "__main__":

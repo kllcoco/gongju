@@ -302,17 +302,33 @@ class JobManager:
             shutil.rmtree(rd, ignore_errors=True)
 
     def _rehold(self, jid: str, rec: Dict[str, Any]) -> None:
+        """Adoption after a node restart: hold the approved files again, checked against the fingerprints the
+        approval bound (``approved_files``, v8.1). A file changed while the node was down is not held again and the
+        job record gets a warning (in ``error``; the running process is left alone)."""
         paths = rec.get("held_paths") or []
         holds = getattr(self.rt, "holds", None)
         if not paths or holds is None:
             return
+        from .approvals import file_fingerprint
+        approved = rec.get("approved_files") if isinstance(rec.get("approved_files"), dict) else None
         try:
-            from .approvals import file_fingerprint
             from .auth import system_identity
             eff = self.rt.effective(system_identity("node:autostart"))
-            hid = holds.acquire({p: file_fingerprint(p) for p in paths}, policy=eff)
+            if approved is None:     # a 1.0.0 record: only the current content is known
+                approved = {p: file_fingerprint(p) for p in paths}
+                rec["approved_files"] = approved
+            hid = holds.acquire({p: approved.get(p) for p in paths}, policy=eff)
             with self._lock:
                 self._holds[jid] = hid
+        except HiveError as e:
+            with self._lock:
+                rec["held_paths"] = []
+                if e.code == "conflict":
+                    changed = ", ".join(str(x) for x in (e.details.get("changed") or [])[:4])
+                    rec["warning"] = f"approved file changed while the node was down: {changed}"
+                    if not rec.get("error"):
+                        rec["error"] = "warning: " + rec["warning"] + " (the job kept running; it is not held)"
+            log.warning("job %s: could not hold its approved files again: %s", jid, e.message)
         except Exception as e:  # noqa: BLE001
             log.warning("job %s: could not hold its approved files again: %s", jid, e)
 
@@ -425,6 +441,7 @@ class JobManager:
         if hold and holds is not None:
             try:
                 rec["held_paths"] = holds.paths(hold)
+                rec["approved_files"] = holds.fingerprints(hold)     # v8.1: re-hold checks THESE after a restart
             except Exception:  # noqa: BLE001
                 rec["held_paths"] = []
         spec = {"v": 1, "argv": argv, "cmdline": cmdline, "cwd": str(cwd), "env": env, "stdin_file": stdin_file,

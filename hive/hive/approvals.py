@@ -346,6 +346,7 @@ class FileHolds:
         self._holds: Dict[str, Set[str]] = {}
         self._count: Dict[str, int] = {}
         self._paths: Dict[str, List[str]] = {}
+        self._fps: Dict[str, Dict[str, Optional[str]]] = {}
 
     def acquire(self, files: Dict[str, Optional[str]], *, policy: "EffectivePolicy") -> str:
         """Re-fingerprint every path through ``policy.resolve_path`` and hold them; ``conflict`` when any changed."""
@@ -353,6 +354,7 @@ class FileHolds:
             changed: List[str] = []
             keys: Set[str] = set()
             reals: List[str] = []
+            fps: Dict[str, Optional[str]] = {}
             for p, expected in (files or {}).items():
                 try:
                     real = policy.resolve_path(p)
@@ -370,12 +372,14 @@ class FileHolds:
                     continue
                 keys.add(key)
                 reals.append(str(real))
+                fps[str(real)] = expected
             if changed:
                 raise conflict("a file used by the approved command changed; request approval again",
                                changed=changed, hint="request approval again; the owner sees the new content")
             hid = "ho_" + secrets.token_urlsafe(12)
             self._holds[hid] = keys
             self._paths[hid] = reals
+            self._fps[hid] = fps
             for k in keys:
                 self._count[k] = self._count.get(k, 0) + 1
             return hid
@@ -385,6 +389,7 @@ class FileHolds:
         with self._lock:
             keys = self._holds.pop(hold_id, None)
             self._paths.pop(hold_id, None)
+            self._fps.pop(hold_id, None)
             for k in keys or ():
                 n = self._count.get(k, 0) - 1
                 if n <= 0:
@@ -406,6 +411,12 @@ class FileHolds:
         """Real paths of a hold (job records and service run state store them)."""
         with self._lock:
             return list(self._paths.get(hold_id, []))
+
+    def fingerprints(self, hold_id: str) -> Dict[str, Optional[str]]:
+        """``{real path: verified fingerprint}`` of a hold (None: bound as absent). v8.1: service run state and job
+        records keep them, so a respawn, autostart or re-hold after a node restart checks the APPROVED content."""
+        with self._lock:
+            return dict(self._fps.get(hold_id, {}))
 
 
 __all__ = ["APPROVAL_ID_PATTERN", "GRANT_ID_PATTERN", "ApprovalStore", "FileHolds", "params_hash",
