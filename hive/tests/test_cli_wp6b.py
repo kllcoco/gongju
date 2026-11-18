@@ -465,7 +465,7 @@ class TestMcpConfig(CliCase):
         code, out, err = run(["mcp-config", "--client", "claude-code"], env=self.env())
         self.assertEqual(code, 0, err)
         self.assertIn("default connection 'this-pc'", out)
-        self.assertIn("claude mcp add hive -- ", out)
+        self.assertRegex(out, r"claude mcp add hive (-e HIVE_HOME=\S+ )?-- ")    # v8.1: a custom HIVE_HOME is passed
         self.assertIn("--wait-budget 110", out)
         self.assertEqual(run(["mcp-config", "--connection", "nope"], env=self.env())[0], 2)
 

@@ -530,7 +530,11 @@ def _install_watchdog(ctx: _Ctx, res: InstallResult, *, dry_run: bool, capture_p
     res.files.append(str(script))
     start = ["/bin/sh", str(script)]
     line = f"nohup /bin/sh {_sq(str(script))} >/dev/null 2>&1 &"
-    res.notes.append(f"add to the pod/container start command: {line}")
+    res.notes.append(f"no systemd user session here, so Hive uses its own small watchdog script: it runs the "
+                     f"{ctx.kind} in the background now and restarts it if it exits")
+    res.notes.append("it does not come back by itself after a reboot; to start it at boot/login add this line to "
+                     f"your login script (e.g. ~/.profile), your desktop's autostart, or a pod/container start "
+                     f"command: {line}")
     res.notes.append("pod templates can use deploy/runpod/start-hive.sh instead (it bootstraps hive.pyz and runs "
                      "the same loop)")
     if dry_run:

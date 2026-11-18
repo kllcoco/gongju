@@ -259,6 +259,33 @@ def _which_not_cwd(cmd: str) -> Optional[str]:
 # ---------------------------------------------------------------------------------------------------------------
 # init
 
+def _hidden_input(prompt: str) -> str:
+    """A prompt without echo; Ctrl-D / Ctrl-C end it cleanly (a CliError, nothing saved) instead of a traceback."""
+    try:
+        return getpass.getpass(prompt)
+    except (EOFError, KeyboardInterrupt):
+        sys.stderr.write("\n")
+        raise CliError("cancelled; nothing was saved")
+
+
+def _token_from_stdin(what: str = "token") -> str:
+    """``--token -``: one line from a pipe, or a prompt without echo in a terminal (v8.1)."""
+    if sys.stdin is not None and not sys.stdin.isatty():
+        try:
+            v = sys.stdin.readline().strip()
+        except (OSError, ValueError, KeyboardInterrupt):
+            v = ""
+        if not v:
+            raise CliError(f"no {what} on stdin")
+    else:
+        v = _hidden_input(f"paste the {what} (not shown), then Enter: ").strip()
+        if not v:
+            raise CliError(f"no {what} given; nothing was saved")
+    if any(c.isspace() for c in v):
+        raise CliError(f"that does not look like a {what} (it contains spaces)")
+    return v
+
+
 def _read_token_arg(args: argparse.Namespace, out: Out) -> Optional[str]:
     if getattr(args, "token_env", None):
         v = os.environ.get(args.token_env, "").strip()
@@ -270,6 +297,8 @@ def _read_token_arg(args: argparse.Namespace, out: Out) -> Optional[str]:
             return Path(os.path.expanduser(args.token_file)).read_text(encoding="utf-8-sig").strip().splitlines()[0]
         except (OSError, IndexError) as e:
             raise CliError(f"cannot read token file {args.token_file}: {e}")
+    if getattr(args, "token", None) == "-":
+        return _token_from_stdin()
     if getattr(args, "token", None):
         sys.stderr.write(TOKEN_WARNING + "\n")
         return args.token
@@ -304,6 +333,24 @@ def _ask_consent(args: argparse.Namespace, what: str) -> None:
         raise CliError("consent not given; nothing written")
 
 
+def _root_warning(out: Out, cfg_path: Path, *, pod: bool = False) -> None:
+    """v8.1: say at init (not first at ``node run``) that a node refuses to run as root/Administrator."""
+    from . import config
+    if pod or not config.is_privileged():
+        return
+    allowed = False
+    if cfg_path.exists():
+        raw = util.read_json(cfg_path, default=None)
+        allowed = isinstance(raw, dict) and raw.get("allow_root") is True
+    if allowed:
+        return
+    who = "Administrator" if os.name == "nt" else "root"
+    out.line(f"warning: you are running as {who}. The node will refuse to start as {who} (an agent would control "
+             "the whole machine). Use your normal user account instead.")
+    out.line(f"  Only on a machine where {who} is the sole user (a cloud GPU container) set \"allow_root\": true "
+             f"in {cfg_path} (hive join / init node --pod do this for pods).")
+
+
 def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
     """``hive init node``."""
     from . import config
@@ -325,6 +372,9 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
     relay_token = _read_token_arg(args, out)
     if args.join and args.relay:
         raise CliError("give --join or --relay, not both")
+    _root_warning(out, cfg_path, pod=bool(args.pod))
+    if args.tailscale or args.listen == "tailscale":
+        _tailscale_check(out, "node")
     if not exists:
         _ask_consent(args, "node")
     else:
@@ -366,8 +416,10 @@ def cmd_init_node(args: argparse.Namespace, out: Out) -> int:
     if cfg.policy.preset != "cautious":
         out.line("tip: if agents will browse the web, consider --preset cautious (approve risky calls once or "
                  "--for 30m)")
-    snippet = {"mcpServers": {"hive": {"command": _console_command()[0],
-                                        "args": _console_command()[1:] + ["mcp", "--local"]}}}
+    local_server: Dict[str, Any] = {"command": _console_command()[0], "args": _console_command()[1:] + ["mcp", "--local"]}
+    if _mcp_env():
+        local_server["env"] = _mcp_env()
+    snippet = {"mcpServers": {"hive": local_server}}
     out.line("MCP config for an agent on this computer:")
     out.line(json.dumps(snippet, indent=2))
     out.line("next: hive node run   (foreground)   or   hive service install node   (start at logon)")
@@ -469,22 +521,49 @@ def cmd_init_hub(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
+def _tighten_token_file(path: Path, out: Out) -> None:
+    """A token file readable by others is made 0600 (POSIX, our own file) instead of only warning later."""
+    if os.name == "nt":
+        return
+    try:
+        st = path.stat()
+        if st.st_mode & 0o077 and st.st_uid == os.getuid():
+            os.chmod(str(path), 0o600)
+            out.line(f"note: {path} was readable by other users; set to 0600")
+    except OSError:
+        pass
+
+
 def cmd_init_client(args: argparse.Namespace, out: Out) -> int:
-    """``hive init client``."""
+    """``hive init client`` (``--token -``: from stdin or a hidden prompt, saved 0600 by Hive itself, v8.1)."""
     from . import config
+    name = args.name or "default"
+    stdin_token = getattr(args, "token", None) == "-"
     tok = _read_token_arg(args, out)
     token_file = None
     if args.token_file and not args.token_env:
-        token_file = str(Path(os.path.expanduser(args.token_file)).resolve())
+        tf = Path(os.path.expanduser(args.token_file)).resolve()
+        token_file = str(tf)
+        if stdin_token and tok:
+            try:
+                config._write_token(tf, tok)                # 0600 file (private dir created when missing)
+            except (OSError, HiveError) as e:
+                raise CliError(f"cannot write token file {tf}: {e}")
+            out.line(f"token saved to {tf} (only you can read it)")
+        else:
+            _tighten_token_file(tf, out)
         tok = None
     try:
         cfg = config.init_client(url=args.url, token=tok, token_file=token_file, tls_pin=args.tls_pin,
-                                 name=args.name or "default", make_default=True if args.default else None)
+                                 name=name, make_default=True if args.default else None)
     except HiveError as e:
         out.error(e.code, e.message, e.hint)
         return EXIT_USAGE
-    out.line(f"connection '{args.name or 'default'}' saved" + (" (default)" if cfg.default == (args.name or "default")
-                                                                 else ""))
+    if tok:
+        out.line(f"token saved to {config.default_paths()['tokens'] / (name + '.token')} (only you can read it)")
+    out.line(f"connection '{name}' saved" + (" (default)" if cfg.default == name else ""))
+    out.line(f"next: hive nodes --connection {name}   then   hive mcp-config --client claude-desktop --connection "
+             f"{name} --write")
     return EXIT_OK
 
 
@@ -636,12 +715,43 @@ def cmd_node_pause(args: argparse.Namespace, out: Out) -> int:
     """``hive node pause``."""
     from . import node
     cfg = _node_config(args)
-    node.pause(_data_dir(cfg))
-    out.line("paused: non-read calls are refused and nothing is spawned; resume with: hive node resume")
+    d = _data_dir(cfg)
+    node.pause(d)
+    if _holder(d) is None:
+        out.line("paused (the node is not running; it starts paused): non-read calls are refused and nothing is "
+                 "spawned; resume with: hive node resume")
+    elif _wait_paused(args, 3.0):
+        out.line("paused (confirmed by the running node): non-read calls are refused and nothing is spawned; resume "
+                 "with: hive node resume")
+    else:
+        out.line("paused: the running node did not confirm within 3 s (it applies PAUSED within about 1 s of "
+                 "reading it); check with: hive node status. Resume with: hive node resume")
     out.line(HUB_REVOKE_LINE)
     for line in _wsl_lines(cfg):
         out.line(line)
     return EXIT_OK
+
+
+def _wait_paused(args: argparse.Namespace, budget: float) -> bool:
+    """v8.1: ``hive node pause`` returns once the running node reports ``paused`` (node.info), at most ``budget``."""
+    end = time.monotonic() + budget
+    client = None
+    try:
+        client = _connect(args, owner_default=True)
+        while True:
+            try:
+                if client.call("node.info", {}, timeout=2).get("paused"):
+                    return True
+            except HiveError:
+                pass
+            if time.monotonic() >= end:
+                return False
+            time.sleep(0.2)
+    except HiveError:
+        return False
+    finally:
+        if client is not None:
+            client.close()
 
 
 def cmd_node_resume(args: argparse.Namespace, out: Out) -> int:
@@ -657,6 +767,9 @@ def cmd_node_panic(args: argparse.Namespace, out: Out) -> int:
     """``hive node panic [--yes]``."""
     from . import node
     cfg = _node_config(args)
+    if not args.yes and (not sys.stdin or not sys.stdin.isatty()):
+        out.line("cancelled: not a terminal, so there is no y/N question; run: hive node panic --yes")
+        return EXIT_USAGE
     if not _confirm("Stop every job, service and container of this node and pause it?", yes=args.yes):
         out.line("cancelled (pass --yes to skip the question)")
         return EXIT_USAGE
@@ -801,10 +914,12 @@ def _read_secret_value(args: argparse.Namespace) -> str:
         if not v:
             raise CliError("no value on stdin")
         return v
-    a = getpass.getpass(f"value for {args.name}: ")
-    b = getpass.getpass("again: ")
+    a = _hidden_input(f"value for {args.name}: ")
+    b = _hidden_input("again: ")
     if a != b:
-        raise CliError("the two values differ")
+        raise CliError("the two values differ; nothing was saved")
+    if not a:
+        raise CliError("empty value; nothing was saved")
     return a
 
 
@@ -887,6 +1002,10 @@ def cmd_call(args: argparse.Namespace, out: Out) -> int:
     client = _connect(args, owner_default=True)
     try:
         res = client.call(args.action, params, node=args.node, timeout=args.timeout, approval_id=args.approval)
+    except HiveError as e:
+        out.error(e.code, e.message, e.hint, e.details if out.as_json else None)
+        _approval_retry_hint(e)
+        return exit_code_for(e)
     finally:
         client.close()
     if args.raw or out.as_json:
@@ -903,6 +1022,17 @@ def _split_sh_argv(argv: List[str]) -> Tuple[List[str], List[str]]:
     return argv, []
 
 
+def _approval_retry_hint(e: HiveError) -> None:
+    """After approval_required: how to retry the very same call once it is approved (v8.1)."""
+    if e.code != "approval_required":
+        return
+    aid = (e.details or {}).get("approval_id") if isinstance(e.details, dict) else None
+    if aid:
+        sys.stderr.write(util.escape_terminal(
+            f"then run the same command again with --approval {aid} (same arguments; e.g. hive sh NODE "
+            f"--approval {aid} -- COMMAND)") + "\n")
+
+
 def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
     """``hive sh NODE -- COMMAND… [--shell S] [--cwd D] [--timeout S]`` (exit = remote exit code)."""
     head, cmd = _split_sh_argv(argv)
@@ -913,6 +1043,7 @@ def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
     ap.add_argument("--cwd")
     ap.add_argument("--timeout", type=float)
     ap.add_argument("--connection")
+    ap.add_argument("--approval", metavar="AP_ID", help="retry an approved call (the ap_… id it printed)")
     try:
         a = ap.parse_args(head)
     except SystemExit as e:
@@ -935,9 +1066,10 @@ def cmd_sh(argv: List[str], gl: argparse.Namespace) -> int:
     client = None
     try:
         client = _connect(gl, owner_default=True)
-        res = client.call("shell.run", params, node=node)
+        res = client.call("shell.run", params, node=node, approval_id=a.approval)
     except HiveError as e:
         Out(False).error(e.code, e.message, e.hint)
+        _approval_retry_hint(e)
         return SH_TIMEOUT if e.code == "timeout" else SH_FAILURE
     finally:
         if client is not None:
@@ -978,7 +1110,27 @@ def cmd_nodes(args: argparse.Namespace, out: Out) -> int:
     out.line(_table([[r.get("name"), "online" if r.get("online") else "offline", r.get("mode"), r.get("os_label"),
                       r.get("gpus_summary"), ",".join(r.get("tags") or [])] for r in rows],
                     ["NAME", "STATE", "MODE", "OS", "GPUS", "TAGS"]))
+    hint = _hub_local_hint(args, len(rows))
+    if hint:
+        out.line(hint)
     return EXIT_OK
+
+
+def _hub_local_hint(args: argparse.Namespace, n_rows: int) -> Optional[str]:
+    """v8.1: ``hive nodes`` on the hub's machine without --connection talks to the local node only; say how to see
+    every node through the hub."""
+    if getattr(args, "connection", None) or os.environ.get("HIVE_CONNECTION") or os.environ.get("HIVE_URL") \
+            or n_rows > 1:
+        return None
+    try:
+        from .config import load_client_config
+        cc = load_client_config()
+    except (HiveError, OSError, ValueError):
+        return None
+    if "hub-local" not in cc.connections or cc.default == "hub-local":
+        return None
+    return (f"hint: this is only this computer (connection '{cc.default}'); every node through the hub on this "
+            "machine: hive nodes --connection hub-local")
 
 
 def cmd_actions(args: argparse.Namespace, out: Out) -> int:
@@ -1125,15 +1277,92 @@ def cmd_join(args: argparse.Namespace, out: Out) -> int:
         _restart_daemon("node", out, no_restart=args.no_restart)
     if args.install:
         from . import install
+        logs = _node_log_files(cfg)
+        marks = {p: _file_size(p) for p in logs}
         try:
             res = install.install("node", cfg_path, method="watchdog" if pod else "auto")
         except HiveError as e:
             out.error(e.code, e.message, e.hint)
             return exit_code_for(e)
         _print_install(res, out)
+        if not res.commands and any("already running" in n for n in res.notes):
+            return EXIT_OK
+        return _verify_joined(cfg, marks, out)
     elif toks:
         out.line("next: hive node run   (foreground)   or   hive service install node")
     return EXIT_OK
+
+
+JOIN_VERIFY_S = 30.0      # v8.1: join --install waits this long for "relay registered" in the node log
+_START_FAIL = re.compile(r"(address already in use|address in use|only one usage of each socket address|"
+                         r"node failed to start|node failed:|refusing to run)", re.I)
+
+
+def _node_log_files(cfg: Any) -> List[Path]:
+    d = _data_dir(cfg)
+    f = Path(str((getattr(cfg, "log", None) or {}).get("file") or "logs/node.log"))
+    return [f if f.is_absolute() else d / f, d / "logs" / "stdout.log"]
+
+
+def _file_size(p: Path) -> int:
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
+
+
+def _read_new(p: Path, start: int) -> str:
+    try:
+        with open(str(p), "rb") as fh:
+            if fh.seek(0, 2) < start:
+                start = 0                       # rotated
+            fh.seek(start)
+            return fh.read(1 << 20).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _verify_joined(cfg: Any, marks: Dict[Path, int], out: Out) -> int:
+    """v8.1: after ``join --install``, success is printed only once the node logs that it registered with the hub
+    (≤ JOIN_VERIFY_S); a crash loop (e.g. its listen port is taken) is reported with the fix."""
+    out.line(f"waiting up to {JOIN_VERIFY_S:g} s for the node to start and register with the hub…")
+    end = time.monotonic() + JOIN_VERIFY_S
+    fail = ""
+    while True:
+        text = "".join(_read_new(p, n) for p, n in marks.items())
+        if "relay registered with" in text:
+            out.line(f"joined: node '{cfg.name}' is running and registered with {cfg.relay.hub_url}")
+            return EXIT_OK
+        for line in text.splitlines():
+            if _START_FAIL.search(line):
+                fail = line.strip()
+        if time.monotonic() >= end:
+            break
+        time.sleep(0.5)
+    if fail:
+        out.error("unavailable", f"the node did not start: {fail[-300:]}", _start_fail_hint(cfg, fail))
+    elif _holder(_data_dir(cfg)) is not None:
+        out.error("unavailable", f"the node runs but has not registered with {cfg.relay.hub_url} within "
+                                 f"{JOIN_VERIFY_S:g} s", "it keeps retrying in the background; check that this "
+                                                         "machine reaches the hub URL, then: hive node status; the "
+                                                         f"log is {_node_log_files(cfg)[0]}")
+    else:
+        out.error("unavailable", f"the node is not running {JOIN_VERIFY_S:g} s after install",
+                  f"see {_node_log_files(cfg)[0]} and {_node_log_files(cfg)[1]}; start it by hand to see the error: "
+                  "hive node run")
+    return EXIT_UNAVAILABLE
+
+
+def _start_fail_hint(cfg: Any, line: str) -> str:
+    low = line.lower()
+    if "in use" in low or "only one usage" in low:
+        lst = cfg.listen
+        return (f"its local port {lst.host}:{lst.port} is taken (another Hive node on this machine?). A relay node "
+                "needs no listener: hive init node --no-listen   or give it its own port: hive init node --listen "
+                "127.0.0.1:7721   (the running watchdog restarts it with the new setting)")
+    if "refusing to run" in low:
+        return "do not run Hive as root; in a container where root is the only user set allow_root: true"
+    return f"see {_node_log_files(cfg)[0]}"
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1520,11 +1749,11 @@ def cmd_hub_add_agent(args: argparse.Namespace, out: Out) -> int:
     out.line(token)
     out.line("")
     out.line("on the agent's machine:")
-    out.line(f"  1. save the token to ~/.hive/tokens/{cfg.name}.token")
-    out.line(f"  2. hive init client --name {cfg.name} --url {base} --token-file ~/.hive/tokens/{cfg.name}.token "
-             f"--default")
-    out.line("  3. MCP for Claude Desktop/Cursor: hive mcp-config --client claude-desktop   (Claude Code: "
-             "--client claude-code)")
+    out.line(f"  1. hive init client --name {cfg.name} --url {base} --token - --default")
+    out.line(f"     (paste the token when asked; it is not shown and is saved to ~/.hive/tokens/{cfg.name}.token, "
+             "readable only by you)")
+    out.line(f"  2. MCP for Claude Desktop/Cursor: hive mcp-config --client claude-desktop --connection {cfg.name} "
+             "--write   (Claude Code: --client claude-code)")
     if len(urls) > 1:
         out.line("  other hub addresses: " + ", ".join(urls[1:]))
     https = [u for u in urls if u.startswith("https://")]
@@ -2122,6 +2351,10 @@ def _decide(args: argparse.Namespace, out: Out, approve: bool) -> int:
         lines = (summ if isinstance(summ, str) else json.dumps(summ, ensure_ascii=False, indent=2)).splitlines()
     _page(out, lines)
     verb = "Approve" + (f" (and allow {rec.get('action')} for {grant} min)" if grant else "") if approve else "Deny"
+    if not args.yes and (not sys.stdin or not sys.stdin.isatty()):
+        out.line(f"nothing decided: not a terminal, so there is no y/N question; after reading the review above "
+                 f"add --yes: hive approvals {'approve' if approve else 'deny'} {args.id} --yes")
+        return EXIT_USAGE
     if not _confirm(f"{verb} this call?", yes=args.yes):
         out.line("nothing decided")
         return EXIT_USAGE
@@ -2202,6 +2435,20 @@ def _desktop_config_path() -> Path:
     if os.name == "nt":
         return Path(os.environ.get("APPDATA") or Path.home()) / "Claude" / "claude_desktop_config.json"
     return Path.home() / ".config" / "Claude" / "claude_desktop_config.json"
+
+
+def _mcp_env() -> Dict[str, str]:
+    """v8.1: ``{"HIVE_HOME": …}`` for MCP snippets when this shell uses a non-default HIVE_HOME (the MCP client
+    starts ``hive mcp`` without it and would look in ~/.hive)."""
+    h = os.environ.get("HIVE_HOME")
+    if not h:
+        return {}
+    try:
+        cur = Path(os.path.expanduser(h)).resolve()
+        default = (Path(os.path.expanduser("~")) / ".hive").resolve()
+    except OSError:
+        return {}
+    return {} if cur == default else {"HIVE_HOME": str(cur)}
 
 
 def _write_mcp_json(path: Path, server: dict, out: Out) -> None:
@@ -2362,11 +2609,15 @@ def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
         out.line("warning: Hive is not installed as a command; the snippet uses python -m hive, which puts the MCP "
                  "client's folder on sys.path. Install Hive with pip (pip install ./hive) for a safer snippet.")
     margs = cmd[1:] + ["mcp", "--connection", conn]
+    env = _mcp_env()
     if client == "claude-code":
-        line = "claude mcp add hive -- " + " ".join(_shq(a) for a in [cmd[0]] + margs + ["--wait-budget", "110"])
+        line = "claude mcp add hive " + "".join(f"-e {_shq(k + '=' + v)} " for k, v in env.items()) + "-- " + \
+            " ".join(_shq(a) for a in [cmd[0]] + margs + ["--wait-budget", "110"])
         out.line(line)
         return EXIT_OK
-    server = {"command": cmd[0], "args": margs}
+    server: Dict[str, Any] = {"command": cmd[0], "args": margs}
+    if env:
+        server["env"] = env
     if args.write:
         if client == "cursor":
             _write_mcp_json(Path.home() / ".cursor" / "mcp.json", server, out)
@@ -2445,6 +2696,98 @@ def cmd_service_status(args: argparse.Namespace, out: Out) -> int:
     return EXIT_OK
 
 
+def cmd_service_define(args: argparse.Namespace, out: Out) -> int:
+    """``hive service define NAME --preset P [--model M] [--arg k=v …] | --argv '…' | --command '…' [--port N]
+    [--endpoint URL] [--node N]``: a thin wrapper over the ``service.define`` action (v8.1)."""
+    import shlex
+    from . import presets
+    params: Dict[str, Any] = {"name": args.name}
+    pargs = list(args.arg or [])
+    if args.preset:
+        params["preset"] = args.preset
+    if args.model:
+        pre = presets.PRESETS.get(args.preset or "")
+        names = [a["name"] for a in (pre.args if pre is not None else [])]
+        key = next((k for k in ("model", "model_path") if k in names), None)
+        if key is None:
+            raise CliError("--model goes with --preset vllm, sglang or llamacpp",
+                           hint="other presets: --arg key=value (hive guide presets lists them)")
+        pargs.append(f"{key}={args.model}")
+    if pargs:
+        if not args.preset:
+            raise CliError("--arg goes with --preset (preset arguments)", hint="hive guide presets")
+        params["preset_args"] = pargs
+    if args.argv:
+        try:
+            params["argv"] = shlex.split(args.argv, posix=os.name != "nt")
+        except ValueError as e:
+            raise CliError(f"--argv: {e}")
+    if args.command:
+        params["command"] = args.command
+    if sum(1 for k in ("preset", "argv", "command") if k in params) != 1:
+        raise CliError("give exactly one of --preset, --argv or --command",
+                       hint="e.g. hive service define qwen --preset vllm --model Qwen/Qwen2.5-7B-Instruct")
+    for k, v in (("port", args.port), ("endpoint", args.endpoint), ("cwd", args.cwd)):
+        if v is not None:
+            params[k] = v
+    if args.autostart:
+        params["autostart"] = True
+    if args.no_start:
+        params["start"] = False
+    elif args.wait:
+        params["wait"] = args.wait
+    for kv in args.param or []:
+        if "=" not in kv:
+            raise CliError(f"--param expects key=value, got {kv!r}")
+        k, v = kv.split("=", 1)
+        params[k.strip()] = _parse_value(v)
+    client = _connect(args, owner_default=True)
+    try:
+        res = client.call("service.define", params, node=args.node, approval_id=args.approval)
+    except HiveError as e:
+        out.error(e.code, e.message, e.hint, e.details if out.as_json else None)
+        _approval_retry_hint(e)
+        return exit_code_for(e)
+    finally:
+        client.close()
+    if out.as_json:
+        out.data(res)
+        return EXIT_OK
+    node = args.node or "self"
+    verb = "defined" if res.get("created") else "updated"
+    out.foreign(f"service '{res.get('name')}' {verb} on {node}: state {res.get('state')}, health "
+                f"{res.get('health') or '-'}" + (f", port {res.get('port')}" if res.get("port") else ""))
+    if res.get("endpoint"):
+        out.foreign(f"endpoint (on that machine): {res.get('endpoint')}")
+    for w in res.get("warnings") or []:
+        out.foreign(f"warning: {w}")
+    out.line(f"watch it: hive logs {node} --service {args.name} -f   status: hive call service.status "
+             f"name={args.name} wait=120" + (f" --node {args.node}" if args.node else ""))
+    if res.get("endpoint") or args.preset not in (None, "comfyui"):
+        out.line(f"chat apps: hive gateway url {node} {args.name}   (README section 6)")
+    return EXIT_OK
+
+
+def cmd_guide(args: argparse.Namespace, out: Out) -> int:
+    """``hive guide [TOPIC]``: the same how-to topics the agents' ``guide`` tool serves (v8.1)."""
+    from . import guides
+    if args.list_topics:
+        out.line("topics: " + ", ".join(guides.TOPICS))
+        return EXIT_OK
+    try:
+        text = guides.topic_text(args.topic or "overview")
+    except HiveError as e:
+        out.error(e.code, e.message, e.hint)
+        return EXIT_USAGE
+    if out.as_json:
+        out.data({"topic": args.topic or "overview", "text": text})
+        return EXIT_OK
+    out.line(text.rstrip("\n"))
+    out.line("")
+    out.line("topics: " + ", ".join(guides.TOPICS) + "   (hive guide TOPIC)")
+    return EXIT_OK
+
+
 def cmd_tls_pin(args: argparse.Namespace, out: Out) -> int:
     """``hive tls-pin CERT.pem``: the ``sha256:…`` pin of a certificate (D51)."""
     import ssl
@@ -2459,17 +2802,25 @@ def cmd_tls_pin(args: argparse.Namespace, out: Out) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
-    """``hive doctor [node|hub|client] [--no-network] [--deep]`` (exit 1 when a check fails)."""
+    """``hive doctor [node|hub|client] [--no-network] [--deep]`` (exit 1 when a check fails). Without a kind every
+    role configured here is checked: node and hub on a machine that has both (v8.1)."""
     from . import doctor
     from .config import default_paths
-    kind = args.kind
-    if kind is None:
-        p = default_paths()
-        kind = "node" if p["node_config"].exists() else "hub" if p["hub_config"].exists() else "client"
-    rows = doctor.run(kind, network=not args.no_network, deep=args.deep)
-    if out.as_json:
-        out.data(rows)
+    if args.kind is not None:
+        kinds = [args.kind]
     else:
+        p = default_paths()
+        kinds = [k for k in ("node", "hub") if p[f"{k}_config"].exists()] or ["client"]
+    all_rows: List[dict] = []
+    for kind in kinds:
+        rows = doctor.run(kind, network=not args.no_network, deep=args.deep)
+        if len(kinds) > 1:
+            rows = [dict(r, target=kind) for r in rows]
+        all_rows += rows
+        if out.as_json:
+            continue
+        if len(kinds) > 1:
+            out.line(f"== {kind} ==")
         for r in rows:
             mark = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL"}.get(str(r.get("status")), "?   ")
             out.foreign(f"[{mark}] {r.get('check')}: {r.get('detail')}")
@@ -2477,7 +2828,9 @@ def cmd_doctor(args: argparse.Namespace, out: Out) -> int:
                 out.foreign(f"       fix: {r.get('fix')}")
         n = {s: sum(1 for r in rows if r.get("status") == s) for s in ("ok", "warn", "fail")}
         out.line(f"{kind}: {n['ok']} ok, {n['warn']} warnings, {n['fail']} failures")
-    return EXIT_ACTION if any(r.get("status") == "fail" for r in rows) else EXIT_OK
+    if out.as_json:
+        out.data(all_rows)
+    return EXIT_ACTION if any(r.get("status") == "fail" for r in all_rows) else EXIT_OK
 
 
 def _audit_dir(args: argparse.Namespace) -> Path:
@@ -2958,6 +3311,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true")
     p = leaf(svc, "status", cmd_service_status)
     p.add_argument("kind", choices=["node", "hub"])
+    p = leaf(svc, "define", cmd_service_define, help="define (and start) a model server or other long-running "
+                                                      "service on a node (the service.define action)")
+    p.add_argument("name", help="service name, e.g. qwen")
+    p.add_argument("--preset", choices=["vllm", "sglang", "ollama", "llamacpp", "comfyui", "docker"],
+                   help="built-in recipe (hive guide presets)")
+    p.add_argument("--model", help="model folder / HF repo id (vllm, sglang) or GGUF file (llamacpp)")
+    p.add_argument("--arg", action="append", metavar="KEY=VALUE", help="preset argument (repeatable)")
+    p.add_argument("--argv", help="the program and its arguments as one string, e.g. 'python3 server.py 8000'")
+    p.add_argument("--command", help="a shell command line instead of --argv")
+    p.add_argument("--port", type=int)
+    p.add_argument("--endpoint", help="OpenAI-compatible base URL, e.g. http://127.0.0.1:8000/v1")
+    p.add_argument("--cwd")
+    p.add_argument("--autostart", action="store_true", help="start again after a reboot")
+    p.add_argument("--no-start", action="store_true")
+    p.add_argument("--wait", type=float, default=30.0, help="seconds to wait for it to come up (default 30)")
+    p.add_argument("--param", action="append", metavar="KEY=VALUE", help="any other service.define parameter")
+    p.add_argument("--node", help="target node (through a hub connection)")
+    p.add_argument("--approval", metavar="AP_ID", help="retry an approved call")
+    p = leaf(sub, "guide", cmd_guide, help="how-to topics (the same text agents get from the guide tool)")
+    p.add_argument("topic", nargs="?", help="overview (default), model-serving, presets, gateway, windows, …")
+    p.add_argument("--list", dest="list_topics", action="store_true")
 
     p = leaf(sub, "tls-pin", cmd_tls_pin, json_flag=False, help="print the sha256 pin of a PEM certificate")
     p.add_argument("cert")
