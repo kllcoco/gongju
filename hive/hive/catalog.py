@@ -852,7 +852,9 @@ def _specs() -> List[ActionSpec]:
                      "overwrite": _b("Replace existing destination files.", False),
                      "recursive": _b("Copy a directory tree.", False)}, ("src", "dst")),
         result=_res({"src": _s("Source path."), "dst": _s("Destination path."), "files": _i("Files copied."),
-                     "bytes": _i("Bytes copied.")}, ("src", "dst", "files", "bytes")),
+                     "bytes": _i("Bytes copied."),
+                     "skipped_links": _i("Symbolic links not recreated (Windows without the symlink privilege); "
+                                         "present only when non-zero.")}, ("src", "dst", "files", "bytes")),
         risk="write", default_timeout=600))
 
     S.append(ActionSpec(

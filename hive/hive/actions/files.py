@@ -499,9 +499,9 @@ def fs_write(ctx: ActionContext, p: dict) -> dict:
 
 def _free_bytes(path: Path) -> int:
     p = path
-    while not p.exists() and p != p.parent:
+    while not os.path.exists(_lp(p)) and p != p.parent:
         p = p.parent
-    return shutil.disk_usage(str(p)).free
+    return shutil.disk_usage(_lp(p)).free
 
 
 @handler("fs.write_chunk")
@@ -674,7 +674,7 @@ def fs_search(ctx: ActionContext, p: dict) -> dict:
     scanned = matched_files = 0
     truncated, reason = False, None
     mask = _edge_masker(ctx)
-    if root.is_file():
+    if os.path.isfile(_lp(root)):
         files: Iterable[Any] = [root]
     else:
         files = _search_files(ctx, root, p, deadline)

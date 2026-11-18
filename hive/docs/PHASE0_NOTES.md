@@ -607,3 +607,53 @@ by the lead or a line in DESIGN.md.
     appended; automatic target = exactly one `healthy:true` row of the probe listing (a service/config row brings
     its own `api_key_env`); `content` beyond `max_chars` is cut 75 % head / 25 % tail; the reply is read up to
     `limits.max_response_bytes`.
+80. **CONTRACT-REQUEST (WP3a review fixes → WP1 `policy.py`, P0 `tests/helpers.py`, additive):**
+    - `EffectivePolicy.resolve_path(…, nofollow_last=False)`: with True, step 5 resolves only the parent and keeps
+      the last component as given, so steps 6–8 (roots, fs.deny, deny_write, hard denies incl. `$HIVE_HOME` and the
+      `.hive` component, FileHolds) judge the path of a symbolic link itself. fs.delete/fs.move use it for a link
+      (and then require the link's target to pass the normal check too; either refusal is raised, never a fall back
+      to the target), and recursive fs.copy / the fs.move EXDEV path use it to re-check every destination entry
+      right before it is created.
+    - `EffectivePolicy.path_key(path, *, follow=True) -> str`: PathGuard's comparison key (casefolded on Windows,
+      macOS and WSL `/mnt/<drive>` paths; realpath'd with `follow=True`, lexical otherwise). fs.delete/fs.move's
+      `protected_path` test and the copy/move-into-itself test compare these keys (a differently cased path to an
+      fs root can no longer slip past on macOS). `helpers.FakeEffectivePolicy` gained both (normcase keys).
+81. **WP3a review-fix interpretations:**
+    - Links (note 78 refined): a link in a denied folder, a link whose own path is denied (`~/.hive` → HIVE_HOME,
+      a symlinked `~/.ssh`, a symlinked `~/.bashrc` for a deny_write identity) and a link to a path outside the roots
+      are refused for fs.delete/fs.move; `protected_path` compares the link's own (lexical) path, so a symlinked fs
+      root, home or workdir cannot be deleted or moved either.
+    - Recursive fs.copy (and the fs.move cross-filesystem fallback, which is a guarded copy + delete instead of
+      `shutil.move`): `_dest_check` stays the fast pre-check; every destination entry is checked again with
+      `resolve_path(target, write=True, nofollow_last=True)` before it is created. A refusal stops the copy with
+      `policy_denied` rule `contains_denied` (details `entries`, `denied_rule`, `copied_files`; entries already
+      copied stay). A walk cut short by the call deadline is `timeout` (`maybe_executed:true`, details
+      `files`/`bytes`, hint "copy incomplete: N files copied; …"), never a partial success; the EXDEV move then
+      keeps the source. On Windows a link that cannot be recreated (WinError 1314) is skipped and counted in the
+      result's optional `skipped_links`; directory links get `target_is_directory`.
+    - `fsops.walk(…, state=None)`: when given a dict, `state["truncated"]` tells whether the deadline cut the walk
+      short (fs.list also sets `total_capped` from it).
+    - fs.write `mode:"create"` is exclusive: the temp file is published with `os.link` (fails on any existing name,
+      dangling links included), falling back to `O_CREAT|O_EXCL|O_NOFOLLOW`; a name created meanwhile → `conflict`.
+      fs.write_chunk's final replace keeps the replaced file's mode bits (new files 0644).
+    - fs.read / fs.read_chunk / fs.edit / fs.search / sha256 open files through `fsops.open_regular(path)`
+      (`O_NONBLOCK`; a FIFO, device or socket → `bad_request`, never a blocked thread). `fsops.read_lines(…,
+      check=None, mask=None)`: `check` (fs.read passes `ctx.check`) runs per 64 KiB chunk of the streamed path;
+      `mask(kept, rest) -> (kept, masked)` (`fsops.EdgeMask`, built on `SecretStore.mask_edges`) hides a secret cut
+      by a line cut (LONG_LINE, the caller's `max_bytes`) and sets `masked:true`; fs.search's 500-char cut uses the
+      same masker. fs.search `names_only` rows carry `before: []`, `after: []`.
+    - Every OS call on a resolved path in actions/files.py goes through `fsops.long_path` (§5.4 step 10).
+    - `fsops.check_regex`: verbose mode (an inline flag group containing `x`, or `re.VERBOSE` after compiling) is
+      refused; a group holding a quantifier or `|` may repeat at most `MAX_GROUP_REPEAT` = 10 times in all (nested
+      bounded counts multiply), so `(a?){22}a{22}` is refused like `(a+)+`. Applies to WP2's `ready_pattern` too.
+    - netutil: non-ASCII URL paths/queries are percent-encoded (UTF-8, existing escapes kept), IDN hosts become
+      punycode; header names must be RFC 9110 tokens and values Latin-1 (`bad_request` before any connection). Any
+      `ssl.SSLError` (not only certificate errors) → `unavailable` reason `tls`. `HttpResult.dns` (additive, default
+      `"local"`): `"remote"` when a proxy resolves the name; model.chat and the service/port branch of
+      model.endpoints record `route` and `dns` in audit `extra` (§5.4 NetGuard rule 8; WP3b's net.* can reuse it).
+    - model.endpoints: managed-service rows are probed with the service's own `api_key_env` AuthSpec
+      (`ServiceManager.endpoint_for`), and a 401/403 from a service keeps ServiceManager's `healthy`, so a
+      key-protected service can be the automatic model.chat target.
+82. **CONTRACT-REQUEST (WP3a review fixes → P0 `catalog.py`, additive):** the fs.copy result schema gained the
+    optional integer `skipped_links` (not required; present only when a Windows node without
+    SeCreateSymbolicLinkPrivilege / Developer Mode skipped links in a recursive copy instead of aborting halfway).
