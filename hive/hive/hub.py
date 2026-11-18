@@ -476,7 +476,8 @@ class RelayLink(NodeLink):
                 self._finish(t, unavailable(f"node {self.name} re-registered while running the call",
                                             reason="session_replaced", maybe_executed=t.mutating))
             self.cancels = []
-            self.session_id = "s_" + new_id()
+            # audit round 3: 192 random bits (was "s_" + new_id(): a millisecond clock + 32 random bits)
+            self.session_id = "s_" + _secrets.token_urlsafe(24)
             self.info = info
             acts = body.get("actions") if isinstance(body.get("actions"), list) else []
             self.actions_list = [a for a in acts if isinstance(a, str) and len(a) <= 64][:500]
@@ -505,9 +506,10 @@ class RelayLink(NodeLink):
                      ) -> Tuple[str, Optional[str]]:
         """(node_id to store, refused value or None). The pod's node_id authenticates nothing (§7.1), so it is kept
         only when well-formed and not equal (case-insensitively) to any configured node name, alias, another
-        link's node_id or a node_id relay_ids.json binds to another node; otherwise a pod could take over routing
-        for another node (WP5b review). Phase 2 review: with ``rec`` (this node's relay_ids record) a register
-        without the bound key keeps only the bound node_id."""
+        link's node_id (audit round 3: including the id a direct link learned from its authenticated node.info) or
+        a node_id relay_ids.json binds to another node; otherwise a pod could take over routing for another node
+        (WP5b review). Phase 2 review: with ``rec`` (this node's relay_ids record) a register without the bound key
+        keeps only the bound node_id."""
         if nid is None or nid == "":
             return "", None
         if not isinstance(nid, str) or not NODE_ID_RE.match(nid):
@@ -705,11 +707,39 @@ class DirectLink(NodeLink):
         self._probes_done = 0                         # completed probes (success or failure)
         self._probe_error: Optional[HiveError] = None  # error of the last completed probe, None after a success
         self.last_error: Optional[str] = None
+        self._node_id = ""
 
     @property
     def node_id(self) -> str:
-        """Unknown for direct links (rows carry no node_id)."""
-        return ""
+        """The node_id the node reported in its authenticated ``node.info`` ("" before the first one, audit round 3);
+        a plain attribute read (no lock), so ``RelayLink._vet_node_id`` can read it under a relay link's lock."""
+        return self._node_id
+
+    def _learn_node_id(self, timeout: float) -> None:
+        """Audit round 3: ``node.info`` over ``/v1/call`` with the hub token (the probe's authenticated channel) for
+        the node's node_id; called with the actions refresh (every ``ACTIONS_INTERVAL``). A failed call keeps the id
+        already known. A newly learned id is taken away from any relay link that claimed it (``Hub._direct_id``)."""
+        with self.lock:
+            if "node.info" not in (self._actions or []):
+                return
+        try:
+            status, _h, data = self.transport.request(
+                "POST", "/v1/call", {"action": "node.info", "params": {}, "timeout": timeout},
+                timeout=timeout + 5, headers={"X-Hive-Agent": "hub-probe"}, raw=True)
+            env = json.loads(data.decode("utf-8"))
+        except (HiveError, UnicodeDecodeError, ValueError, RecursionError) as e:
+            log.info("node.info on %s failed: %s", self.name, getattr(e, "message", e))
+            return
+        res = env.get("result") if isinstance(env, dict) and env.get("ok") is True else None
+        nid = res.get("node_id") if isinstance(res, dict) else None
+        if not isinstance(nid, str) or not NODE_ID_RE.match(nid):
+            if status == 200 and isinstance(res, dict):
+                log.info("node.info on %s carried no valid node_id", self.name)
+            return
+        if nid == self._node_id:
+            return
+        self._node_id = nid
+        self.hub._direct_id(self, nid)
 
     def _fresh(self) -> bool:
         return self._row_ok_at is not None and time.monotonic() - self._row_ok_at <= FRESH_S
@@ -743,6 +773,7 @@ class DirectLink(NodeLink):
                         [x.get("name") for x in rows_a or [] if isinstance(x, dict) and x.get("name")]
                     self._catalog = [x for x in rows_a or [] if isinstance(x, dict)]
                     self._actions_at = time.monotonic()
+                self._learn_node_id(timeout)
             with self.lock:
                 self._row = row
                 self._row_ok_at = time.monotonic()
@@ -841,16 +872,14 @@ class DirectLink(NodeLink):
     def open_gateway(self, service: str, method: str, path: str, body: bytes, *, agent: str, timeout: float,
                      cancel: threading.Event) -> "GatewayResponse":
         """Raw GET/POST to ``<node url>/openai/self/<service>/v1/<path>``, streamed back (§8.7)."""
-        from .gateway import GatewayResponse
+        from .gateway import GatewayResponse, safe_headers
         hdrs = {"X-Hive-Agent": agent[:64], "Accept": "*/*"}
         status, rh, chunks = self.transport.open_stream(method, f"/openai/self/{service}/v1/{path}",
                                                         body if method == "POST" else None, headers=hdrs,
                                                         timeout=timeout, cancel=cancel)
-        keep = {}
-        for k, v in rh.items():
-            if k.lower() in ("content-type", "retry-after"):
-                keep[k] = v
-        return GatewayResponse(status=status, headers=keep, body=None, chunks=chunks)
+        # audit round 3: the direct node chooses these values; only JSON / SSE / plain-text types and a numeric
+        # Retry-After are passed on
+        return GatewayResponse(status=status, headers=safe_headers(rh), body=None, chunks=chunks)
 
     def stop(self) -> None:
         """Close the transport."""
@@ -1079,18 +1108,52 @@ class Hub:
         return [l for l in self.links.values() if identity.allows_node(l.name)]
 
     def resolve(self, node: str) -> Optional[NodeLink]:
-        """Case-insensitive match on name, then node_id, then aliases (§8.1), no access check."""
+        """Case-insensitive match on name, then node_id, then aliases (§8.1), no access check.
+
+        Audit round 3: node_ids reported by direct links (authenticated ``node.info``) are matched before the ones
+        relay pods report at register (which authenticate nothing), so a pod can never take a direct node's id; an
+        id that more than one link of the same kind reports is refused (``not_found`` "ambiguous")."""
         n = str(node).lower()
-        for l in self.links.values():
+        links = list(self.links.values())
+        for l in links:
             if l.name.lower() == n:
                 return l
-        for l in self.links.values():
-            if l.node_id and l.node_id.lower() == n:
-                return l
-        for l in self.links.values():
+        for direct in (True, False):
+            hits = [l for l in links if isinstance(l, DirectLink) == direct and l.node_id and l.node_id.lower() == n]
+            if len(hits) > 1:
+                raise not_found(f"node_id {str(node)[:64]!r} is ambiguous (reported by more than one node)",
+                                hint="address the node by name")
+            if hits:
+                return hits[0]
+        for l in links:
             if n in l.aliases:
                 return l
         return None
+
+    def _direct_id(self, link: "DirectLink", nid: str) -> None:
+        """Audit round 3: a direct probe learned ``nid``; a relay link (live session or relay_ids.json binding) that
+        claims the same id loses the claim (warning audit record). Direct node ids come from an authenticated probe,
+        relay node ids are self-reported."""
+        n = nid.lower()
+        for other in list(self.links.values()):
+            if not isinstance(other, RelayLink):
+                continue
+            dropped = None
+            with other.lock:
+                if other._node_id and other._node_id.lower() == n:
+                    dropped = other._node_id
+                    other._node_id = ""
+                rec = self.relay_ids.get(other.name)
+                bound = rec.get("node_id")
+                if isinstance(bound, str) and bound.lower() == n:
+                    dropped = dropped or bound
+                    rec["node_id"] = None
+                    self.relay_ids.save()
+            if dropped:
+                log.warning("relay node %s claimed node_id %s, which direct node %s reports; claim dropped",
+                            other.name, dropped, link.name)
+                self._audit_event("warning", other.name, {"event": "relay node_id claim dropped", "node_id": dropped,
+                                                          "direct_node": link.name})
 
     def link_for(self, identity: Identity, node: Optional[str]) -> NodeLink:
         """§8.1 resolution + access check."""
@@ -1771,6 +1834,12 @@ def build_server(hub: Hub) -> "ApiServer":
             raise forbidden(f"this relay token belongs to node {link.name}")
         return link, body
 
+    # audit round 3: polls naming an unknown or superseded session (409) count per source IP, as auth failures do;
+    # the token check's own throttle forgets an IP at every successful auth, so this one is separate and is reset
+    # only by a successful register from that IP (what a real node does after a 409)
+    session_throttle = AuthThrottle(int(th.get("max_failures", 10)), float(th.get("window", 60)),
+                                    float(th.get("block", 300)))
+
     def relay_register(req: "Request") -> dict:
         link, body = _relay_body(req)
         if body.get("node") != link.name:
@@ -1778,11 +1847,25 @@ def build_server(hub: Hub) -> "ApiServer":
         raw = req.body or b""
         if len(raw) > (2 << 20) + 65536:
             raise HiveError("too_large", "register body larger than 2 MiB", status=413)
-        return link.register(body, req.client_ip)
+        out = link.register(body, req.client_ip)
+        session_throttle.ok(req.client_ip)
+        return out
 
     def relay_poll(req: "Request") -> dict:
         link, body = _relay_body(req)
-        return link.poll(body)
+        blocked = session_throttle.check(req.client_ip)
+        if blocked is not None:
+            raise rate_limited("too many polls with an unknown relay session from your address",
+                               retry_after=blocked, reason="auth_throttle", hint="register again later")
+        try:
+            return link.poll(body)
+        except HiveError as e:
+            if e.code == "conflict":
+                session_throttle.fail(req.client_ip)
+                if session_throttle.check(req.client_ip) is not None:
+                    hub._audit_event("warning", link.name, {"event": "relay session guesses blocked",
+                                                            "ip": req.client_ip})
+            raise
 
     def relay_result(req: "Request") -> dict:
         link, body = _relay_body(req)

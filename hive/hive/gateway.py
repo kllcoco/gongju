@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -79,6 +80,46 @@ def upstream_status(value: Any) -> Optional[int]:
     if 200 <= st <= 599 and st not in (204, 304):
         return st
     return None
+
+
+UPSTREAM_TYPES = ("application/json", SSE_TYPE, "text/plain")
+_CHARSET_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,40}\Z")
+_CTL_RE = re.compile("[\x00-\x1f\x7f]")
+
+
+def safe_content_type(value: Any) -> str:
+    """Audit round 3: the Content-Type a gateway reply may carry when an upstream (a direct node, a relay pod's
+    ``model.forward`` result, a model server) chose it: ``application/json``, ``text/event-stream`` or
+    ``text/plain``, optionally with ``; charset=<token>``, normalized; anything else (other types or parameters,
+    control characters, non-strings) → ``application/json``."""
+    if not isinstance(value, str) or len(value) > 200 or _CTL_RE.search(value):
+        return "application/json"
+    parts = value.split(";")
+    main = parts[0].strip().lower()
+    if main not in UPSTREAM_TYPES or len(parts) > 2:
+        return "application/json"
+    if len(parts) == 1:
+        return main
+    k, eq, cs = parts[1].strip().partition("=")
+    cs = cs.strip()
+    if k.strip().lower() != "charset" or not eq or not _CHARSET_RE.match(cs):
+        return "application/json"
+    return f"{main}; charset={cs.lower()}"
+
+
+def safe_headers(headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    """Audit round 3: the reply headers the gateway writes: ``Content-Type`` through ``safe_content_type`` (default
+    ``application/json``), ``Retry-After`` only as 1-10 digits; other headers dropped."""
+    out: Dict[str, str] = {}
+    ctype = None
+    for k, v in (headers or {}).items():
+        lk = str(k).lower()
+        if lk == "content-type":
+            ctype = v
+        elif lk == "retry-after" and isinstance(v, str) and re.match(r"^ *[0-9]{1,10} *\Z", v):
+            out["Retry-After"] = v.strip(" ")
+    out["Content-Type"] = safe_content_type(ctype) if ctype is not None else "application/json"
+    return out
 
 
 def _openai_error(status: int, message: str, typ: str, code: str) -> GatewayResponse:
@@ -253,7 +294,7 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
             if isinstance(e, HiveError):
                 raise _fold_hint(e)
             raise
-        headers = {k: v for k, v in (resp.headers or {}).items()}
+        headers = safe_headers(resp.headers)
         if resp.body is not None or resp.chunks is None:
             data = resp.body or b""
             release(key)
@@ -606,9 +647,8 @@ class HubGatewayBackend(GatewayBackend):
                                  "upstream_error")
         text = r.get("body") if isinstance(r.get("body"), str) else ""
         data = text.encode("utf-8")
-        ctype = r.get("content_type") if isinstance(r.get("content_type"), str) else "application/json"
-        if status == 404 and path != "models":
-            pass
+        # audit round 3: the pod chooses this value; only JSON / SSE / plain text types reach the client
+        ctype = safe_content_type(r.get("content_type"))
         if 200 <= status < 300 and want_stream and path in ("chat/completions", "completions"):
             try:
                 reply = json.loads(text)
@@ -617,9 +657,8 @@ class HubGatewayBackend(GatewayBackend):
             if isinstance(reply, dict):
                 return GatewayResponse(status=status, headers={"Content-Type": SSE_TYPE},
                                        body=synthesize_sse(reply, path, include_usage), chunks=None)
-        return GatewayResponse(status=status, headers={"Content-Type": ctype or "application/json"}, body=data,
-                               chunks=None)
+        return GatewayResponse(status=status, headers={"Content-Type": ctype}, body=data, chunks=None)
 
 
 __all__ = ["GatewayResponse", "GatewayBackend", "HubGatewayBackend", "NodeGatewayBackend", "register_gateway_routes",
-           "synthesize_sse", "rewrite_stream", "normalize_path"]
+           "synthesize_sse", "rewrite_stream", "normalize_path", "safe_content_type", "safe_headers"]

@@ -280,6 +280,12 @@ class RelayAgent:
             return
         self.failures += 1
         delay = self._backoff()
+        if code == "rate_limited":
+            # audit round 3: the hub throttles polls naming unknown sessions per IP; wait out its block
+            try:
+                delay = max(delay, min(BACKOFF_MAX * 10, float((e.details or {}).get("retry_after") or 0)))
+            except (TypeError, ValueError):
+                pass
         if code == "unavailable" and (e.details or {}).get("reason") == "tls_pin":
             log.error("relay: %s", e.message)
         else:

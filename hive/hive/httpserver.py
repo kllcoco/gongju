@@ -955,12 +955,10 @@ class ApiServer:
         reason = http.server.BaseHTTPRequestHandler.responses.get(status, ("OK",))[0]
         lines = [f"HTTP/1.1 {status} {reason}"]
         hdrs = self._base_headers()
+        headers = {k: v for k, v in headers.items() if _header_ok(k, v)}
         if default_ct and not any(k.lower() == "content-type" for k in headers) and body:
             hdrs.append(("Content-Type", "application/json; charset=utf-8"))
-        for k, v in headers.items():
-            if "\r" in k or "\n" in k or "\r" in v or "\n" in v:
-                continue
-            hdrs.append((k, v))
+        hdrs += list(headers.items())
         if bodyless:
             hdrs = [(k, v) for k, v in hdrs if k.lower() not in ("content-length", "transfer-encoding")]
         else:
@@ -975,7 +973,7 @@ class ApiServer:
         if status < 200 or status in (204, 304):
             status = 502
         reason = http.server.BaseHTTPRequestHandler.responses.get(status, ("OK",))[0]
-        hdrs = self._base_headers() + [(k, v) for k, v in headers.items() if "\n" not in k + v and "\r" not in k + v]
+        hdrs = self._base_headers() + [(k, v) for k, v in headers.items() if _header_ok(k, v)]
         hdrs.append(("Connection", "close"))
         head = "\r\n".join([f"HTTP/1.1 {status} {reason}"] + [f"{k}: {v}" for k, v in hdrs]) + "\r\n\r\n"
         try:
@@ -992,6 +990,18 @@ class ApiServer:
                     close()
                 except Exception:  # noqa: BLE001
                     pass
+
+
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}\Z")
+_HEADER_BAD_RE = re.compile("[\x00-\x08\x0a-\x1f\x7f]")
+
+
+def _header_ok(k: Any, v: Any) -> bool:
+    """Audit round 3: a response header is written only with a token name and a value free of control characters
+    (< 0x20 except tab, and 0x7f); CR/LF alone were filtered before, so ``\x0b`` or NUL from an upstream reached
+    the client."""
+    return isinstance(k, str) and isinstance(v, str) and bool(_HEADER_NAME_RE.match(k)) and \
+        not _HEADER_BAD_RE.search(v)
 
 
 class _Conn:
