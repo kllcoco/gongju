@@ -1452,3 +1452,75 @@ M3-5. **Counts verified end to end:** 38 actions (37 node-scope rows on the node
     (`--profile minimal|standard|full`, default standard, `--prefix hv_`) and through the hub's `/mcp?profile=`
     (direct link to the node daemon); 4 export formats × 3 profiles through `GET /v1/tools` (§17.7 shapes; `gemini` →
     400); 3 MCP protocol versions (`title` only from 2025-06-18; an unknown version gets a supported one).
+
+## Phase 2 hardening review (whole system)
+
+(Items numbered P2-1… . Regression tests in `tests/test_phase2_review.py`.)
+
+P2-1. **CONTRACT-REQUEST (Phase 2 → WP2 `presets.py`, security fix, §5.6):** `candidate_words` splits POSIX
+    commands with `shlex.shlex(posix=True, punctuation_chars=True)` and drops the pure operator tokens, so a script
+    next to an unquoted shell operator (`bash run.sh;true`, `run.sh|bash`, `<run.sh`, `(./x.sh)`) is still a
+    candidate word and bound (and held) by `bind_files`; PowerShell/cmd words are also split on `; | & < > ( )`
+    (a bare `&` is no longer a word). The hub's `_bind_words`/`_split` call it, so hub-routed approvals get the same.
+P2-2. **CONTRACT-REQUEST (Phase 2 → WP3a `actions/files.py`, security fix, §5.1):** `fs.search` matches against
+    the text after `SecretStore.mask` (whole values) when the node knows secret values, so the match predicate
+    (matches / files_matched) is no oracle over secret bytes. Line numbers stay those of the masked text (they differ
+    only for a multi-line secret value).
+P2-3. **CONTRACT-REQUEST (Phase 2 → WP5b `gateway.py`, WP1 `httpserver.py`):** new `gateway.upstream_status(v)`;
+    the relay path (pod-chosen `status`) and the node gateway's upstream status accept only an int 200..599 other
+    than 204/304, else an OpenAI-shaped 502 `upstream_error`. `ApiServer._write` (defence in depth) puts only
+    100..599 on the wire (else 502) and for 1xx/204/304 writes no body and no Content-Length (a dropped body forces
+    `Connection: close`); `_write_stream` maps those statuses to 502.
+P2-4. **CONTRACT-REQUEST (Phase 2 → WP5b `hub.py`, D54 addition):** `relay_ids.json` node records carry an
+    optional `"node_id"` (readers default null; reset with the record by `rotate-token`). A register's node_id is
+    stored only when the register's instance key is the bound one (or binds now); a register without the bound key
+    keeps only the stored node_id; a node_id stored for another node is refused even while that node is offline
+    (`relay node_id refused` audit as before). Residual: before a pod has ever registered, a pod holding its own
+    relay token can still claim that pod's (public) node_id first; owners resolve by name.
+P2-5. **Lead (P0 `httpserver.py`):** `ID_PARAM_PATTERNS` end in `\Z` and are applied with `re.fullmatch`
+    (`%0A`-suffixed ids/names/nodes → 400 before any handler).
+P2-6. **CONTRACT-REQUEST (Phase 2 → WP5b `dist.py`, WP4 `deploy/runpod/start-hive.sh`, §5.9):**
+    `add_node_instructions` prints an `http://` join code (variants T/C) only when `transport.plaintext_ok` holds for
+    the host (loopback/private/tailnet, names resolved), else `bad_request` with a TLS/public_url hint.
+    `start-hive.sh` refuses to fetch `hive.pyz` over `http://` from a host that is not loopback/private/tailnet
+    (IP literal by range; a name by its addresses, or a local/`.ts.net` name) unless `HIVE_PYZ_SHA256` is set.
+P2-7. **Lead (P0 `util.py`, blocker fix):** Linux `process_create_time` no longer uses the live `/proc/stat btime`
+    (it moves with every wall-clock step: NTP first sync on a Pi without RTC, WSL2 resync, local-time RTC). The first
+    btime read in a boot is kept per `boot_id` in a 0600 file owned by this uid
+    (`$XDG_RUNTIME_DIR`, `/dev/shm` or the temp dir: `hive-btime-<uid>-<boot_id>`, first writer wins via `link`,
+    O_NOFOLLOW + owner/mode checked on read) and cached in-process, so every Hive process of the boot (node, shims,
+    CLI) computes the same create times and `boot_key()` stays stable. On Linux psutil is no longer consulted for
+    create times (its `create_time` follows the moving btime too); other platforms unchanged.
+P2-8. **CONTRACT-REQUEST (Phase 2 → WP2 `textlog.py`, §10.3):** `.state` is a seqlock: `{"v":1,"rotated_bytes",
+    "seq"}` with an even `seq` when settled; before the renames the writer writes an odd `seq` with `"rotating": S`
+    (the rotated file's size). Readers retry while `seq` is odd or changed (≤ 2 s, then settle from the files: the
+    rotation counts as done when `.1` has size S and the current file is smaller); a writer that finds an odd state
+    at start settles it the same way. `read_range` with an offset beyond the logical size returns empty data with
+    `offset = next_offset = ` the requested offset (a follower never moves backwards). Readers of old state files
+    (no `seq`) treat them as settled.
+P2-9. **CONTRACT-REQUEST (Phase 2 → WP2 `textlog.py`/`actions/shell.py`/`jobs.py`, P0 `util.decode_text`):** on
+    Windows, `decode_chunk` holds back a trailing lead byte of non-UTF-8 (ANSI code page) text; new
+    `textlog.dbcs_skip(before, data, *, aligned_start=False)` drops a leading trail byte (walking forward from the
+    last byte < 0x40 of the preceding bytes), used for the `shell.run` 75 % tail and `read_log` ranges;
+    `util.decode_text` retries the code page without the first/last byte (marking them U+FFFD) and otherwise picks
+    the `errors="replace"` decoding with fewer U+FFFD, instead of turning a whole chunk into U+FFFD through UTF-8.
+P2-10. **CONTRACT-REQUEST (Phase 2 → WP2 `jobs.py`/`services.py`):** an unreadable `jobs/<id>/job.json` is
+    renamed `job.json.corrupt` and skipped (warning log); an unreadable `services.json` is renamed
+    `services.json.corrupt-<YYYYmmddHHMMSS>`, the manager starts with no definitions and appends a warning to
+    `rt.warnings`. Neither makes the manager `_Unavailable`.
+P2-11. **Lead (P0 `util.py`, additive):** `atomic_write_bytes`/`write_json_atomic` take keyword `mkdir=True`;
+    `JobManager._save` writes with `mkdir=False` and removes the run dir again when the record was removed during
+    the write (a removed job never reappears on disk). New `util.is_disk_full(e)` (ENOSPC, EDQUOT, Windows 112/39);
+    `JobManager.start_job` maps it to `too_large` "disk full" (hint "disk full").
+P2-12. **CONTRACT-REQUEST (Phase 2 → WP2 `services.py`):** restart timestamps later than now + 60 s are dropped
+    when counting the restart window and when restoring `runtime.json`. `ServiceManager.shutdown` joins the
+    staggered autostart thread (≤ 5 s), and a spawn that completes after the shutdown hands its Popen to
+    `proctree.adopt_popens`.
+P2-13. **CONTRACT-REQUEST (Phase 2 → WP3 `_download.py`):** `_fetch(…, checkpoint=dict)` keeps the hasher state
+    of the part across attempts of one file, so an in-process retry re-hashes the part only when its size or mtime
+    changed. A full disk (ENOSPC/EDQUOT/Windows disk full) is not transient: pull files fail with exit 4 at once (so
+    `_fatal()` stops the other workers), `net.download` ends with exit 4.
+P2-14. **Lead (`transport.py`, `hub.py`, tests):** `_Conn.__del__` and `HttpTransport.__del__` close keep-alive
+    sockets (no unclosed-socket ResourceWarnings from thread-local connections of finished threads); `Hub.stop`
+    joins its reaper/prober threads (≤ 5 s each) after the in-flight wait and closes the link transports again.
+    `test_e2e_m2._shutdown` waits for both nodes online and retries `service.remove` that could not connect.
