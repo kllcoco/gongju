@@ -319,6 +319,7 @@ class TestRealNode(unittest.TestCase):
         cls.rt.test_stop()
 
     def test_identity_nodes_actions(self):
+        c = self.client
         self.assertEqual(c.target.resolve_kind(), "node")
         self.assertEqual(c.target.kind, "node")
         self.assertEqual(c.whoami()["identity"]["kind"], "agent")
