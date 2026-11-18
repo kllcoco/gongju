@@ -152,7 +152,7 @@ class NodeDaemon:
         self.url = ""
         self.sup: Optional[Supervisor] = None
         self.agent = self.owner = ""
-        self._clients: List[Any] = []
+        self._clients: Dict[str, Any] = {}   # one client per token (FA-C1: a client per call held a keep-alive slot each)
         self._sessions: List[McpSession] = []
         self.extra_pids: List[int] = []
         self.cleanup_panic = True
@@ -183,6 +183,7 @@ class NodeDaemon:
 
     def run(self) -> None:
         """(Re)start the daemon and wait until it answers."""
+        self.close_clients()                  # connections to an earlier daemon are dead
         self.sup = Supervisor([sys.executable, "-m", "hive", "node", "run"], env=self.node_env, cwd=str(ROOT),
                               log=self.base / "node.log", name=self.name).start()
         wait_for(self.healthy, 60, what=f"node {self.name} health: {self.output()}")
@@ -210,12 +211,8 @@ class NodeDaemon:
         for s in self._sessions:
             s.close()
         self._sessions = []
-        for c in self._clients:
-            try:
-                c.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._clients = []
+        self.close_clients()
+        self._clients = {}
         try:
             if self.sup is not None and self.sup.running and self.cleanup_panic:
                 self.cli("node", "panic", "--yes", timeout=60)       # stops every job, service and container
@@ -248,9 +245,22 @@ class NodeDaemon:
         return r.stdout
 
     def client(self, token: Optional[str] = None) -> Any:
-        c = hclient.connect(self.url, token=token or self.owner)
-        self._clients.append(c)
+        """The cached client for ``token`` (owner by default). One client per token, not per call: every client keeps
+        an authenticated keep-alive connection, the node's authenticated pool is about 32 slots and those connections
+        are not evicted before IDLE_TIMEOUT, so a client per call ran into ``busy`` after ~32 quick calls (FA-C1)."""
+        tok = token or self.owner
+        c = self._clients.get(tok)
+        if c is None:
+            c = self._clients[tok] = hclient.connect(self.url, token=tok)
         return c
+
+    def close_clients(self) -> None:
+        """Close the cached clients' connections (the clients stay usable and reconnect on the next call)."""
+        for c in list(self._clients.values()):
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     def call(self, action: str, params: Optional[dict] = None, *, token: Optional[str] = None) -> dict:
         """Owner (default) call through the Python client; raises HiveError."""

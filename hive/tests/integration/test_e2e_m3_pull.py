@@ -305,6 +305,19 @@ class TestE2EM3Pull(unittest.TestCase):
         e = self.pull_err(repo="org/tiny", source="modelscope", repo_type="dataset", dry_run=True)
         self.assertEqual(e.code, "unsupported")
 
+    def test_08_helper_reuses_one_client(self) -> None:
+        """FA-C1: NodeDaemon.call reuses one client per token. A client per call kept one authenticated keep-alive
+        connection each, and ~32 quick calls filled the node's authenticated pool (503 ``busy``)."""
+        n = self.node
+        self.assertIs(n.client(), n.client())
+        for i in range(40):
+            try:
+                n.call("node.info")
+            except HiveError as e:  # pragma: no cover - the regression
+                self.fail(f"call {i + 1} of 40 failed: {e.code} {e.details.get('reason')}: {e}")
+        n.call("node.info", token=n.agent)
+        self.assertEqual(len(n._clients), 2, "one client per token")
+
 
 if __name__ == "__main__":
     unittest.main()
