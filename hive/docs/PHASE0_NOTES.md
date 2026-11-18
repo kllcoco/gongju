@@ -976,3 +976,109 @@ W10. **Open items (WP3b):** Windows/macOS-only paths (winreg read, SIGBREAK in `
     `HIVE_LIVE_NET=1 python -m unittest tests.test_pull.TestLiveListing` (skipped by default) lists
     `openai-community/gpt2` on huggingface.co and `Qwen/Qwen2.5-0.5B-Instruct` on www.modelscope.cn through the real
     netproxy (passed here through the env HTTPS proxy, i.e. a real CONNECT tunnel + verified TLS).
+
+## WP4 hand-off (sysinfo, gpu, procinfo, wsl, actions/system, install, doctor, deploy/*)
+
+(Items numbered K1… so they cannot collide with the notes of WP5b/WP3b.)
+
+K1. **CONTRACT-REQUEST (WP4 → P0 `tests/test_stubs.py`):** `TestWp4Wp5Wp6Stubs.test_procinfo` became `test_procinfo_real`
+    (`process_info` has the v3 shape), `test_node_info_probes_neutral` became `test_node_info_probes_real` (capability
+    keys, `live_status` keys, the `gpu.detect` key set) and `test_install_restart` became `test_install_restart_real` (a
+    node that is neither running nor installed → `unavailable` with the "hive node run" hint).
+K2. **CONTRACT-REQUEST (WP4 → WP6 `tests/test_cli.py`):** `hive node restart` with no daemon and nothing installed now
+    exits 4 (`unavailable`, hint "start it: hive node run (or hive service install node)") instead of the stub's 1.
+K3. **CONTRACT-REQUEST (WP4 → WP2 `tests/test_services.py`):** the two daemon-down container tests
+    (`test_daemon_down_waits_then_starts`, `test_daemon_down_cap`) patch `hive.sysinfo.capabilities` (docker true) around
+    the define: the real probe runs `docker version`, and §10.6 refuses the docker preset while the daemon is down; the
+    tests model a daemon that goes down after the define (the §10.5 start-time wait). The other container tests run
+    against the real probe (the fake docker's `version` exits 0).
+K4. **CONTRACT-REQUEST (WP4 → WP1 `node.py`, one line):** `wsl.Keepalive(self.state_dir)`. Additive signature
+    `Keepalive(state_dir=None, *, wsl_exe=None, clock=time.monotonic)` (default state dir: `default_paths()["node_data"]
+    / "state"`; `wsl_exe`/`clock` are test seams).
+K5. **Additive names (WP4):**
+    - `sysinfo`: `network()` (the §9.2 network section), `which(names, *, node_path, versions)`, `tailscale_ip(addrs)`,
+      `container_limit(total)`, `version_line(name, path)`, `software(names, refresh=False)`, `capabilities(refresh=False)`,
+      parsers `parse_mounts`/`parse_df`/`parse_vm_stat`, `clear_cache()`, `SOFTWARE`, `VERSION_NAMES`.
+    - `gpu`: `note(result)` (→ `gpu_note`), `summary(gpus)`, parsers `parse_query_gpu`/`parse_compute_apps`/
+      `parse_cuda_version`/`parse_lspci`/`parse_win_video`/`parse_system_profiler`, `clear_cache()`, `WSL_NOTE`,
+      `AMD_NOTE`, `NO_SMI_NOTE`.
+    - `procinfo`: parsers `parse_proc_stat`/`parse_proc_net_tcp`/`parse_lsof`/`parse_netstat`/`parse_lstart`/
+      `parse_ps_rows`/`parse_ps_args`/`split_windows_cmdline`. `list_processes` rows: `{pid, ppid, name, user, uid, cpu_pct,
+      mem_bytes, create_time, cmdline}`; `listeners` rows: `{proto, address, port, pid, name}` (what WP2/WP3 read).
+    - `wsl`: `interop_enabled()`, `networking_mode()`, `systemd_running()`, `has_distros()` (capabilities `wsl`),
+      `version_line()`, `wsl_exe()`, `decode_output`/`parse_list_verbose`/`parse_list_quiet`, `clear_cache()`.
+    - `install`: `render_systemd`/`render_plist`/`render_task_xml`/`render_watchdog`, `systemd_quote`, `captured_path`,
+      `check_launcher(data_dir)`, `TASK_NAMES`; `status()` returns `{kind, installed, method, system, files, running, pid,
+      data_dir, active}`.
+    - `doctor`: `parse_icacls`, `parse_powercfg`, `firewall_rule_present`, `ENDPOINTS` (the network targets; tests point
+      them at stub servers).
+    - `actions/system.protected_pids(ctx)`.
+K6. **Interpretations (probes and actions):**
+    - `capabilities()` is cached 60 s per trusted PATH (a node or test with another PATH probes again); `docker` = the CLI
+      on the trusted PATH and `docker version --format {{.Server.Version}}` exits 0 in 5 s; `docker_gpu` is `false` on
+      Linux when Docker is unusable, `null` on Windows/macOS. `nvidia_smi` = `gpu.find_tool("nvidia-smi")` (false on macOS).
+    - `system.info`: `refresh` clears the sysinfo/gpu caches; os/cpu static parts cached 60 s, `software` 5 min per
+      trusted PATH; `which` looks names up on `ctx.policy.node_path` and runs `--version` only for `VERSION_NAMES` hits whose
+      folder is on the trusted PATH (node PATH minus trusted PATH = folders inside rw roots → `note`); `ffmpeg` uses
+      `-version`, nvcc reports its "release" line; a found tool whose version probe fails reads "unknown version @ path".
+    - GPU rows without a size (lspci/CIM names) have `memory_total_mb: 0` (the result schema types it as a number);
+      `gpu_backend` is `nvidia|apple|cim|lspci|null`; `gpu_note` joins `errors` with "; "; an empty process list inside a
+      container while memory is in use adds the PID-namespace note; a failing nvidia-smi falls back to lspci/CIM names and
+      keeps its first output line in `errors`.
+    - `proc.list`: `filter` matches the name or the command line (the command line is read for filtering even with
+      `cmdline:false`); `user` compares without a `DOMAIN\` prefix, case-insensitively; `sort:"started"` is newest first,
+      memory/cpu largest first with unknown values last; `cmd` = argv joined with spaces, `audit.redact_text`, cut to 300
+      chars (299 + "…"); `managed` from `rt.managed_pids()` (jobs, services and `wsl-keepalive:<distro>`).
+    - `proc.kill`: unknown/exited pid → `not_found`; `protected` = the node pid and all its ancestors ("hive node", so
+      pid 1 is refused as `protected_process` before the pid ≤ 4 rule) ∪ `rt.managed_pids()` ∪ `rt.keepalive_pids()`;
+      the `check_kill` extras go into `audit_extra` with `pid`, `name`, `killed`, `still_alive`; `grace` is capped to the
+      call's remaining time − 5 s; `tree:false` stops only that pid (SIGTERM → grace → SIGKILL, method `signal`; Windows
+      `taskkill` / `taskkill/F` / `terminate`).
+    - Linux `/proc/<pid>/cmdline` shows the parent's command line between fork and exec; tests wait for the exec.
+    - WSL keepalive: backoff 10 s doubling to 300 s after each death or failed spawn, reset after 300 s of uptime; the
+      state file is `state/wsl-keepalive-<distro>.json` `{distro, pid, ctime, argv, started_at}`; adoption by pid + ctime.
+    - `wsl.parse_list_verbose` maps the common localized state words (zh/de) to Running/Stopped; unknown words are kept.
+K7. **Interpretations (install, restart, start-hive.sh):**
+    - `--system` exists only for systemd (others → `bad_request`); the system unit has `User=` and
+      `WantedBy=multi-user.target`; `Type=simple` is added; `--no-capture-path` omits the PATH line (systemd/watchdog) and
+      the `path_prepend` capture (schtasks; node only, via `config.edit_config`). ExecStart/WorkingDirectory values are
+      quoted only when they contain whitespace, quotes, backslashes, `;` or `$` (`$` → `$$` in ExecStart).
+    - Task XML is written UTF-16 with BOM to `<data>/run/task-<kind>.xml`; the LogonTrigger and Principal name
+      `%USERDOMAIN%\%USERNAME%`.
+    - Watchdog: only the node script calls `_update` (the hub has no relay block); `run/watchdog.pid` (+
+      `run/watchdog.json` with the ctime); a live watchdog is never started twice (a re-install rewrites the script
+      atomically and notes it). `uninstall` stops the daemon through `control.json` first (exit 0 ends every method's
+      loop), then signals only the watchdog shell (never its tree: shims are descendants of the node);
+      `stop_services` runs `services.panic_offline` (jobs too).
+    - `restart()`: nothing running and nothing installed → `unavailable` "start it: hive <kind> run (or hive service
+      install <kind>)"; a foreground daemon is stopped through `control.json` and then reported as `unavailable` "start it
+      again: hive <kind> run" (CLI exit 4); old holder still alive after 30 s → `timeout`. `dry_run` returns the plan only
+      (a dry run cannot observe a relaunch); the §13.1 sequence is tested with patched seams (`_holder`, `_execute`,
+      `_clock`, …).
+    - `check_launcher` runs with `PYTHONPATH` removed and cwd = data dir and requires exit 0 plus this version in the
+      output; the editable-install test builds a venv with a `.pth` pointing at the checkout.
+    - `start-hive.sh`: `HIVE_RELAY_PROXY` values `auto`/empty fall back to `HIVE_PROXY`, `off` means direct; the loop
+      appends to `$HIVE_HOME/node/logs/stdout.log`; `HIVE_PYTHON` and `HIVE_POD_WORKSPACE` are test seams. Its inline
+      bootstrap contains `ssl.CERT_NONE` on the pin path (§5.9; `deploy/` is outside the package grep gate of §22.3).
+    - `deploy/systemd|launchd|windows/*.tmpl` are reference copies for the README; `install.py` renders its own text.
+K8. **Interpretations (doctor):** statuses are `ok|warn|fail`; the design's INFO findings (docker group, `python3` only,
+    power plan unchecked with interop off) are `ok` rows whose detail starts with `INFO:`. Doctor loads the configs, runs
+    the config/files groups first and only then builds the node `Policy` + `SecretStore` (SecretStore repairs a loose
+    `secrets.json`, which would hide it) and calls `proctree.set_trusted_path(policy.trusted_path)`. Network GETs use
+    `netutil.guarded_request` with a NetGuard (loopback/private/public) built from the config's `network` block (5 s each,
+    in parallel); hf-mirror.com is probed only when huggingface.co fails and no endpoint is set. "Forwarded requests on
+    the main port" comes from `logs/<kind>.log`; "no X-Forwarded-For" from recent audit rows whose ip is `proxy:<peer>`.
+    Windows ACL checks parse `icacls` output for Users/Authenticated Users/Everyone incl. common German/French/Spanish
+    names and SIDs; `powercfg` values are the last two hex numbers (AC, DC) because the labels are localized. The
+    "hub's machine" for T5 = direct nodes with a loopback, own-hostname or own-tailnet URL plus nodes tagged
+    `wsl-host:<hub hostname>`.
+K9. **Open items (WP4):**
+    - Windows/macOS-only paths (Toolhelp+CIM process listing, `netstat`, GetSystemTimes/GlobalMemoryStatusEx/disk
+      ctypes, `schtasks`, `launchctl`, `icacls`, `netsh`, `powercfg`, system_profiler) are written against the design but
+      only their parsers and off-OS guards run in this CI.
+    - The WSL mirrored-networking Hyper-V firewall spike was not possible here; doctor prints
+      `New-NetFirewallHyperVRule … -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -LocalPorts <port>` (Microsoft's
+      documented WSL rule) as the fix, to be confirmed on a real Windows 11 machine.
+    - Not implemented: doctor's "service code dir skipped" warning (needs a ServiceManager), §20.5 item 15 (restart
+      warning about running `hive.exe` processes), the `--deep` Docker GPU run was not exercised (no daemon here).
+    - CLI wiring of `hive service install|uninstall|status` and `hive doctor` is WP6b.

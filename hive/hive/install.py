@@ -423,7 +423,8 @@ def _install_systemd(ctx: _Ctx, res: InstallResult, *, system: bool, dry_run: bo
     _run_all(res, [_systemctl(system, "daemon-reload"), _systemctl(system, "enable", "--now", _unit_name(ctx.kind))],
              dry_run=dry_run)
     if not system:
-        prefix = "sudo " if _is_wsl() or os.geteuid() != 0 else ""
+        euid = os.geteuid() if hasattr(os, "geteuid") else 1
+        prefix = "sudo " if _is_wsl() or euid != 0 else ""
         res.notes.append(f"start at boot without a login: {prefix}loginctl enable-linger {getpass.getuser()}")
         if _is_wsl():
             res.notes.append("inside WSL the user unit starts with the distro; the Windows node's wsl.keepalive "

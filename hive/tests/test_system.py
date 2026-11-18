@@ -322,6 +322,19 @@ class TestTrustedPathProbes(unittest.TestCase):
             w = sysinfo.which(["nvidia-smi"], node_path=str(self.tooldir))
         self.assertIn("NVIDIA-SMI", w["found"]["nvidia-smi"]["version"] or "")
 
+    def test_fail_safe_default_excludes_temp(self):
+        # v6: without set_trusted_path (CLI, tests) the default drops PATH entries under home, cwd and the temp dir
+        old = proctree._trusted_path
+        proctree._trusted_path = None
+        try:
+            self.assertNotIn(str(self.tooldir), proctree.trusted_path().split(os.pathsep))
+            with mock.patch.object(gpu, "FIXED_SMI", []):
+                found = gpu.find_tool("nvidia-smi")        # a real one in /usr/bin may exist on a GPU runner
+                self.assertFalse(found and Path(found).parent == self.tooldir)
+        finally:
+            proctree._trusted_path = old
+        self.assertFalse(self.mark.exists())
+
     def test_wsl_nvidia_path_first_and_no_processes(self):
         with TrustedPath(""), mock.patch.object(gpu, "_is_wsl", return_value=True), \
                 mock.patch.object(gpu, "WSL_SMI", str(self.tooldir / "nvidia-smi")):
