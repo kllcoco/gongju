@@ -1125,3 +1125,44 @@ R5b-6. **dist (amends B3/B8):** `add_node_instructions(..., host=None)` (additiv
     determine the hub's tailnet IP" (hint: start tailscale, or `--via public`); a T/B code for a wildcard/loopback
     listen host without `host`/`public_url` → `bad_request` (hint: give the hub address or set `public_url`). IPv6
     literals are bracketed in URLs.
+
+## WP3b review fixes
+
+(Items numbered R3b-1… so they cannot collide with the notes of parallel review packages.)
+
+R3b-1. **`_download` file mode (amends W6):**
+    - Range resume has a validator: when headers arrive for a fresh body the child writes `<path>.hive-part.json`
+      (0600, `{"v":1,"url","etag"(strong only),"last_modified"}`) next to the part. A part is resumed only when that
+      sidecar names the same URL, with `If-Range: <etag|last_modified>` (a changed resource answers 200 → restart from
+      zero); a part with no sidecar (unknown origin) or another URL restarts from zero. The sidecar is deleted with the
+      part on success and kept with it on a sha256 mismatch. The handler also vets `<path>.hive-part.json` for writing.
+      Dir mode (hidden per-run part) and pull mode (commit-pinned URLs, every file hashed) send no validator.
+    - A 206 is a fresh body only when its Content-Range starts at 0 (or, with no Range sent, has none); a 206 to a
+      `Range: bytes=N-` (N > 0) with a missing/unparsable/other Content-Range drops the part and fetches again without
+      Range (`_Restart`), never splices or truncates.
+    - A stop that surfaces as `cancelled` from `open_download` (or any error while the stop event is set) ends with
+      exit 7 "stopped", not exit 1.
+    - Server-chosen names: `choose_name` falls back to `download.bin` when the name is longer than 251 bytes in UTF-8
+      (255 = NAME_MAX minus room for `-999`; UTF-16 units on Windows) or, on Windows, contains `<>"|?*`. If the
+      filesystem still refuses a candidate at publish time (not `EEXIST`), the child publishes as `download.bin`; if
+      that fails too the job fails and the hidden `.hive-download-<run>.hive-part` is deleted.
+R3b-2. **`_download` pull mode (amends W6):** `Puller._dest` checks `realpath` of the would-be parent against the target
+    first and then creates missing folders one at a time, each only after its parent's realpath was checked (nothing is
+    created behind a planted symlink); a component that exists and is not a folder fails that file. `.hive-pull.json`,
+    the lock file name and `*.hive-part` are never destinations (skipped_unsafe in the child). `run_pull` refuses
+    (exit 1) a symlinked `lock_file` or manifest and pre-creates the lock with `O_NOFOLLOW` (where available) before
+    `FileLock` opens it.
+R3b-3. **model.pull (amends W8):** repo names equal (casefolded) to `.hive-pull.json` / `.hive-pull.lock`, ending in
+    `.hive-part`, or with a segment the local filesystem cannot hold together with the `.hive-part` suffix (> 245 bytes
+    UTF-8; UTF-16 units and `<>"|?*` on Windows) are `skipped_invalid`. Destinations that collide under
+    `EffectivePolicy.path_key(dest, follow=False)` (casefolded where PathGuard casefolds) keep the first listed file;
+    the others are skipped as unsafe (`skipped_unsafe` / the dry-run `note`). A target whose `.hive-pull.lock` or
+    `.hive-pull.json` is a symbolic link → `conflict`. Audit `extra` gains `route` and `dns` of the endpoint
+    (`check_url(endpoint, purpose="download")`, best effort).
+R3b-4. **net.download (amends W9):** folder mode also vets `<folder>/download.bin` with `resolve_path(write=True)`, so the
+    rules that look at a file's parents (v7 venv `bin`/`Scripts`, PATH dirs, service code dirs) refuse a server-named
+    download into such a folder for a gated identity (`policy_denied` `exec_path`) as they refuse fs.write there.
+    Audit `extra` gains `route` and `dns` of the vetted first hop.
+R3b-5. **netutil:** the unread-stream close fix is R5b-2 (`ClosingIterator`); `_download._fetch` already closes the
+    stream in its `finally` before `_HttpStatus` / `_Restart` propagate. A regression test checks that closing an unread
+    `open_download` 404 stream closes the connection.

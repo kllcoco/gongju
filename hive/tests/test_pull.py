@@ -131,8 +131,8 @@ class TestPlan(PullCase):
         files["readme.md"] = b"# lower\n"
         self.hf.repos[REPO] = Repo(files)
         r = self.pull(dry_run=True)
-        self.assertEqual(sorted(r["skipped_invalid"]), sorted([".hive-pull.json", ".hive-pull.lock",
-                                                               "config.json.hive-part", "sub/" + "模型" * 42 + ".bin"]))
+        want = [".hive-pull.json", ".hive-pull.lock", "config.json.hive-part", "sub/" + "模型" * 42 + ".bin"]
+        self.assertEqual(sorted(r["skipped_invalid"]), sorted(want))
         self.assertIn("readme.md", [f["path"] for f in r["files"]])       # case-sensitive here: two files
         from hive import policy as policy_mod
         real_key = policy_mod.EffectivePolicy.path_key
