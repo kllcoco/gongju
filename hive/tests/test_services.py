@@ -11,6 +11,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -445,6 +446,90 @@ class TestAdoptionAndBoot(SvcCase):
         self.n.stop_runtime()
         wait_for(lambda: not util.pid_alive(int(shim)), 15)
         self.n.rt = self.n.make_runtime()
+
+
+class TestQAAutostartRaces(SvcCase):
+    """QA L1/F2: the boot-time autostart against shutdown() and service.status wait, made deterministic by gating
+    the spawn (no timing assumptions)."""
+
+    def _queue_autostart(self, **overrides):
+        """Define "soe", stop the node with stop_on_exit (desired stays running: the next start autostarts it)."""
+        self.n.overrides = overrides
+        self.n.restart_runtime()
+        self.define(name="soe", argv=SLEEPER, wait=10)
+        shim = self.sm.runtime("soe")["shim_pid"]
+        self.n.stop_runtime()
+        wait_for(lambda: not util.pid_alive(int(shim)), 15)
+
+    def _gate_spawn(self):
+        entered, go = threading.Event(), threading.Event()
+        real = services.ServiceManager._spawn
+
+        def gated(sm, name, **kw):
+            if not entered.is_set():
+                entered.set()
+                go.wait(30)
+            return real(sm, name, **kw)
+        self.addCleanup(go.set)
+        self._go = go
+        p = mock.patch.object(services.ServiceManager, "_spawn", gated)
+        p.start()
+        self.addCleanup(p.stop)
+        return entered, go
+
+    def _kill_if_alive(self, sm, name):
+        def kill():     # a failing run never leaves the gated spawn's processes behind
+            self._go.set()
+            at = sm._autostart_thread
+            if at is not None:
+                at.join(30)
+            wait_for(lambda: not any(k.startswith("spawn:") for k in sm._busy), 30)
+            r = sm.runtime(name)
+            for k, c in (("shim_pid", "shim_ctime"), ("child_pid", "child_ctime")):
+                if r.get(k) and util.pid_alive(int(r[k]), r.get(c)):
+                    proctree.kill_tree(int(r[k]), force=True, create_time=r.get(c))
+        self.addCleanup(kill)
+
+    def test_shutdown_stops_a_service_the_autostart_was_spawning(self):
+        # QA L1: shutdown() ran the stop-on-exit pass before stopping the autostart thread, which then spawned the
+        # service after the pass: an orphaned shim + child on every run of test_stop_on_exit
+        self._queue_autostart(policy={"services": {"stop_on_exit": True}})
+        entered, go = self._gate_spawn()
+        self.n.rt = self.n.make_runtime()
+        sm = self.sm
+        self._kill_if_alive(sm, "soe")
+        self.assertTrue(entered.wait(15))           # the autostart is inside the spawn
+        t = threading.Thread(target=self.n.stop_runtime)
+        t.start()
+        wait_for(sm._stop.is_set, 15)               # shutdown has begun ...
+        go.set()                                    # ... and only then does the gated spawn go ahead
+        t.join(60)
+        self.assertFalse(t.is_alive())
+        r = sm.runtime("soe")
+        self.assertTrue(r.get("shim_pid"))          # the spawn ran
+        self.assertFalse(sm._alive("soe"))          # and the stop-on-exit pass stopped it
+        self.assertFalse(util.pid_alive(int(r["shim_pid"]), r.get("shim_ctime")))
+
+    def test_status_wait_covers_the_queued_autostart(self):
+        # QA F2: a service queued for the boot-time autostart was "stopped" (settled) until the autostart thread
+        # spawned it, so service.status wait=N returned "stopped" at once
+        self._queue_autostart(policy={"services": {"stop_on_exit": True}})
+        entered, go = self._gate_spawn()
+        self.n.rt = self.n.make_runtime()
+        sm = self.sm
+        self._kill_if_alive(sm, "soe")
+        self.assertTrue(entered.wait(15))
+        self.assertEqual(sm.runtime("soe")["state"], "stopped")
+        self.assertFalse(sm._settled("soe"))
+        out = {}
+        t = threading.Thread(target=lambda: out.update(sm.status("soe", tail_lines=0, wait=30)))
+        t.start()
+        t.join(0.5)
+        self.assertTrue(t.is_alive())               # still waiting: the service is about to start
+        go.set()
+        t.join(30)
+        self.assertFalse(t.is_alive())
+        self.assertEqual((out["state"], out["desired"]), ("running", "running"))
 
 
 class TestPanicOffline(SvcCase):

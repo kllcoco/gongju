@@ -177,9 +177,9 @@ class TestE2E2Restart(unittest.TestCase):
         wait_for(lambda: not any(util.pid_alive(p) for p in dead), 20, what="service shim gone")
         self.start_daemon()
         now = c.call("service.status", {"name": "llm", "wait": 30})
+        self.pids += self.svc_pids("llm")     # QA F2: registered before asserting, so a failure leaks nothing
         self.assertEqual((now["state"], now["health"]), ("running", "healthy"), now)
         self.assertNotEqual(now["pid"], before["pid"])
-        self.pids += self.svc_pids("llm")
         auto = c.call("service.status", {"name": "auto"})     # its shim survived the crash: adopted
         self.assertEqual(auto["state"], "running", auto)
 
