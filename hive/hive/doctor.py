@@ -252,10 +252,11 @@ class _Doctor:
         cfg = self.node_cfg if self.kind == "node" else self.hub_cfg
         if cfg is not None and getattr(cfg, "data_dir", None):
             self.data_dir = Path(cfg.data_dir)
-        if self.node_cfg is not None and self.kind == "node":
-            self._build_policy()
 
     def _build_policy(self) -> None:
+        """Policy + SecretStore of the node (after the files group: SecretStore repairs a loose secrets.json)."""
+        if self.node_cfg is None or self.kind != "node":
+            return
         from . import config
         from .policy import Policy
         from .secretstore import SecretStore
@@ -823,7 +824,8 @@ def run(kind: str = "node", *, network: bool = True, deep: bool = False) -> List
         raise bad_request(f"unknown doctor target '{kind}'", hint="use node, hub or client")
     d = _Doctor(kind, network, deep)
     d.load()
-    groups: List[Tuple[str, Callable[[], None]]] = [("config", d.g_config), ("files", d.g_files)]
+    groups: List[Tuple[str, Callable[[], None]]] = [("config", d.g_config), ("files", d.g_files),
+                                                    ("policy", d._build_policy)]
     if kind in ("node", "hub"):
         groups.append(("listen", d.g_listen))
     if network:
