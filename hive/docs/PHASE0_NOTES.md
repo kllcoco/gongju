@@ -1925,3 +1925,12 @@ A3-1b. **Direct node_ids were forgotten at every hub restart (MAJOR):** `DirectL
     → desk's `unavailable`/`connect`, gateway by the id → 403 for a `pod-a/*` app, the polling pod gets no task;
     stale binding dropped at start; changed url or pin forgets the id). DESIGN §8.3, file table; PROTOCOL §5.1;
     SECURITY relay row and limits.
+A3-4. **Gateway resolved the node twice (MINOR):** `HubGatewayBackend.authorize` resolved the node and matched the
+    token's globs, then `forward` called `hub.resolve(node)` again with no glob check on the direct path, so a
+    `node_id` moving between the two calls sent a `pod-a/*` app's request to desk. `authorize` now returns the
+    canonical link name (the `GatewayBackend` protocol allows `Optional[str]`; `NodeGatewayBackend` still returns
+    None), the route passes it to `forward` (and to the audit row), and `forward` looks the link up by name
+    (`hub.links`) and re-checks `<link>/<service>` against the globs on both paths before `open_gateway` /
+    `model.forward`. Tests: `TestGatewayResolvesOnce` (the probe moves the id from pod-a to desk inside authorize:
+    the request still goes to pod-a, nothing reaches desk's audit; `forward` refuses a link the globs do not cover).
+    DESIGN §8.7 step 1.

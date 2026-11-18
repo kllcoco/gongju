@@ -55,8 +55,9 @@ class GatewayResponse:
 class GatewayBackend(Protocol):
     """Authorize and forward gateway requests."""
 
-    def authorize(self, identity: "Identity", node: str, service: str) -> None:
-        """forbidden / not_found."""
+    def authorize(self, identity: "Identity", node: str, service: str) -> Optional[str]:
+        """forbidden / not_found. May return the canonical node the request was authorized for; the route then
+        passes that (not the requested name, alias or node_id) to ``forward``, so the node is resolved once."""
         ...
 
     def forward(self, identity: "Identity", node: str, service: str, method: str, path: str, body: bytes, *,
@@ -270,9 +271,13 @@ def register_gateway_routes(server: "ApiServer", *, role: str, backend: GatewayB
             model = obj.get("model")
             stream = obj.get("stream") is True and path != "embeddings"
         try:
-            backend.authorize(ident, node, service)
+            target = backend.authorize(ident, node, service)
         except HiveError as e:
             raise _fold_hint(e)
+        # verification fix (audit round 3): the node is resolved once, by authorize; forward gets the canonical name
+        # it authorized (a node_id can move to another link between the two calls)
+        if isinstance(target, str) and target:
+            node = target
         anode = node
         try:
             anode = getattr(backend, "audit_node", lambda n: n)(node)
@@ -533,8 +538,9 @@ class HubGatewayBackend(GatewayBackend):
                 out.append(name)
         return sorted(out)
 
-    def authorize(self, identity: "Identity", node: str, service: str) -> None:
-        """Resolve the node (§8.1), then match ``<canonical node>/<service>`` against the token's globs."""
+    def authorize(self, identity: "Identity", node: str, service: str) -> str:
+        """Resolve the node (§8.1), then match ``<canonical node>/<service>`` against the token's globs; returns the
+        canonical node name (what ``forward`` is then called with)."""
         if identity.kind != "models":
             raise forbidden("use a gateway token: hive gateway token add")
         link = self.hub.resolve(node)
@@ -545,6 +551,7 @@ class HubGatewayBackend(GatewayBackend):
             raise not_found(f"node {node[:64]!r} not found" + (f" (did you mean {', '.join(sugg)}?)" if sugg else ""))
         if not glob_match(f"{link.name.lower()}/{service}", identity.models):
             raise forbidden(f"this gateway token may not use {node[:64]}/{service}")
+        return link.name
 
     def _not_found(self, identity: "Identity", link_name: str, service: str) -> GatewayResponse:
         pairs = [g for g in identity.models if glob_match(link_name.lower(), [g.split("/", 1)[0]])]
@@ -601,8 +608,13 @@ class HubGatewayBackend(GatewayBackend):
                 stream: bool, request_id: str, cancel: threading.Event) -> GatewayResponse:
         """Direct links: passthrough; relay links: ``model.forward`` (+ SSE synthesis)."""
         from .hub import DirectLink, RelayLink
-        link = self.hub.resolve(node)
-        assert link is not None
+        # verification fix (audit round 3): ``node`` is the canonical name authorize returned; look it up by name
+        # (not by node_id resolution again, which may have moved meanwhile) and re-check the token's globs
+        link = self.hub.links.get(node) or self.hub.resolve(node)
+        if link is None:
+            raise not_found(f"node {node[:64]!r} not found")
+        if identity.kind != "models" or not glob_match(f"{link.name.lower()}/{service}", identity.models):
+            raise forbidden(f"this gateway token may not use {link.name}/{service}")
         if isinstance(link, DirectLink):
             if not link.online():
                 try:

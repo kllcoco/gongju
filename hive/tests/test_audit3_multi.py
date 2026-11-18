@@ -136,6 +136,45 @@ class TestRelayCannotTakeDirectNodeId(_DeskAndPod):
         self.assertIs(self.hub.resolve("n_podaown1234"), self.pod)
 
 
+class TestGatewayResolvesOnce(_DeskAndPod):
+    """Verification fix: the hub gateway resolves the node once (authorize) and forwards to that link; a node_id
+    that moves between authorize and forward cannot send a request to a node the token was not authorized for."""
+
+    def test_id_moves_between_authorize_and_forward(self):
+        from unittest import mock
+        self.desk._node_id = ""
+        self.fake.register(node_id=self.desk_id)          # pod claims the id before desk's probe
+        self.assertIs(self.hub.resolve(self.desk_id), self.pod)
+        orig = gateway.HubGatewayBackend.authorize
+
+        def authorize(backend, identity, node, service):
+            out = orig(backend, identity, node, service)
+            self.desk.probe(actions=True)                 # the probe lands now: the id moves to desk
+            self.assertIs(self.hub.resolve(self.desk_id), self.desk)
+            return out
+        with mock.patch.object(gateway.HubGatewayBackend, "authorize", authorize):
+            box = call_async(req, self.url, "GET", f"/openai/{self.desk_id}/qwen/v1/models",
+                             token=self.toks["podapp"])
+            # authorized as pod-a, so it goes to pod-a (the link it was authorized for), never to desk
+            t = self.fake.poll_until(1)[0]
+            self.assertEqual(t["action"], "model.forward")
+            self.fake.result(t["task_id"], ok_env({"status": 200, "content_type": "application/json",
+                                                   "body": "{}", "truncated": False, "elapsed_s": 0.1}))
+            box["thread"].join(15)
+        st, _h, _b = box["result"]
+        self.assertEqual(st, 200)
+        self.assertNotIn('"agent":"gw/podapp"', "".join(
+            p.read_text() for p in (self.nrt.data_dir / "audit").glob("*.jsonl")))
+
+    def test_forward_rechecks_globs(self):
+        be = gateway.HubGatewayBackend(self.hub)
+        ident = self.hub.tokens.authenticate(self.toks["podapp"], "127.0.0.1")
+        with self.assertRaises(HiveError) as cm:
+            be.forward(ident, "desk", "qwen", "GET", "models", b"", stream=False, request_id="r_x",
+                       cancel=threading.Event())
+        self.assertEqual(cm.exception.code, "forbidden")
+
+
 class TestDirectIdSurvivesRestart(_DeskAndPod):
     """Verification fix (A3-1b): the learned direct node_id is persisted (state/direct_ids.json) and preloaded at hub
     start, so a pod cannot claim it after a hub restart while the direct node is offline."""
