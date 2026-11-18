@@ -126,7 +126,10 @@ def http(method: str, url: str, *, token: Optional[str] = None, body: Any = None
 
 def http_json(method: str, url: str, **kw: Any) -> "tuple[int, Any]":
     r = http(method, url, **kw)
-    raw = r.read()
+    try:
+        raw = r.read()
+    finally:
+        r.close()
     try:
         return r.status if hasattr(r, "status") else r.code, json.loads(raw.decode("utf-8") or "null")
     except ValueError:

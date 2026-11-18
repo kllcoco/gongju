@@ -501,7 +501,11 @@ def _run_fs_transfer(tk: "Toolkit", args: dict, cctx: CallCtx) -> ToolResult:
                 cctx.progress(float(st.get("bytes_done") or 0), st.get("bytes_total"), f"{st.get('state')}")
             except Exception:  # noqa: BLE001
                 pass
-    return tk._ok("fs_transfer", st, args, node=None, action=None)
+    res = tk._ok("fs_transfer", st, args, node=None, action=None)
+    if st.get("state") == "failed":
+        # M2: a copy that failed is an execution error (§18.2 isError), not a status report
+        res = dataclasses.replace(res, is_error=True)
+    return res
 
 
 # ---------------------------------------------------------------------------------------------------------------
