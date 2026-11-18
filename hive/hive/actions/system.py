@@ -269,12 +269,14 @@ def _group_members(pid: int) -> List[int]:
 def _check_tree(ctx: ActionContext, pid: int, prot: Dict[int, str]) -> None:
     """The kill guard for every process a tree kill would signal (descendants + group members): the first refusal
     refuses the whole call, so a protected process cannot be killed through an unprotected parent (§5.4)."""
-    targets = list(dict.fromkeys(list(proctree.descendants(pid)) + _group_members(pid)))
+    targets = [d for d in dict.fromkeys(list(proctree.descendants(pid)) + _group_members(pid)) if d != pid]
+    rows: Optional[Dict[int, dict]] = None
+    if util.IS_WINDOWS and len(targets) > 1:  # pragma: no cover - Windows only
+        # without psutil each process_info is a PowerShell CIM query: one listing serves every descendant
+        rows = {int(r["pid"]): r for r in procinfo.list_processes(cmdline=True)[0] if isinstance(r.get("pid"), int)}
     for d in targets:
-        if d == pid:
-            continue
         ctx.check()
-        dinfo = procinfo.process_info(d)
+        dinfo = rows.get(d) if rows is not None else procinfo.process_info(d)
         if dinfo is None:        # exited meanwhile
             continue
         try:

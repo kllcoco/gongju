@@ -1079,7 +1079,7 @@ K9. **Open items (WP4):**
     - The WSL mirrored-networking Hyper-V firewall spike was not possible here; doctor prints
       `New-NetFirewallHyperVRule … -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' -LocalPorts <port>` (Microsoft's
       documented WSL rule) as the fix, to be confirmed on a real Windows 11 machine.
-    - Not implemented: doctor's "service code dir skipped" warning (needs a ServiceManager), §20.5 item 15 (restart
+    - Not implemented: (doctor's "service code dir skipped" warning: done in the review fixes, R4-7), §20.5 item 15 (restart
       warning about running `hive.exe` processes), the `--deep` Docker GPU run was not exercised (no daemon here).
     - CLI wiring of `hive service install|uninstall|status` and `hive doctor` is WP6b.
 
@@ -1166,3 +1166,43 @@ R3b-4. **net.download (amends W9):** folder mode also vets `<folder>/download.bi
 R3b-5. **netutil:** the unread-stream close fix is R5b-2 (`ClosingIterator`); `_download._fetch` already closes the
     stream in its `finally` before `_HttpStatus` / `_Restart` propagate. A regression test checks that closing an unread
     `open_download` 404 stream closes the connection.
+
+## WP4 review fixes
+
+(Items numbered R4-1… so they cannot collide with the notes of parallel review packages. Regression tests:
+`tests/test_wp4_review.py`.)
+
+R4-1. **proc.kill (amends K6):** with `tree:true` (default) the kill guard runs on every process the tree kill would
+    signal: `proctree.descendants(pid)` plus, on POSIX when the pid leads a process group (`killpg`), the other members
+    of that group. The first refusal refuses the whole call (`policy_denied`, the descendant's rule, `details.descendant`,
+    hint "use tree:false, or job_stop/service_control"); nothing is signalled. `protected_pids` walks the node's
+    ancestors over one ppid snapshot on Windows (psutil | Toolhelp32) instead of one `process_info` per ancestor; on
+    Windows a tree check with several descendants reads them from one `procinfo.list_processes` listing.
+R4-2. **proc.list (amends K6):** `filter` matches `name + " " + audit.redact_text(<whole joined cmdline>)` (the text
+    `cmd` shows, not cut to 300 chars), so `total`/`shown` never reveal a redacted secret.
+R4-3. **sysinfo disks:** `parse_mounts(text, *, wsl=False, isdir=None)` (additive): with `isdir`, mount points that are
+    not folders are dropped. `disks()` checks "is a folder" inside the statvfs thread (Docker's `/etc/hosts`,
+    `/etc/hostname`, `/etc/resolv.conf` file binds are not disks) and keeps one row per block device + totals (a
+    device bind-mounted at several places, as pods do, is listed once; overlays as before).
+R4-4. **WSL keepalive (amends K6):** a live recorded keepalive is adopted only when its recorded `argv` equals the
+    entry's current argv; otherwise it is stopped (`proctree.kill_tree`, grace 2 s) and the new command started.
+    `wsl.read_keepalive_state(state_dir, distro)` / `wsl.keepalive_state_path(state_dir, distro)` (additive) read the
+    state file offline (`running` = pid + ctime alive); doctor's Windows wsl group adds ok "keepalive for X running
+    (pid N)" or warn "keepalive for X not running" (fix "hive node restart") per `wsl.keepalive` entry.
+R4-5. **install (amends K7):** `install(..., system=True)` with `SUDO_USER` set (≠ root) renders the unit for that user's
+    HIVE_HOME: the config's HIVE_HOME root when the config path is `<home>/<kind>/config.json`, else an explicit
+    `HIVE_HOME`, else `~<SUDO_USER>/.hive` (`pwd`); the default config path follows that home. A logs folder the
+    installer creates for a system unit is chowned to the user. `restart()` of a daemon with no install record waits
+    ≤ 20 s for a new holder after the old one exits (the `start-hive.sh` loop relaunches without an install record)
+    and reports success when one appears; only then is it `unavailable` "start it again: hive <kind> run".
+R4-6. **start-hive.sh:** the inline bootstrap runs as `"$PY" -I -` (isolated: no cwd/user site on `sys.path`, PYTHON*
+    ignored), so a planted `json.py` in the start cwd is never imported (D56).
+R4-7. **doctor (amends K8/K9):** wsl mirrored + `listen.host "tailscale"` shows the IP from `httpserver.tailscale_info()`
+    (a tuple; `HiveError` = unavailable); the "service code dir skipped" warning is implemented (services.json read
+    offline through a never-started `ServiceManager.policy_view()`; dirs that normalise to ~, a root or an ancestor of
+    one → `policy` warn "service code dir X is your home or a root; Hive cannot protect it from writes");
+    `parse_icacls(text, path=None)` strips the path from the first line (a profile with a space hid open ACEs there);
+    the "without X-Forwarded-For" warning only when no main-port forwarding was logged and `listen.proxy_port` or
+    `trusted_proxies` is set (main-port forwarding records `proxy:<peer>` with or without XFF); the Windows
+    permission fix is `icacls "<path>" /inheritance:r /grant:r "*<user SID>:F" /grant:r "*S-1-5-18:F"`
+    (`doctor.win_fix_perm`, `(OI)(CI)F` for folders; §20.5 item 12).
