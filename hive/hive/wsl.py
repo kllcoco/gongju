@@ -235,6 +235,24 @@ def _safe_name(distro: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", distro)[:80] or "distro"
 
 
+def keepalive_state_path(state_dir: "Path | str", distro: str) -> Path:
+    return Path(state_dir) / f"wsl-keepalive-{_safe_name(distro)}.json"
+
+
+def read_keepalive_state(state_dir: "Path | str", distro: str) -> Optional[dict]:
+    """The recorded keepalive of ``distro`` (``state/wsl-keepalive-<distro>.json``: ``{distro, pid, ctime, argv,
+    started_at}``) plus ``running`` (pid + ctime alive); None when there is no usable record. Offline (doctor)."""
+    try:
+        rec = util.read_json(keepalive_state_path(state_dir, distro), default=None)
+    except Exception:  # noqa: BLE001 - unreadable/corrupt state = no record
+        return None
+    if not isinstance(rec, dict) or not isinstance(rec.get("pid"), int) or isinstance(rec.get("pid"), bool):
+        return None
+    out = dict(rec)
+    out["running"] = bool(util.pid_alive(int(rec["pid"]), rec.get("ctime")))
+    return out
+
+
 class Keepalive:
     """Windows-side WSL keepalive processes (spawned with proctree.spawn_detached, §20.7 step 6).
 
@@ -255,7 +273,7 @@ class Keepalive:
 
     # -- helpers
     def _state_path(self, distro: str) -> Path:
-        return self.state_dir / f"wsl-keepalive-{_safe_name(distro)}.json"
+        return keepalive_state_path(self.state_dir, distro)
 
     def _argv(self, entry: dict) -> List[str]:
         exe = self._exe or wsl_exe()
@@ -305,12 +323,24 @@ class Keepalive:
                 st = {"entry": dict(e), "pid": None, "ctime": None, "started": None, "backoff": BACKOFF_MIN,
                       "next_try": 0.0, "attempts": 0, "last_try": None, "error": None, "adopted": False}
                 self._entries[distro] = st
-                rec = util.read_json(self._state_path(distro), default=None)
-                if isinstance(rec, dict) and isinstance(rec.get("pid"), int) and \
-                        util.pid_alive(rec["pid"], rec.get("ctime")):
-                    st.update(pid=rec["pid"], ctime=rec.get("ctime"), started=self._clock(), adopted=True)
-                    log.info("WSL keepalive for %s adopted (pid %s)", distro, rec["pid"])
-                    continue
+                rec = read_keepalive_state(self.state_dir, distro)
+                if rec is not None and rec["running"]:
+                    try:
+                        want: Optional[List[str]] = self._argv(e)
+                    except Exception:  # noqa: BLE001 - wsl.exe not found now: keep the live one
+                        want = None
+                    if want is None or rec.get("argv") == want:
+                        st.update(pid=rec["pid"], ctime=rec.get("ctime"), started=self._clock(), adopted=True)
+                        log.info("WSL keepalive for %s adopted (pid %s)", distro, rec["pid"])
+                        continue
+                    # the entry's command changed (e.g. null -> the §20.7 run-node.sh form): the old keepalive holds
+                    # nothing but the distro, so it is stopped and the new command started
+                    log.info("WSL keepalive for %s (pid %s) runs an old command; replacing it", distro, rec["pid"])
+                    try:
+                        from . import proctree
+                        proctree.kill_tree(int(rec["pid"]), grace=2.0, create_time=rec.get("ctime"))
+                    except Exception as ex:  # noqa: BLE001
+                        log.warning("cannot stop the old WSL keepalive for %s: %s", distro, ex)
                 self._spawn(distro)
                 if st.get("pid") is None:
                     self._defer(st, self._clock())
@@ -354,4 +384,4 @@ class Keepalive:
 
 __all__ = ["is_wsl", "wsl_info", "list_distros", "Keepalive", "interop_enabled", "networking_mode",
            "systemd_running", "decode_output", "parse_list_verbose", "parse_list_quiet", "has_distros",
-           "version_line", "wsl_exe", "clear_cache"]
+           "version_line", "wsl_exe", "clear_cache", "read_keepalive_state", "keepalive_state_path"]

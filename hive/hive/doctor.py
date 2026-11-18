@@ -106,15 +106,28 @@ def _hostname() -> str:
 # ---------------------------------------------------------------------------------------------------------------
 # helpers (parsers are public for tests)
 
-def parse_icacls(text: str) -> List[str]:
+def parse_icacls(text: str, path: Optional[str] = None) -> List[str]:
     """Principals in ``icacls <path>`` output that are open groups (Users, Authenticated Users, Everyone, incl. common
-    localized names and SIDs)."""
+    localized names and SIDs). The first line starts with the path, which may contain spaces
+    (``C:\\Users\\John Smith\\…``): ``path`` is stripped from it; without ``path`` a candidate that still looks like
+    a path (a ``:`` or more than one backslash) is skipped for the next whitespace-separated start."""
     out: List[str] = []
-    for line in (text or "").splitlines():
-        m = re.search(r"(?:^|\s)([^\s:][^:]*?):\(", line)
-        if not m:
+    for i, line in enumerate((text or "").splitlines()):
+        if i == 0 and path and line.lower().startswith(str(path).lower()):
+            line = " " + line[len(str(path)):]
+        idx = line.find(":(")
+        if idx <= 0:
             continue
-        who = m.group(1).strip()
+        head = line[:idx]
+        who = None
+        for m in re.finditer(r"(?:^|(?<=\s))[^\s:]", head):
+            cand = head[m.start():].strip()
+            if ":" in cand or cand.count("\\") > 1:
+                continue
+            who = cand
+            break
+        if not who:
+            continue
         name = who.rsplit("\\", 1)[-1].strip().lower()
         if name in OPEN_PRINCIPALS or who.lower() in OPEN_PRINCIPALS:
             if who not in out:
@@ -151,7 +164,7 @@ def _mode_problem(path: Path) -> Optional[str]:
         code, out = _run([icacls, str(path)])
         if code is None:
             return None
-        bad = parse_icacls(out)
+        bad = parse_icacls(out, str(path))
         return f"readable by {', '.join(bad)}" if bad else None
     problems = []
     if st.st_mode & 0o077:
@@ -161,9 +174,17 @@ def _mode_problem(path: Path) -> Optional[str]:
     return ", ".join(problems) or None
 
 
+def win_fix_perm(path: "Path | str", is_dir: bool, sid: Optional[str]) -> str:
+    """The owner-only ``icacls`` fix by SID (§20.5 item 12; ``%USERNAME%`` is not expanded in PowerShell and can name
+    the wrong account): the current user's SID and SYSTEM, inheritance removed (what ``util`` applies itself)."""
+    perm = "(OI)(CI)F" if is_dir else "F"
+    who = f"*{sid}" if sid else "*<your SID from whoami /user>"
+    return f'icacls "{path}" /inheritance:r /grant:r "{who}:{perm}" /grant:r "*S-1-5-18:{perm}"'
+
+
 def _fix_perm(path: Path, is_dir: bool = False) -> str:
     if IS_WINDOWS:  # pragma: no cover - Windows only
-        return f'icacls "{path}" /inheritance:r /grant:r "%USERNAME%:F"'
+        return win_fix_perm(path, is_dir, util._current_user_sid())
     return f"chmod {'700' if is_dir else '600'} '{path}'"
 
 
@@ -373,11 +394,15 @@ class _Doctor:
         if not getattr(listen, "enabled", True):
             self.add("listen", "ok", "listen is off (relay only)")
             return
-        if "forwarded request on the main port" in self._log_text():
+        main_fwd = "forwarded request on the main port" in self._log_text()
+        if main_fwd:
             self.add("listen", "warn", "forwarded requests were seen on the main port (a reverse proxy or tunnel "
                                        "points at it)", f"point the proxy at listen.proxy_port "
                                                         f"({listen.proxy_port or 'set one, e.g. 7709'})")
-        proxied = [r for r in self._audit_rows() if str(r.get("ip") or "").startswith("proxy:")]
+        # a `proxy:<peer>` client IP means "no X-Forwarded-For" only on the proxy port or from a trusted proxy; on the
+        # main port every forwarded request is recorded so, with or without the header (§5.7, httpserver._client)
+        proxied = [] if main_fwd or not (listen.proxy_port or getattr(listen, "trusted_proxies", None)) else \
+            [r for r in self._audit_rows() if str(r.get("ip") or "").startswith("proxy:")]
         if proxied:
             self.add("proxy", "warn", f"{len(proxied)} recent requests came through a proxy without "
                                       "X-Forwarded-For (all share one throttle bucket)",
@@ -533,6 +558,7 @@ class _Doctor:
                 if e.get("distro") not in names:
                     self.add("wsl", "warn", f"wsl.keepalive names {e.get('distro')}, which is not installed",
                              "fix the distro name in the config (wsl -l -v)")
+            self._wsl_keepalives(entries)
             return
         if not wsl.is_wsl():
             return
@@ -563,8 +589,11 @@ class _Doctor:
                 ip = None
                 try:
                     from . import httpserver
-                    ip = (httpserver.tailscale_info() or {}).get("ip")
+                    ip, _names, _note = httpserver.tailscale_info()
+                except HiveError:      # Tailscale unavailable
+                    ip = None
                 except Exception:  # noqa: BLE001
+                    log.debug("tailscale_info failed", exc_info=True)
                     ip = None
                 self.add("wsl", "ok", f"mirrored networking, listen tailscale -> {ip or 'tailnet IP not found'}; "
                                       "inbound to WSL also needs the Hyper-V firewall to allow the port",
@@ -588,6 +617,22 @@ class _Doctor:
                     self.add("wsl", "warn", "the wsl-host proxy is not reachable",
                              "enable 'allow LAN' in Clash/v2rayN and allow the port in the Windows firewall")
         self._wsl_power()
+
+    def _wsl_keepalives(self, entries: List[dict]) -> None:
+        """Windows: the state of each configured keepalive, read offline from ``state/wsl-keepalive-<distro>.json``."""
+        from . import wsl
+        if self.node_cfg is None:
+            return
+        state = Path(self.node_cfg.data_dir) / "state"
+        for e in entries:
+            if not isinstance(e, dict) or not e.get("distro"):
+                continue
+            distro = str(e["distro"])
+            rec = wsl.read_keepalive_state(state, distro)
+            if rec is not None and rec["running"]:
+                self.add("wsl", "ok", f"keepalive for {distro} running (pid {rec['pid']})")
+            else:
+                self.add("wsl", "warn", f"keepalive for {distro} not running", "hive node restart")
 
     def _wsl_power(self) -> None:
         from . import wsl
@@ -671,6 +716,10 @@ class _Doctor:
         if self.policy is not None:
             for w in self.policy.warnings:
                 self.add("policy", "warn", w)
+            for d in self._skipped_service_code_dirs():
+                self.add("policy", "warn", f"service code dir {d} is your home or a root; Hive cannot protect it from "
+                                           "writes", "give the service a cwd of its own (a folder below a root, "
+                                                     "e.g. ~/apps/<name>) and run it from there")
         node_preset = getattr(getattr(self.node_cfg, "policy", None), "preset", None)
         if self.node_cfg is not None:
             for t in self.node_cfg.auth.tokens:
@@ -699,6 +748,38 @@ class _Doctor:
             if hubs:
                 self.add("policy", "warn", f"agents on this WSL node can read the Windows hub's tokens ({hubs[0]}) "
                                            "(T25)", "use --cautious hub tokens or set [automount] enabled=false")
+
+    def _skipped_service_code_dirs(self) -> List[str]:
+        """Service code dirs (§5.4 step 7, read offline from ``state/services.json``) that the node drops because they
+        are ``~``, a root or an ancestor of one (§12.4 policy v6)."""
+        if self.policy is None or self.node_cfg is None:
+            return []
+        from types import SimpleNamespace
+        from . import services
+        data = Path(self.node_cfg.data_dir)
+        state = data / "state"
+        path = state / "services.json"
+        if not path.is_file():
+            return []
+        try:
+            raw = util.read_json(path, {})
+        except HiveError:
+            return []
+        defs = (raw.get("services") or {}) if isinstance(raw, dict) else {}
+        if not isinstance(defs, dict) or not defs:
+            return []
+        rt = SimpleNamespace(state_dir=state, data_dir=data, policy=self.policy)
+        mgr = services.ServiceManager(rt)     # never started: only its offline policy_view() is used
+        mgr._defs = {str(k): dict(v) for k, v in defs.items() if isinstance(v, dict)}
+        out: List[str] = []
+        for d in mgr.policy_view().get("code_dirs") or ():
+            try:
+                key = self.policy._norm(str(d))
+            except Exception:  # noqa: BLE001
+                continue
+            if self.policy._is_root_or_ancestor(key) and str(d) not in out:
+                out.append(str(d))
+        return out
 
     def _hub_local_nodes(self) -> List[str]:
         out = []

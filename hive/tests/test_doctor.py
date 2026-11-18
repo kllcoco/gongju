@@ -131,7 +131,9 @@ class TestListenAndProxy(DoctorCase):
                                              request_id="r_1")
         res = self.run_doc()
         self.assertRow(res, "listen", "warn", "point the proxy at listen.proxy_port")
-        self.assertRow(res, "proxy", "warn", "without X-Forwarded-For")
+        # main-port forwarding records `proxy:<peer>` with or without X-Forwarded-For: no XFF warning then
+        # (WP4 review; the XFF case is tests/test_wp4_review.py)
+        self.assertFalse([r for r in res if "without X-Forwarded-For" in r["detail"]], res)
 
     def test_firewall_parser(self):
         text = ("\r\nRule Name:                            Hive Node (tailnet)\r\n"
