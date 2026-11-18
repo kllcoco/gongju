@@ -285,12 +285,30 @@ def _listen_pin(hub_cfg: Any) -> Optional[str]:
         return None
 
 
+def _url_host(host: str) -> str:
+    """Bracket an IPv6 literal for a URL."""
+    h = str(host).strip().strip("[]")
+    return f"[{h}]" if ":" in h else h
+
+
+def _reachable_host(host: Optional[str]) -> Optional[str]:
+    """``host`` when a remote machine could reach it: not empty, not ``tailscale``, not a wildcard, not loopback."""
+    from .util import is_loopback_host
+    h = str(host or "").strip().strip("[]")
+    if not h or h.lower() == "tailscale" or h in ("0.0.0.0", "::", "*") or is_loopback_host(h):
+        return None
+    return h
+
+
 def add_node_instructions(hub_cfg: Any, name: str, token: str, *, via: Optional[str] = None,
                           tailnet_ip: Optional[str] = None, pyz_sha256_hex: Optional[str] = None,
-                          tls_pin: Optional[str] = None) -> Dict[str, Any]:
+                          tls_pin: Optional[str] = None, host: Optional[str] = None) -> Dict[str, Any]:
     """Join codes and printed blocks for a new relay node (§20.4): ``{"variants": [...], "codes": {variant: code},
-    "lines": [str]}``. ``via`` None picks T for a ``"tailscale"`` hub (plus the public block A when ``public_url`` is
-    set), A for a hub with an https ``public_url``, else B (self-signed TLS) or T (plain loopback/LAN hub)."""
+    "lines": [str]}``. ``via`` None on a ``"tailscale"`` hub means ``--via tailnet``: T (plus the public block A when
+    ``public_url`` is set), then C; otherwise A for a hub with an https ``public_url``, else B (self-signed TLS) or T
+    (plain LAN hub). ``host`` (additive, WP5b review) is the hub address a remote machine uses when the listen host is
+    a wildcard or loopback. A join code never points at a loopback or wildcard address: without a usable host the
+    call fails with ``bad_request`` (the relay token would otherwise be handed out in an unusable one-time code)."""
     if via not in (None, "tailnet", "public"):
         raise bad_request("--via must be tailnet or public")
     listen = hub_cfg.listen
@@ -308,8 +326,7 @@ def add_node_instructions(hub_cfg: Any, name: str, token: str, *, via: Optional[
         variants.append("T")
         if via is None and public:
             variants.append("A")
-        if via == "tailnet":
-            variants.append("C")
+        variants.append("C")
     elif via == "public":
         if not public and not listen.tls.cert:
             raise bad_request("this hub has no public URL", hint="set public_url (hive init hub --funnel) or use "
@@ -321,19 +338,35 @@ def add_node_instructions(hub_cfg: Any, name: str, token: str, *, via: Optional[
         variants.append("B")
     else:
         variants.append("T")
+    plain_host: Optional[str] = None
+    if "T" in variants or "C" in variants:
+        plain_host = _reachable_host(tailnet_ip) or _reachable_host(host) or \
+            (None if tailscale else _reachable_host(str(listen.host)))
+        if plain_host is None:
+            if tailscale:
+                raise bad_request("cannot determine the hub's tailnet IP (tailscale ip -4 failed)",
+                                  hint="is tailscale up on the hub? start it, or use --via public"
+                                       + (" (public_url is set)" if public else " with public_url set"))
+            raise bad_request(f"the hub listens on {listen.host}, which another machine cannot reach",
+                              hint="give the hub's LAN/tailnet address, or set public_url")
+    tls_host: Optional[str] = None
+    if "B" in variants and not public:
+        tls_host = _reachable_host(host) or _reachable_host(str(listen.host))
+        if tls_host is None:
+            raise bad_request(f"the hub listens on {listen.host}, which another machine cannot reach",
+                              hint="set public_url to the address pods use (https://HUB:7700), or give the hub "
+                                   "address")
     sha_line = pyz_sha256_hex or "<sha256 printed by hive dist build>"
     codes: Dict[str, str] = {}
     lines: List[str] = []
     for v in variants:
         if v in ("T", "C"):
-            host = tailnet_ip or (str(listen.host) if str(listen.host) not in ("tailscale", "0.0.0.0", "::")
-                                  else "127.0.0.1")
-            url = f"http://{host}:{port}"
+            url = f"http://{_url_host(str(plain_host))}:{port}"
             pin = None
         elif v == "A":
             url, pin = str(public), None
         else:
-            url = public or f"https://{listen.host}:{port}"
+            url = public or f"https://{_url_host(str(tls_host))}:{port}"
             pin = tls_pin or _listen_pin(hub_cfg)
         code = encode_join({"u": url, "t": token, "p": pin, "n": name})
         codes[v] = code

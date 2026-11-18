@@ -28,14 +28,14 @@ import time
 import unicodedata
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import __version__, catalog, schema
 from .auth import CAUTIOUS_ACTIONS, Identity, TokenStore, exec_gated as auth_exec_gated
 from .errors import (HiveError, bad_request, conflict, forbidden, internal, not_found, rate_limited,
                      timeout as timeout_error, unavailable)
-from .util import (FileLock, IS_WINDOWS, glob_match, human_bytes, iso_utc, new_id, read_json, secure_mkdir,
-                   write_json_atomic)
+from .util import (ClosingIterator, FileLock, IS_WINDOWS, glob_match, human_bytes, iso_utc, new_id, read_json,
+                   secure_mkdir, write_json_atomic)
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import HubConfig, HubNodeEntry
@@ -59,11 +59,15 @@ HASH_MAX = 16 << 20
 SHOW_MAX = 256 << 10
 DIST_PER_MIN = 6
 DIST_CONCURRENT = 4
+DIST_CHUNK = 262144             # bytes per write of a hive.pyz download
 _BAD_CHARS_RE = re.compile("[\u0000-\u001f\u007f-\u009f​-‏‪-‮⁠-⁩﻿]")
 
 
 # ---------------------------------------------------------------------------------------------------------------
 # helpers
+
+NODE_ID_RE = re.compile(r"^n_[A-Za-z0-9_-]{4,64}\Z")   # the config.py node_id pattern
+
 
 def _sanitize(v: Any, depth: int = 0) -> Any:
     """T28: strings capped at 200 chars, C0/C1, bidi and zero-width characters stripped (recursively)."""
@@ -468,7 +472,7 @@ class RelayLink(NodeLink):
             acts = body.get("actions") if isinstance(body.get("actions"), list) else []
             self.actions_list = [a for a in acts if isinstance(a, str) and len(a) <= 64][:500]
             nid = body.get("node_id")
-            self._node_id = _sanitize(nid) if isinstance(nid, str) else ""
+            self._node_id, bad_nid = self._vet_node_id(nid)
             try:
                 self.max_parallel = max(1, min(256, int(body.get("max_parallel") or 8)))
             except (TypeError, ValueError):
@@ -478,6 +482,9 @@ class RelayLink(NodeLink):
             self.poll_gen += 1
             sid = self.session_id
             self.cond.notify_all()
+        if bad_nid:
+            self.hub._audit_event("warning", self.name, {"event": "relay node_id refused", "node_id": bad_nid,
+                                                         "session": sid})
         if old is not None or note is not None:
             extra = {"event": "relay session replaced" if old else "relay register", "session": sid}
             if note:
@@ -485,6 +492,20 @@ class RelayLink(NodeLink):
             self.hub._audit_event("relay" if note is None else "warning", self.name, extra)
         return {"session_id": sid, "node": self.name, "poll_wait": float(self.cfg.poll_wait),
                 "server_time": iso_utc(), "max_result_bytes": int(self.cfg.max_result_bytes)}
+
+    def _vet_node_id(self, nid: Any) -> Tuple[str, Optional[str]]:
+        """(node_id to store, refused value or None). The pod's node_id authenticates nothing (§7.1), so it is kept
+        only when well-formed and not equal (case-insensitively) to any configured node name, alias or another
+        link's node_id; otherwise a pod could take over routing for another node (WP5b review)."""
+        if nid is None or nid == "":
+            return "", None
+        if not isinstance(nid, str) or not NODE_ID_RE.match(nid):
+            return "", _sanitize(str(nid))[:80]
+        n = nid.lower()
+        for l in list(self.hub.links.values()):
+            if n == l.name.lower() or n in l.aliases or (l is not self and l.node_id and l.node_id.lower() == n):
+                return "", nid
+        return nid, None
 
     def poll(self, body: dict) -> dict:
         """Hold the poll up to ``poll_wait`` until tasks/cancels/refresh exist (§7.2)."""
@@ -535,43 +556,46 @@ class RelayLink(NodeLink):
 
     def _take(self, free: int, sid: str) -> Optional[dict]:
         """Tasks/cancels/refresh for this poll, or None when there is nothing (lock held)."""
+        if self.identity_changed:
+            # a foreign instance holds the session (§7.1): it gets no tasks, and neither the restart flag nor
+            # cancels meant for the bound instance (they stay for it)
+            return None
         refresh = self.refresh
         cancels = list(self.cancels)
         tasks: List[dict] = []
-        if not self.identity_changed:
-            now = time.monotonic()
-            fwd_cap = max(1, self.max_parallel - 2)
-            fwd_live = sum(1 for t in self.delivered.values() if t.forward)
-            budget = int(self.cfg.max_poll_bytes)
-            used = 0
-            for t in list(self.queue):
-                if len(tasks) >= free:
-                    t.busy_seen = True
-                    continue
-                if t.forward and fwd_live >= fwd_cap:
-                    t.busy_seen = True
-                    continue
-                remaining = t.deadline - now
-                if remaining <= 0:
-                    self._finish(t, timeout_error("the call's deadline passed before the node picked it up",
-                                                  maybe_executed=False))
-                    continue
-                t.timeout_s = remaining
-                w = t.wire()
-                try:
-                    size = len(json.dumps(w, ensure_ascii=False, default=str).encode("utf-8"))
-                except (TypeError, ValueError):
-                    size = 0
-                if tasks and used + size > budget:
-                    continue
-                used += size
-                self.queue.remove(t)
-                t.delivered_at = now
-                t.session = sid
-                self.delivered[t.task_id] = t
-                if t.forward:
-                    fwd_live += 1
-                tasks.append(w)
+        now = time.monotonic()
+        fwd_cap = max(1, self.max_parallel - 2)
+        fwd_live = sum(1 for t in self.delivered.values() if t.forward)
+        budget = int(self.cfg.max_poll_bytes)
+        used = 0
+        for t in list(self.queue):
+            if len(tasks) >= free:
+                t.busy_seen = True
+                continue
+            if t.forward and fwd_live >= fwd_cap:
+                t.busy_seen = True
+                continue
+            remaining = t.deadline - now
+            if remaining <= 0:
+                self._finish(t, timeout_error("the call's deadline passed before the node picked it up",
+                                              maybe_executed=False))
+                continue
+            t.timeout_s = remaining
+            w = t.wire()
+            try:
+                size = len(json.dumps(w, ensure_ascii=False, default=str).encode("utf-8"))
+            except (TypeError, ValueError):
+                size = 0
+            if tasks and used + size > budget:
+                break       # §7.2: stop adding; this and later tasks stay queued in order (FIFO)
+            used += size
+            self.queue.remove(t)
+            t.delivered_at = now
+            t.session = sid
+            self.delivered[t.task_id] = t
+            if t.forward:
+                fwd_live += 1
+            tasks.append(w)
         if not tasks and not cancels and not refresh:
             return None
         self.cancels = []
@@ -620,9 +644,10 @@ class RelayLink(NodeLink):
                 self.cond.notify_all()
 
     def request_restart(self) -> bool:
-        """Set ``refresh:"restart"`` for the next poll; False (nothing queued) when offline."""
+        """Set ``refresh:"restart"`` for the next poll; False (nothing queued) when offline or while a foreign
+        instance holds the session (``identity_changed``: the bound instance is not the one polling)."""
         with self.lock:
-            if not self.online():
+            if not self.online() or self.identity_changed:
                 return False
             self.refresh = "restart"
             self.cond.notify_all()
@@ -656,6 +681,8 @@ class DirectLink(NodeLink):
         self._catalog: List[dict] = []
         self._actions_at: Optional[float] = None
         self._probe_lock = threading.Lock()
+        self._probes_done = 0                         # completed probes (success or failure)
+        self._probe_error: Optional[HiveError] = None  # error of the last completed probe, None after a success
         self.last_error: Optional[str] = None
 
     @property
@@ -674,39 +701,56 @@ class DirectLink(NodeLink):
     def probe(self, *, timeout: float = PROBE_TIMEOUT, actions: bool = False) -> None:
         """GET /v1/nodes (and /v1/actions when due or never fetched); raises on failure."""
         with self._probe_lock:
-            try:
-                r = self.transport.request("GET", "/v1/nodes", timeout=timeout)
-                rows = r.get("nodes") if isinstance(r, dict) else None
-                if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
-                    raise internal(f"unexpected /v1/nodes answer from {self.name}")
-                row = _sanitize(rows[0])
-                need_actions = actions or self._actions is None or self._actions_at is None or \
-                    time.monotonic() - self._actions_at > ACTIONS_INTERVAL
-                if need_actions:
-                    a = self.transport.request("GET", "/v1/actions", timeout=timeout)
-                    impl = a.get("implemented") if isinstance(a, dict) else None
-                    rows_a = a.get("actions") if isinstance(a, dict) else None
-                    with self.lock:
-                        self._actions = [x for x in impl if isinstance(x, str)] if isinstance(impl, list) else \
-                            [x.get("name") for x in rows_a or [] if isinstance(x, dict) and x.get("name")]
-                        self._catalog = [x for x in rows_a or [] if isinstance(x, dict)]
-                        self._actions_at = time.monotonic()
+            self._probe_locked(timeout=timeout, actions=actions)
+
+    def _probe_locked(self, *, timeout: float, actions: bool) -> None:
+        """``probe`` with ``_probe_lock`` held; records the outcome for callers that waited for it."""
+        try:
+            r = self.transport.request("GET", "/v1/nodes", timeout=timeout)
+            rows = r.get("nodes") if isinstance(r, dict) else None
+            if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
+                raise internal(f"unexpected /v1/nodes answer from {self.name}")
+            row = _sanitize(rows[0])
+            need_actions = actions or self._actions is None or self._actions_at is None or \
+                time.monotonic() - self._actions_at > ACTIONS_INTERVAL
+            if need_actions:
+                a = self.transport.request("GET", "/v1/actions", timeout=timeout)
+                impl = a.get("implemented") if isinstance(a, dict) else None
+                rows_a = a.get("actions") if isinstance(a, dict) else None
                 with self.lock:
-                    self._row = row
-                    self._row_ok_at = time.monotonic()
-                    self.last_error = None
-            except HiveError as e:
-                with self.lock:
-                    self.last_error = e.message
-                raise
+                    self._actions = [x for x in impl if isinstance(x, str)] if isinstance(impl, list) else \
+                        [x.get("name") for x in rows_a or [] if isinstance(x, dict) and x.get("name")]
+                    self._catalog = [x for x in rows_a or [] if isinstance(x, dict)]
+                    self._actions_at = time.monotonic()
+            with self.lock:
+                self._row = row
+                self._row_ok_at = time.monotonic()
+                self.last_error = None
+                self._probe_error = None
+                self._probes_done += 1
+        except HiveError as e:
+            with self.lock:
+                self.last_error = e.message
+                self._probe_error = e
+                self._probes_done += 1
+            raise
 
     def ensure_fresh(self) -> None:
         """v5 (fail closed): synchronous probe when the row is missing or older than 75 s."""
         with self.lock:
             if self._row is not None and self._fresh() and self._actions is not None:
                 return
+            seen = self._probes_done
+        # §8.3 v5: one probe in flight per link; callers that waited for it share its outcome
         try:
-            self.probe(timeout=PROBE_TIMEOUT)
+            with self._probe_lock:
+                with self.lock:
+                    if self._row is not None and self._fresh() and self._actions is not None:
+                        return
+                    shared = self._probe_error if self._probes_done != seen else None
+                if shared is not None:
+                    raise HiveError(shared.code, shared.message)
+                self._probe_locked(timeout=PROBE_TIMEOUT, actions=False)
         except HiveError as e:
             raise unavailable(f"node {self.name} is not reachable: {e.message}", reason="connect",
                               maybe_executed=False, hint="is the node running? check its URL and the hub token")
@@ -1654,7 +1698,7 @@ def build_server(hub: Hub) -> "ApiServer":
         link, body = _relay_body(req)
         return link.result(body)
 
-    def dist_pyz(req: "Request") -> Tuple[int, Dict[str, str], bytes]:
+    def dist_pyz(req: "Request") -> Tuple[int, Dict[str, str], Any]:
         if not (cfg.dist or {}).get("enabled", True):
             raise not_found("pyz distribution is disabled on this hub")
         wait = hub.dist_allowed(req.client_ip)
@@ -1664,10 +1708,20 @@ def build_server(hub: Hub) -> "ApiServer":
             raise rate_limited("too many concurrent hive.pyz downloads; retry later", retry_after=5, reason="dist")
         try:
             data, sha = hub.pyz()
-        finally:
+        except BaseException:
             hub._dist_sem.release()
+            raise
+
+        # §5.7 "at most 4 concurrent downloads": the slot is held until the body is sent (or the client is gone);
+        # ClosingIterator releases it even when the stream is closed before the first chunk
+        def body() -> Iterator[bytes]:
+            view = memoryview(data)
+            for i in range(0, len(data), DIST_CHUNK):
+                yield bytes(view[i:i + DIST_CHUNK])
         return 200, {"Content-Type": "application/octet-stream", "X-Hive-Sha256": sha,
-                     "Content-Disposition": "attachment; filename=hive.pyz"}, data
+                     "Content-Length": str(len(data)),
+                     "Content-Disposition": "attachment; filename=hive.pyz"}, \
+            ClosingIterator(body(), hub._dist_sem.release)
 
     server.route("GET", "/v1/health", health, auth="none")
     server.route("GET", "/v1/whoami", whoami)

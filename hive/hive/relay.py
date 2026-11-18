@@ -401,6 +401,15 @@ class RelayAgent:
     def _run_task(self, task: dict, timeout_s: float, ev: threading.Event, sid: Optional[str]) -> None:
         tid = task["task_id"]
         try:
+            self._execute(task, tid, timeout_s, ev, sid)
+        finally:
+            # the task stays in ``running`` until its result is posted (WP5b review): a poll sent while a large
+            # result uploads or retries must not make the hub mark it lost (§7.4 lost_grace)
+            with self._lock:
+                self._running.pop(tid, None)
+
+    def _execute(self, task: dict, tid: str, timeout_s: float, ev: threading.Event, sid: Optional[str]) -> None:
+        try:
             ident = self._identity(task)
             action = str(task.get("action") or "")
             params = task.get("params") if isinstance(task.get("params"), dict) else {}
@@ -412,9 +421,6 @@ class RelayAgent:
             log.error("relay task %s failed", tid, exc_info=True)
             env = {"ok": False, "error": HiveError("internal", type(e).__name__).to_dict(),
                    "meta": {"request_id": task.get("request_id"), "node": self.rt.name, "api": 1}}
-        finally:
-            with self._lock:
-                self._running.pop(tid, None)
         self._post_result(sid, tid, env)
 
     def _hint_gateway(self, env: dict, action: str, ident: Any) -> dict:

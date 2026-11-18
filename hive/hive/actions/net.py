@@ -135,6 +135,14 @@ def net_http(ctx: ActionContext, p: dict) -> dict:
 # ---------------------------------------------------------------------------------------------------------------
 # net.download
 
+def _dns_side(target: Any) -> str:
+    """§5.4 NetGuard rule 8 audit value (local|remote) of a vetted target."""
+    try:
+        return netutil._dns_side(target)
+    except Exception:  # noqa: BLE001 - test fakes
+        return "local"
+
+
 def _guard_dict(ctx: ActionContext) -> dict:
     ng = getattr(ctx.policy, "net_guard", None)
     to_dict = getattr(ng, "to_dict", None)
@@ -212,6 +220,9 @@ def net_download(ctx: ActionContext, p: dict) -> dict:
         raise
     if cand.is_dir():
         directory = ctx.policy.resolve_path(raw_path, write=True, must_exist=True)
+        # the server picks the name: vet a file *inside* the folder too, so the rules that look at a file's parents
+        # (v7 venv bin/Scripts, PATH and service code dirs) apply to the folder itself (§5.4 PathGuard step 7)
+        ctx.policy.resolve_path(str(directory / "download.bin"), write=True)
     else:
         dest = cand
         if dest.is_symlink():
@@ -223,6 +234,7 @@ def net_download(ctx: ActionContext, p: dict) -> dict:
                 raise not_found(f"folder '{dest.parent}' does not exist", hint="create it or use make_dirs=true")
             ctx.policy.resolve_path(str(dest.parent), write=True)
         ctx.policy.resolve_path(str(dest) + ".hive-part", write=True)
+        ctx.policy.resolve_path(str(dest) + ".hive-part.json", write=True)     # the resume validator sidecar
     spec: Dict[str, Any] = {
         "v": 1, "mode": "file", "net": _guard_dict(ctx),
         "auth": ({"name": auth.name, "header": auth.header, "value": auth.value, "hosts": list(auth.hosts)}
@@ -237,7 +249,8 @@ def net_download(ctx: ActionContext, p: dict) -> dict:
     shown = (dest or directory)
     info = start_download_job(ctx, kind="download", spec=spec,
                               name="download " + (url.rsplit("/", 1)[-1][:40] or target.host))
-    ctx.audit_extra.update(path=str(shown), host=target.host)
+    ctx.audit_extra.update(path=str(shown), host=target.host, route=getattr(target, "route", None),
+                           dns=_dns_side(target))
     return {"job_id": info["job_id"], "path": str(shown), "state": "running"}
 
 

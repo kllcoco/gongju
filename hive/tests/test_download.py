@@ -67,6 +67,12 @@ def file_spec(url: str, *, path: Optional[str] = None, directory: Optional[str] 
     return spec
 
 
+def seed_meta(dest: Path, url: str, etag: Optional[str] = None) -> None:
+    """The resume validator a previous run of ``url`` into ``dest`` left next to its part."""
+    Path(str(dest) + ".hive-part.json").write_text(json.dumps({"v": 1, "url": url, "etag": etag,
+                                                                "last_modified": None}))
+
+
 class DownloadCase(unittest.TestCase):
     def setUp(self) -> None:
         self.srv = helpers.StubHTTPServer().start()
@@ -183,11 +189,108 @@ class TestFileMode(DownloadCase):
         self.srv.add_file("/f.bin", DATA)
         dest = self.tmp / "f.bin"
         Path(str(dest) + ".hive-part").write_bytes(DATA[:30000])
+        seed_meta(dest, self.srv.url + "/f.bin")
         code, res, _p = self.run_spec(file_spec(self.srv.url + "/f.bin", path=str(dest),
                                                 sha256=hashlib.sha256(DATA).hexdigest()))
         self.assertEqual(code, 0)
         self.assertEqual(self.srv.requests[-1]["headers"].get("Range"), "bytes=30000-")
         self.assertEqual(dest.read_bytes(), DATA)
+        self.assertFalse(Path(str(dest) + ".hive-part.json").exists())       # the validator goes with the part
+
+    def test_206_without_content_range_restarts(self):
+        """Review fix: a 206 to ``Range: bytes=30000-`` without Content-Range is never taken as the whole body."""
+        def h(req: dict) -> Any:
+            if req["headers"].get("Range"):
+                return 206, {}, DATA[30000:]
+            return 200, {}, DATA
+        self.srv.add_handler("GET", "/f.bin", h)
+        dest = self.tmp / "f.bin"
+        Path(str(dest) + ".hive-part").write_bytes(DATA[:30000])
+        seed_meta(dest, self.srv.url + "/f.bin")
+        code, res, _p = self.run_spec(file_spec(self.srv.url + "/f.bin", path=str(dest)))
+        self.assertEqual(code, 0)
+        self.assertEqual(dest.read_bytes(), DATA)
+        self.assertEqual(res["size"], len(DATA))
+        self.assertEqual([q["headers"].get("Range") for q in self.srv.requests], ["bytes=30000-", None])
+        # a 206 whose Content-Range starts elsewhere restarts too
+        self.srv.requests.clear()
+
+        def h2(req: dict) -> Any:
+            if req["headers"].get("Range"):
+                return 206, {"Content-Range": f"bytes 100-{len(DATA) - 1}/{len(DATA)}"}, DATA[100:]
+            return 200, {}, DATA
+        self.srv.add_handler("GET", "/g.bin", h2)
+        dest = self.tmp / "g.bin"
+        Path(str(dest) + ".hive-part").write_bytes(DATA[:30000])
+        seed_meta(dest, self.srv.url + "/g.bin")
+        code, _r, _p = self.run_spec(file_spec(self.srv.url + "/g.bin", path=str(dest)))
+        self.assertEqual((code, dest.read_bytes()), (0, DATA))
+
+    def test_resume_validator(self):
+        """Review fix: a part is resumed only for the same URL, with If-Range; a changed resource restarts."""
+        new = bytes(reversed(DATA))
+        self.srv.add_file("/v.bin", new, {"ETag": '"v2"'})
+        dest = self.tmp / "v.bin"
+        part = Path(str(dest) + ".hive-part")
+        # (a) a part without a validator (unknown origin) or of another URL is not resumed
+        for meta_url in (None, self.srv.url + "/other.bin"):
+            with self.subTest(meta_url=meta_url):
+                self.srv.requests.clear()
+                part.write_bytes(DATA[:30000])
+                if meta_url:
+                    seed_meta(dest, meta_url, etag='"v1"')
+                code, _r, _p = self.run_spec(file_spec(self.srv.url + "/v.bin", path=str(dest), overwrite=True))
+                self.assertEqual((code, dest.read_bytes()), (0, new))
+                self.assertEqual([q["headers"].get("Range") for q in self.srv.requests], [None])
+        # (b) same URL, the server's ETag changed: If-Range is sent, the server answers 200 -> restart from zero
+        def h(req: dict) -> Any:
+            ok = req["headers"].get("If-Range") == '"v2"' and req["headers"].get("Range") == "bytes=30000-"
+            if ok:
+                return 206, {"ETag": '"v2"', "Content-Range": f"bytes 30000-{len(new) - 1}/{len(new)}"}, new[30000:]
+            return 200, {"ETag": '"v2"'}, new
+        self.srv.add_handler("GET", "/w.bin", h)
+        dest = self.tmp / "w.bin"
+        part = Path(str(dest) + ".hive-part")
+        part.write_bytes(DATA[:30000])
+        seed_meta(dest, self.srv.url + "/w.bin", etag='"v1"')
+        self.srv.requests.clear()
+        code, _r, _p = self.run_spec(file_spec(self.srv.url + "/w.bin", path=str(dest)))
+        self.assertEqual((code, dest.read_bytes()), (0, new))
+        self.assertEqual(self.srv.requests[0]["headers"].get("If-Range"), '"v1"')
+        # (c) the validator matches: resumed (206) and the result is whole
+        dest.unlink()
+        part.write_bytes(new[:30000])
+        seed_meta(dest, self.srv.url + "/w.bin", etag='"v2"')
+        self.srv.requests.clear()
+        code, _r, _p = self.run_spec(file_spec(self.srv.url + "/w.bin", path=str(dest),
+                                               sha256=hashlib.sha256(new).hexdigest()))
+        self.assertEqual((code, dest.read_bytes()), (0, new))
+        self.assertEqual(len(self.srv.requests), 1)
+        # (d) a failed download leaves part + validator; the retry resumes with the stored ETag
+        self.srv.requests.clear()
+        dest.unlink()
+        code, _r, _p = self.run_spec(file_spec(self.srv.url + "/w.bin", path=str(dest), sha256="0" * 64))
+        self.assertEqual(code, 3)
+        meta = json.loads(Path(str(dest) + ".hive-part.json").read_text())
+        self.assertEqual((meta["url"], meta["etag"]), (self.srv.url + "/w.bin", '"v2"'))
+
+    def test_stop_between_chunks_is_stopped(self):
+        """Review fix: a stop that surfaces as ``cancelled`` from the stream ends with exit 7, not a failure."""
+        stop = threading.Event()
+
+        def fake_open(url: str, **kw: Any) -> Any:
+            def chunks() -> Any:
+                yield DATA[:100]
+                stop.set()
+                raise HiveError("cancelled", "cancelled by the caller")
+            return 200, {"Content-Length": str(len(DATA))}, url, chunks()
+        dest = self.tmp / "s.bin"
+        with RunDir(), mock.patch.object(netutil, "open_download", fake_open), \
+                mock.patch.object(_download, "_say") as say:
+            code = _download.run(file_spec("http://127.0.0.1:1/s.bin", path=str(dest)), stop)
+        self.assertEqual(code, 7)
+        self.assertEqual(say.call_args_list[-1][0][0], "stopped")
+        self.assertFalse(dest.exists())
 
     def test_200_instead_of_206_restarts(self):
         self.srv.add("GET", "/plain.bin", 200, DATA, {"Content-Type": "application/octet-stream"})
@@ -241,6 +344,49 @@ class TestFileMode(DownloadCase):
                 self.assertEqual(os.listdir(str(d)), [want])
         self.assertEqual(_download.choose_name({}, "http://h/a/b/weights.bin?x=1"), "weights.bin")
         self.assertEqual(_download.choose_name({}, "http://h/"), "download.bin")
+
+    def test_uncreatable_server_name(self):
+        """Review fix: a name longer than NAME_MAX bytes (102 CJK chars = 306 bytes) becomes download.bin, and a
+        name the filesystem still refuses at publish time leaves no hidden part behind."""
+        long_name = "模型" * 51 + ".bin"
+        self.assertLessEqual(len(long_name), 255)
+        self.assertEqual(_download.choose_name({"Content-Disposition": "attachment; filename*=UTF-8''"
+                                                + "%E6%A8%A1%E5%9E%8B" * 51 + ".bin"}, "http://h/x"), "download.bin")
+        with mock.patch.object(_download, "IS_WINDOWS", True):
+            self.assertEqual(_download.choose_name({"Content-Disposition": 'attachment; filename="a?b.bin"'},
+                                                   "http://h/x"), "download.bin")
+        self.srv.add("GET", "/long", 200, DATA[:100],
+                     {"Content-Disposition": "attachment; filename*=UTF-8''" + "%E6%A8%A1%E5%9E%8B" * 51 + ".bin"})
+        d = self.tmp / "long"
+        d.mkdir()
+        code, res, _p = self.run_spec(file_spec(self.srv.url + "/long", directory=str(d)))
+        self.assertEqual((code, os.path.basename(res["path"])), (0, "download.bin"))
+        self.assertEqual(os.listdir(str(d)), ["download.bin"])
+        # the filesystem refuses a name choose_name accepted: falls back to download.bin, nothing hidden is left
+        self.srv.add("GET", "/odd", 200, DATA[:100], {"Content-Disposition": 'attachment; filename="odd.bin"'})
+        d = self.tmp / "odd"
+        d.mkdir()
+        real_open = os.open
+
+        def picky_open(path: Any, flags: int, *a: Any) -> int:
+            if os.path.basename(str(path)) == "odd.bin":
+                raise OSError(36, "File name too long")
+            return real_open(path, flags, *a)
+        with mock.patch.object(_download.os, "open", picky_open):
+            code, res, _p = self.run_spec(file_spec(self.srv.url + "/odd", directory=str(d)))
+        self.assertEqual((code, os.listdir(str(d))), (0, ["download.bin"]))
+        # and when even download.bin cannot be created, the job fails without leaving the hidden part
+        d = self.tmp / "odd2"
+        d.mkdir()
+
+        def no_open(path: Any, flags: int, *a: Any) -> int:
+            if flags & os.O_EXCL:
+                raise OSError(22, "Invalid argument")
+            return real_open(path, flags, *a)
+        with mock.patch.object(_download.os, "open", no_open):
+            code, res, _p = self.run_spec(file_spec(self.srv.url + "/odd", directory=str(d)))
+        self.assertEqual((code, res), (1, None))
+        self.assertEqual(os.listdir(str(d)), [])
 
     def test_never_overwrites_server_name(self):
         self.srv.add("GET", "/dl/file.tar.gz", 200, DATA[:10])

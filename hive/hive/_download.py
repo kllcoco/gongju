@@ -41,8 +41,12 @@ GIB = 1 << 30
 IS_WINDOWS = sys.platform == "win32"
 CASEFOLD_DEFAULT = IS_WINDOWS or sys.platform == "darwin"
 PART_SUFFIX = ".hive-part"
+META_SUFFIX = ".json"     # <path>.hive-part.json: the resume validator (file mode)
 SYMLINK = "target is a symbolic link"
 MANIFEST = ".hive-pull.json"
+LOCK_NAME = ".hive-pull.lock"
+NAME_MAX = 255
+WIN_BAD_CHARS = '<>"|?*'
 
 
 class Failure(Exception):
@@ -235,18 +239,59 @@ class Progress:
 # ---------------------------------------------------------------------------------------------------------------
 # one transfer into a part file
 
+def _meta_path(part: Path) -> Path:
+    """Sidecar of a resumable file-mode part: ``{"v":1,"url","etag","last_modified"}`` (the resume validator)."""
+    return Path(str(part) + META_SUFFIX)
+
+
+def _read_meta(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        m = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def _write_meta(path: Path, url: str, rh: Dict[str, str]) -> None:
+    etag = (_header(rh, "ETag") or "").strip()
+    meta = {"v": 1, "url": url, "etag": etag if etag and not etag.startswith("W/") else None,
+            "last_modified": (_header(rh, "Last-Modified") or "").strip() or None}
+    util.write_json_atomic(path, meta, private=True)
+
+
+def _drop_meta(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        if os.path.lexists(str(path)):
+            os.unlink(str(path))
+    except OSError:
+        pass
+
+
 def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec], headers: Dict[str, str],
            resume: bool, max_size: Optional[int], hasher_factory: Callable[[], Any], progress: Progress,
-           stop: threading.Event, on_headers: Optional[Callable[[int, int, Dict[str, str]], None]] = None
-           ) -> Tuple[Any, int, Dict[str, str], str]:
+           stop: threading.Event, on_headers: Optional[Callable[[int, int, Dict[str, str]], None]] = None,
+           meta: Optional[Path] = None) -> Tuple[Any, int, Dict[str, str], str]:
     """Download ``url`` into ``part`` (Range resume from the part size when ``resume``); returns
     (hasher over the whole part, size, response headers, final URL). ``max_size``: abort at max_size + 1 bytes.
-    ``on_headers(start, remaining_or_-1, headers)`` runs before the first byte is written (disk checks)."""
+    ``on_headers(start, remaining_or_-1, headers)`` runs before the first byte is written (disk checks).
+    ``meta`` (file mode): the resume validator sidecar; a part is resumed only when the sidecar names the same URL,
+    with ``If-Range`` (strong ETag or Last-Modified) so a changed resource answers 200 and restarts from zero."""
     start = 0
     if resume and part.exists() and not part.is_symlink():
         start = part.stat().st_size
         if max_size is not None and start > max_size:
             start = 0
+    headers = {k: v for k, v in headers.items() if k.lower() != "if-range"}
+    if meta is not None and start > 0:
+        m = _read_meta(meta)
+        if m is None or m.get("url") != url:
+            start = 0                                   # a part of another download (or of unknown origin)
+        elif m.get("etag") or m.get("last_modified"):
+            headers["If-Range"] = str(m.get("etag") or m.get("last_modified"))
     status, rh, final, chunks = netutil.open_download(url, guard=guard, headers=headers, auth=auth,
                                                       range_start=start, cancel=stop)
     try:
@@ -265,16 +310,26 @@ def _fetch(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec]
             progress.add(start, downloaded=False)
             fd = _open_part(part, truncate=False)
             size = start
-        elif status in (200, 206) and (status == 200 or _range_start(rh) in (0, None)):
+        elif status == 200 or (status == 206 and _range_start(rh) in ((0, None) if start == 0 else (0,))):
             h = hasher_factory()
             fd = _open_part(part, truncate=True)
             size = 0
+        elif status == 206 and start > 0:
+            # a ranged reply that does not start where the part ends (or has no/an unparsable Content-Range) is
+            # never taken as a fresh body: drop the part and fetch it again without Range (§11.3)
+            raise _Restart()
         else:
             raise _HttpStatus(status, rh)
         if on_headers is not None:
             cl = _content_length(rh)
             try:
                 on_headers(size, cl if cl is not None else -1, rh)
+            except BaseException:
+                os.close(fd)
+                raise
+        if meta is not None and size == 0:
+            try:
+                _write_meta(meta, url, rh)
             except BaseException:
                 os.close(fd)
                 raise
@@ -353,9 +408,17 @@ def choose_name(headers: Dict[str, str], url: str) -> str:
         return "download.bin"
     base = (raw or "").strip()
     name = util.safe_remote_name(base) if base else None
-    if not name or name.startswith(".") or "/" in name:
+    if not name or name.startswith(".") or "/" in name or not _creatable(name):
         return "download.bin"
     return name
+
+
+def _creatable(name: str) -> bool:
+    """A name the local filesystem can create, with room for a ``-999`` clash suffix: at most NAME_MAX (255) bytes
+    in UTF-8 (UTF-16 units on Windows) and, on Windows, none of ``<>"|?*``."""
+    if IS_WINDOWS:
+        return not any(c in WIN_BAD_CHARS for c in name) and len(name.encode("utf-16-le")) // 2 <= NAME_MAX - 4
+    return len(name.encode("utf-8", "surrogateescape")) <= NAME_MAX - 4
 
 
 def _name_allowed(directory: str, target: str, deny: List[str], casefold: bool) -> Optional[str]:
@@ -394,6 +457,10 @@ def _publish_exclusive(part: Path, directory: str, name: str, deny: List[str], c
             fd = os.open(target, flags, 0o644)
         except FileExistsError:
             continue
+        except OSError as e:             # a name this filesystem cannot hold (length, characters)
+            if name != "download.bin":
+                return _publish_exclusive(part, directory, "download.bin", deny, casefold)
+            raise Failure(f"cannot create {cand}: {e}")
         os.close(fd)
         util.replace_with_retry(part, target)
         return target
@@ -423,6 +490,7 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
         part = Path(str(dest) + PART_SUFFIX)
         if part.is_symlink():
             raise Failure(f"{part} is a symbolic link")
+        meta: Optional[Path] = _meta_path(part)
     else:
         directory = os.path.normcase(os.path.realpath(str(directory)))
         if not os.path.isdir(directory):
@@ -430,6 +498,7 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
         dest = None
         part = Path(directory) / (".hive-download-" + os.path.basename(os.getcwd())[-16:] + PART_SUFFIX)
         resume = resume and part.exists()
+        meta = None                      # the hidden part belongs to this run only (never resumed by another)
     name_check: Optional[Callable[[Dict[str, str]], None]] = None
     if directory is not None:
         def name_check(rh: Dict[str, str]) -> None:
@@ -446,7 +515,7 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
             try:
                 h, size, rh, final = _fetch_checked(url, part, guard=guard, auth=auth, headers=headers,
                                                      resume=resume, progress=progress, stop=stop,
-                                                     name_check=name_check)
+                                                     name_check=name_check, meta=meta)
                 break
             except Stopped:
                 raise
@@ -460,6 +529,8 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
             except Failure:
                 raise
             except Exception as e:  # noqa: BLE001
+                if stop.is_set() or (isinstance(e, HiveError) and e.code == "cancelled"):
+                    raise Stopped()          # the stop landed inside open_download / between two chunks
                 if attempt < 3 and _transient(e):
                     attempt += 1
                     resume = True
@@ -474,9 +545,18 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
             if dest.exists() and not overwrite:
                 raise Failure(f"{dest} already exists (use overwrite=true)")
             util.replace_with_retry(part, dest)
+            _drop_meta(meta)
             final_path = str(dest)
         else:
-            final_path = _publish_exclusive(part, str(directory), choose_name(rh, url), deny, casefold)
+            try:
+                final_path = _publish_exclusive(part, str(directory), choose_name(rh, url), deny, casefold)
+            except BaseException:
+                try:                     # never leave the hidden part behind in the user's folder
+                    if os.path.lexists(str(part)):
+                        part.unlink()
+                except OSError:
+                    pass
+                raise
         util.write_json_atomic("result.json", {"v": 1, "path": final_path, "size": size, "sha256": digest})
         _say(f"saved {final_path} ({util.human_bytes(size)}, sha256 {digest})")
         return EXIT_OK
@@ -486,7 +566,7 @@ def run_file(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
 
 def _fetch_checked(url: str, part: Path, *, guard: Any, auth: Optional[netutil.AuthSpec], headers: Dict[str, str],
                    resume: bool, progress: Progress, stop: threading.Event,
-                   name_check: Optional[Callable[[Dict[str, str]], None]] = None
+                   name_check: Optional[Callable[[Dict[str, str]], None]] = None, meta: Optional[Path] = None
                    ) -> Tuple[Any, int, Dict[str, str], str]:
     """One attempt; the server-chosen name and the free-space check (against Content-Length) are checked before
     the first byte is written."""
@@ -506,13 +586,17 @@ def _fetch_checked(url: str, part: Path, *, guard: Any, auth: Optional[netutil.A
             raise Failure(f"not enough disk space: need {remaining} bytes, {free} free in {part.parent}", EXIT_DISK)
 
     try:
-        return _fetch(url, part, guard=guard, auth=auth, headers=headers, resume=resume, max_size=None,
-                      hasher_factory=hashlib.sha256, progress=progress, stop=stop, on_headers=check)
-    except _Restart:
-        if part.exists():
-            part.unlink()
-        return _fetch(url, part, guard=guard, auth=auth, headers=headers, resume=False, max_size=None,
-                      hasher_factory=hashlib.sha256, progress=progress, stop=stop, on_headers=check)
+        try:
+            return _fetch(url, part, guard=guard, auth=auth, headers=headers, resume=resume, max_size=None,
+                          hasher_factory=hashlib.sha256, progress=progress, stop=stop, on_headers=check, meta=meta)
+        except _Restart:
+            if part.exists():
+                part.unlink()
+            with progress.lock:
+                progress.done = 0
+                progress.downloaded = 0
+            return _fetch(url, part, guard=guard, auth=auth, headers=headers, resume=False, max_size=None,
+                          hasher_factory=hashlib.sha256, progress=progress, stop=stop, on_headers=check, meta=meta)
     except BaseException:
         if name_check is not None and part.exists():     # dir mode: the hidden part is never resumed
             try:
@@ -618,17 +702,48 @@ class Puller:
         self._save_manifest()
 
     # per file
+    def _inside(self, path: str) -> bool:
+        """``realpath(path)`` (non-existent tails resolve lexically) stays inside the target."""
+        tgt = os.path.normcase(str(self.target))
+        try:
+            return os.path.commonpath([os.path.normcase(os.path.realpath(path)), tgt]) == tgt
+        except ValueError:
+            return False
+
     def _dest(self, rel: str) -> Optional[Path]:
-        dest = self.target.joinpath(*rel.split("/"))
-        parent = dest.parent
-        parent.mkdir(parents=True, exist_ok=True)
-        real_parent = os.path.realpath(str(parent))
-        tgt = str(self.target)
-        if os.path.commonpath([os.path.normcase(real_parent), os.path.normcase(tgt)]) != os.path.normcase(tgt):
+        """Final path of ``rel``, or None when it would leave the target (§11.3: the parent's realpath must stay
+        inside the target before anything is written). Missing folders are created one at a time, each only after
+        its parent's realpath was checked, so a planted symlink never gets folders created behind it."""
+        parts = rel.split("/")
+        if not parts or any(x in ("", ".", "..") for x in parts) or self._reserved(rel):
+            return None
+        dest = self.target.joinpath(*parts)
+        if not self._inside(str(dest.parent)):
+            return None
+        cur = self.target
+        for name in parts[:-1]:
+            if not self._inside(str(cur)):
+                return None
+            cur = cur / name
+            if not os.path.lexists(str(cur)):
+                try:
+                    os.mkdir(str(cur))
+                except FileExistsError:
+                    pass
+            elif not os.path.isdir(str(cur)):
+                raise Failure(f"{rel}: '{cur}' exists and is not a folder")
+        real_parent = os.path.realpath(str(dest.parent))
+        if not self._inside(real_parent) or not os.path.isdir(real_parent):
             return None
         if dest.is_symlink() or Path(str(dest) + PART_SUFFIX).is_symlink():
             return None
         return Path(real_parent) / dest.name
+
+    def _reserved(self, rel: str) -> bool:
+        """Names that would collide with Hive's own files in the target (manifest, lock, ``*.hive-part``)."""
+        low = rel.casefold()
+        own = {MANIFEST.casefold(), os.path.basename(str(self.spec.get("lock_file") or LOCK_NAME)).casefold()}
+        return low in own or low.endswith(PART_SUFFIX)
 
     def _existing_ok(self, f: Dict[str, Any], dest: Path) -> Optional[bool]:
         """True: complete and verified; False: must be (re)downloaded; None: conflict (not ours, differs)."""
@@ -702,6 +817,8 @@ class Puller:
                     continue
                 except Exception as e:  # noqa: BLE001
                     self._rewind(before)
+                    if self.stop.is_set():
+                        raise Stopped()
                     if _transient(e) and net_retries < len(BACKOFF):
                         _say(f"{f['path']}: {_err_text(e)}; retrying in {BACKOFF[net_retries]} s")
                         _sleep(BACKOFF[net_retries], self.stop)
@@ -830,7 +947,17 @@ def run_pull(spec: Dict[str, Any], guard: Any, auth: Optional[netutil.AuthSpec],
             raise Failure(f"invalid pull spec: missing {k}", EXIT_SPEC)
     target = Path(str(spec["target"]))
     target.mkdir(parents=True, exist_ok=True)
-    lock = util.FileLock(str(spec["lock_file"]))
+    lock_file = str(spec["lock_file"])
+    for own in (lock_file, str(target / MANIFEST)):
+        if os.path.islink(own):
+            raise Failure(f"{own} is a symbolic link (remove it and pull again)")
+    try:        # create the lock file without following a link planted since the check (FileLock follows links)
+        os.close(os.open(lock_file, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600))
+    except OSError as e:
+        raise Failure(f"cannot create the lock file {lock_file}: {e}")
+    if os.path.islink(lock_file):
+        raise Failure(f"{lock_file} is a symbolic link (remove it and pull again)")
+    lock = util.FileLock(lock_file)
     if not lock.acquire(note=os.path.basename(os.getcwd())):
         raise Failure("another pull into this folder is running", EXIT_LOCK)
     try:

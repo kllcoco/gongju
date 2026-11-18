@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from pathlib import Path
@@ -722,7 +723,7 @@ def _plan_files(ctx: ActionContext, p: dict, files: List[hfhub.RepoFile]
     invalid: List[str] = []
     kept: List[hfhub.RepoFile] = []
     for f in files:
-        if util.safe_remote_name(f.path) != f.path:
+        if util.safe_remote_name(f.path) != f.path or _reserved_name(f.path):
             invalid.append(f.path[:300])
             continue
         if include and not _glob(f.path, include):
@@ -741,6 +742,38 @@ def _plan_files(ctx: ActionContext, p: dict, files: List[hfhub.RepoFile]
             out.append(f)
         kept = out
     return kept, invalid[:1000], pickle[:1000]
+
+
+def _reserved_name(path: str) -> bool:
+    """Repo names Hive cannot write as given: its own manifest / lock, ``*.hive-part`` (a file's part name), and
+    segments the local filesystem cannot create (> 255 bytes; ``<>"|?*`` on Windows)."""
+    low = path.casefold()
+    if low in (MANIFEST.casefold(), LOCK_NAME.casefold()) or low.endswith(PART_SUFFIX):
+        return True
+    for seg in path.split("/"):
+        if os.name == "nt":
+            if any(c in '<>"|?*' for c in seg) or len(seg.encode("utf-16-le")) // 2 > 255 - len(PART_SUFFIX):
+                return True
+        elif len(seg.encode("utf-8", "surrogateescape")) > 255 - len(PART_SUFFIX):
+            return True
+    return False
+
+
+def _dest_key(ctx: ActionContext, dest: Path) -> str:
+    """Collision key of a destination (casefolded where the filesystem is, via PathGuard's rule)."""
+    try:
+        return ctx.policy.path_key(str(dest), follow=False)
+    except Exception:  # noqa: BLE001 - test fakes
+        return util.path_key(str(dest), casefold=os.name == "nt" or sys.platform == "darwin")
+
+
+def _audit_endpoint(ctx: ActionContext, endpoint: str) -> None:
+    """§5.4 NetGuard rule 8: ``route`` and ``dns`` (local|remote) of the listing endpoint in audit ``extra``."""
+    try:
+        t = ctx.policy.check_url(endpoint, purpose="download", method="GET")
+        ctx.audit_extra.update(route=getattr(t, "route", None), dns=netutil._dns_side(t))
+    except Exception:  # noqa: BLE001 - the listing already went through; the audit fields are best effort
+        pass
 
 
 def _expected(f: hfhub.RepoFile) -> Optional[str]:
@@ -806,6 +839,10 @@ def model_pull(ctx: ActionContext, p: dict) -> dict:
     if target.exists() and not target.is_dir():
         raise conflict(f"'{target}' exists and is not a folder", hint="pick another path")
     _refuse_target(ctx, target)
+    for own in (LOCK_NAME, MANIFEST):        # FileLock / the manifest reader follow links: never through one
+        if os.path.islink(str(target / own)):
+            raise conflict(f"'{target / own}' is a symbolic link", hint="remove it (or pick another folder) and "
+                                                                       "call again")
     tkey = _pkey(ctx, target)
     _check_busy(ctx, target, tkey)
     # 2. listing (bounded by the call deadline; cached 10 min)
@@ -826,6 +863,7 @@ def model_pull(ctx: ActionContext, p: dict) -> dict:
             raise HiveError(e.code, e.message, details, hint=note)
         raise
     ctx.audit_extra.update(repo=repo, source=source, commit=commit, endpoint_host=ep_host)
+    _audit_endpoint(ctx, endpoint)
     # 4. names and filters
     planned, invalid, pickle = _plan_files(ctx, p, listed)
     if len(planned) > int(p.get("max_files", 1000)):
@@ -858,9 +896,15 @@ def model_pull(ctx: ActionContext, p: dict) -> dict:
     total = 0
     to_download = 0
     plan: List[hfhub.RepoFile] = []
+    seen: set = set()
     for f in planned:
         total += f.size
         dest = Path(real_target).joinpath(*f.path.split("/"))
+        dkey = _dest_key(ctx, dest)
+        if dkey in seen:          # README.md and readme.md on a case-insensitive filesystem: one file, two writers
+            unsafe.append(f.path)
+            continue
+        seen.add(dkey)
         try:
             parent_real = os.path.realpath(str(dest.parent))
             inside = os.path.commonpath([os.path.normcase(parent_real), os.path.normcase(real_target)]) \

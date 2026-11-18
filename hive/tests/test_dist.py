@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from hive.errors import HiveError
 from hive import __version__, dist
 from tests import helpers
 
@@ -122,12 +123,15 @@ class TestJoinAndAddNode(unittest.TestCase):
 
     def test_tailnet_hub_variant_t_and_public(self):
         out = dist.add_node_instructions(self.hub_cfg(), "desk-wsl", "hv_" + "t" * 40, tailnet_ip="100.101.1.7")
-        self.assertEqual(out["variants"], ["T"])
+        # --via omitted on a "tailscale" hub = --via tailnet: T, then block C (review fix)
+        self.assertEqual(out["variants"], ["T", "C"])
         self.assertEqual(dist.decode_join(out["codes"]["T"])["u"], "http://100.101.1.7:7700")
+        self.assertEqual(dist.decode_join(out["codes"]["C"])["u"], "http://100.101.1.7:7700")
         self.assertTrue(any("hive join" in ln for ln in out["lines"]))
+        self.assertTrue(any("localhost:1055" in ln for ln in out["lines"]))
         out = dist.add_node_instructions(self.hub_cfg(public="https://home-hub.tail1.ts.net"), "pod-a",
                                          "hv_" + "t" * 40, tailnet_ip="100.101.1.7")
-        self.assertEqual(out["variants"], ["T", "A"])
+        self.assertEqual(out["variants"], ["T", "A", "C"])
         self.assertEqual(dist.decode_join(out["codes"]["A"])["u"], "https://home-hub.tail1.ts.net")
         self.assertTrue(any("Cloud pod (not on your tailnet)" in ln for ln in out["lines"]))
         out = dist.add_node_instructions(self.hub_cfg(public="https://home-hub.tail1.ts.net"), "pod-a",
@@ -145,6 +149,34 @@ class TestJoinAndAddNode(unittest.TestCase):
         jd = dist.decode_join(out["codes"]["B"])
         self.assertEqual((jd["u"], jd["p"]), ("https://203.0.113.5:7700", "sha256:" + "ab" * 32))
         self.assertTrue(any("curl -fsSL -k" in ln for ln in out["lines"]))
+
+
+    def test_never_loopback_or_wildcard(self):
+        """Review fix: a join code never points the remote machine at itself (loopback / wildcard)."""
+        from unittest import mock
+        tok = "hv_" + "t" * 40
+        # tailscale hub whose tailnet IP cannot be read
+        with mock.patch("hive.httpserver.tailscale_info", side_effect=OSError("tailscale not found")):
+            with self.assertRaises(HiveError) as cm:
+                dist.add_node_instructions(self.hub_cfg(), "desk-wsl", tok)
+        self.assertEqual(cm.exception.code, "bad_request")
+        self.assertIn("--via public", cm.exception.hint)
+        # plain hub on a wildcard or loopback address -> refused, unless the CLI passes the reachable host
+        for h in ("0.0.0.0", "::", "127.0.0.1"):
+            with self.subTest(host=h), self.assertRaises(HiveError):
+                dist.add_node_instructions(self.hub_cfg(host=h), "box", tok)
+        out = dist.add_node_instructions(self.hub_cfg(host="0.0.0.0"), "box", tok, host="192.168.1.5")
+        self.assertEqual(dist.decode_join(out["codes"]["T"])["u"], "http://192.168.1.5:7700")
+        # variant B on a wildcard listen host -> refused; with a host (IPv6 bracketed) or public_url it works
+        with self.assertRaises(HiveError) as cm:
+            dist.add_node_instructions(self.hub_cfg(host="0.0.0.0", cert="/nonexistent.pem"), "pod-a", tok,
+                                       tls_pin="sha256:" + "ab" * 32)
+        self.assertIn("public_url", cm.exception.hint)
+        out = dist.add_node_instructions(self.hub_cfg(host="::", cert="/nonexistent.pem"), "pod-a", tok,
+                                         tls_pin="sha256:" + "ab" * 32, host="2001:db8::5")
+        self.assertEqual(dist.decode_join(out["codes"]["B"])["u"], "https://[2001:db8::5]:7700")
+        for code in out["codes"].values():
+            self.assertNotIn("0.0.0.0", dist.decode_join(code)["u"])
 
 
 if __name__ == "__main__":
