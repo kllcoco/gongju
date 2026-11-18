@@ -1861,6 +1861,65 @@ A2-3. **Node binding keyed the resolved path (LOW):** node `files` entries now c
     on the node and the hub. Test: `TestNodeOperandBinding.test_symlink_retargeted_after_approval`,
     `TestHubOperandBinding.test_hub_binds_second_path_to_same_file`.
 
+#### Audit round 2 — verification findings
+
+Verification of the round-2 fixes on a real node (cautious agent token + files token). Changes in `presets.py`
+(`_posix_scan`, `_shell_spellings`, `_W`/`_Roles`, wrapper tables, `_scan_command`/`_scan_commands`, new
+`_scan_text_runner`/`_scan_launcher`/`_uv_run`, `bind_plan_ex` via `_plan`, `moved_items`, `bind_files`), `hub.py`
+(`_review`, `_stat_type`, `_bind_files` only), `policy.py` (`DEFAULT_EXEC_PATHS`, `Policy.live_deny_write`,
+`EffectivePolicy._hop_keys`/`_bare_repo_shape`/`_deny_reason`); tests `tests/test_audit2_verify.py` (28: plan cases,
+real-node repros absent at review → created after approval → `conflict`, payload never ran, hub cases, exec-path
+cases), `tests/test_audit2_binding.py` and `tests/test_sec_audit.py` (expectations for `.pyc` module files and the
+per-command cwd rule); DESIGN §5.5 exec-path list, §5.6 "Verification of audit round 2"; SECURITY "Exec paths" and
+"Approvals" rows.
+
+V-1. **Words dropped after a cwd change; eval/iex (blocker):** `eval` and PowerShell `iex`/`Invoke-Expression` now
+    join their words and plan them again; in POSIX text the cwd is followed per simple command (`_Roles.cwd_segs`:
+    cd/pushd/popd/chdir, eval, source/`.`, a program named by a variable or substitution), so words of commands before
+    the first change stay bound (a loop/function/alias/trap starting before it keeps the old all-moved rule);
+    `moved_items(..., quiet, exists)` lists a moved missing plain name as "(no file here, not bound)" on the node and
+    the hub. `eval bash run3` → `./run3` absent → `conflict`; `cd .; flock /tmp/x bash run3` → "./run3 (cwd may
+    change)"; `bash -c "$(cat run3)"` → `run3` bound (see V-2). PowerShell keeps the whole-text rule (its `$(…)` and
+    script blocks run anywhere), so `iex "bash run3"` lists "./run3 (cwd may change)".
+V-2. **Script text on stdin or in arguments (blocker):** here-strings (`_posix_scan` kind `herestr`) and
+    `echo`/`printf` text piped into a shell with no script operand are planned again, `cat/head/tail x | sh` binds
+    `x`; `$(…)`/`` `…` `` stay inside their word (unbindable), their text is planned again and `cat x` inside binds
+    `x`; text runners `trap`, `alias`, `watch`, `su`/`runuser`/`sg -c`, `script -c` (clusters `-qc`), `flock -c`;
+    `ssh host cmd` → "(remote command; not read or bound)"; any other argument with whitespace that starts with a known
+    interpreter/wrapper/runner/eval/source/cd is planned again late and quietly (operands bound absent, no header
+    noise: `git commit -m "bash is fun"`).
+V-3. **`uv run --script`/`-s`/`--gui-script` (major):** the target is a Python script (op + entry files); `-m` uses
+    the target as module; an unknown target is bound quietly with its entry files.
+V-4. **Bytecode (major):** `**/__pycache__/**`, `**/*.pyc` added to `DEFAULT_EXEC_PATHS` (gated Hive writes only);
+    `_module_files`/`_entry_files` bind `name.pyc`, `name/__init__.pyc`, `name/__main__.pyc` (`pkg/sub.pyc`) quietly.
+V-5. **node folder operand (major):** `name/index.node` added to the node extras; a python/node operand that is a
+    folder at review is named "<word>/ (folder; only its entry files are bound)" (`OP_MARK` in the quiet set).
+V-6. **Exec paths through symbolic links (major):** gated writes are matched against the resolved key, the path as
+    named (lexically normalized) and each link hop (`_hop_keys`); `Policy.live_deny_write` re-resolves pattern
+    prefixes every 2 s, so links made by a dotfile manager after start are protected at both ends (repro: policy built
+    first, then `~/.bashrc -> dotfiles/bashrc`, `~/.config/systemd -> ../dotfiles/config/systemd`; all four writes now
+    `exec_path`). SECURITY documents dotfile managers and the residual (an unlinked second copy).
+V-7. **gitfile (major):** `**/.git` added; a `config` beside a `HEAD` (or the reverse) is refused for gated writes
+    (bare-repository shape). Residual documented: `net.download` checks patterns only; recommend
+    `safe.bareRepository=explicit`.
+V-8. **Windows PATHEXT / PowerShell (major, code reading):** cmd/`call`/`start`/`Start-Process` bind every default
+    PATHEXT extension (plus the node's own on Windows); PowerShell `.\run3`/`& .\run3` bind `run3.ps1` and the
+    PATHEXT names quietly. Absent entries got their own cap (`BIND_MAX_ABSENT` 48) so these never crowd out content
+    binding.
+V-9. **Unknown wrappers, quiet collisions (minor):** quiet is tracked per occurrence (`_W.quiet`/`vquiet`, louder
+    spellings removed from the quiet set); `_NUMERIC_RE` needs a known unit (`1run`, `9x` are listed); csh/tcsh in
+    the sh family; wrappers flock, strace, ltrace, nsenter, systemd-run, setpriv, firejail, unbuffer, valgrind,
+    torsocks, proxychains, numactl, prlimit, xvfb-run, dbus-run-session, catchsegv, nocache; launchers torchrun,
+    deepspeed, `accelerate launch`; `env -S` text joined with the remaining words.
+V-10. **Over-broad unbinding (minor):** the dynamic/cwd decision for POSIX text uses the scanned command words
+    (comments, quoted and plain arguments no longer unbind: `bash run3 # source`, `python3 train.py eval`);
+    `source run3`/`. run3` bind their operand (the command after them moves); output redirect targets are neither
+    bound nor listed, and a `flock` lock file is never listed.
+    Test expectation updates: `test_sec_audit` (`cd sub && bash setup.sh` keeps `cd sub` bound; words before the first
+    `cd` stay bound), `test_audit2_binding.test_python_module_files` (dotted module `.pyc` names).
+    Note: the first commit of this work also swept in another session's uncommitted files present in the shared tree
+    (`_regexworker.py`, `actions/files.py`, `fsops.py`, `httpserver.py`, `services.py`, `test_imports.py`).
+
 ### Audit round 3 (multi-machine)
 
 Hub + direct node + relay pod + gateway audit. Changes in `hub.py` (links, relay routes, resolution only),

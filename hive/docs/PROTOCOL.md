@@ -8,8 +8,16 @@ DESIGN.md §6–§7 and §8.7 (v8), kept in sync with it; DESIGN.md is authorita
 - HTTP/1.1 + JSON, keep-alive (≤ 100 requests per connection), `Server: hive`.
 - Auth: `Authorization: Bearer <token>` only (never in a query string). Tokens start with `hv_`. Missing or wrong →
   401 + `WWW-Authenticate: Bearer`; 10 failures / 60 s from one IP → 429 + `Retry-After` (reason `auth_throttle`).
-- Headers must arrive within 10 s; authentication happens from the headers before any body byte is read, so an
+- Headers must arrive within 10 s (5 s in total, TLS handshake and idle wait included, on a connection that has not
+  authenticated yet); authentication happens from the headers before any body byte is read, so an
   unauthenticated request with a body is answered 401 without reading it.
+- Connections: `max_connections` is split into a pre-auth pool and an authenticated pool with 4 slots reserved for
+  local owner tokens; unauthenticated connections are bucketed (per IP, all of loopback, everything on
+  `proxy_port`, ≤ 16 each) and a newcomer evicts the oldest idle one of its bucket. Busy → 503 `unavailable` reason
+  `busy` with `Retry-After`.
+- Before a body is read: ≤ 32 requests with a body in flight per non-owner identity → 429 reason `inflight`; a global
+  byte budget for buffered bodies (`listen.max_buffered_bytes`, node 128 MiB, hub 256 MiB) → 503 reason `busy`,
+  `Retry-After: 2`. Both close the connection.
 - POST needs `Content-Length` (chunked → 411) and `Content-Type: application/json` (→ 415). Body limit 48 MiB
   (`listen.max_body_bytes`), gateway routes `gateway.max_body_bytes` (8 MiB) → 413. JSON nested deeper than 64 →
   400.
@@ -147,7 +155,9 @@ The hub holds the request up to `poll_wait` until a task, a cancel or a refresh 
 ### 5.3 Result — `POST /v1/relay/result`
 `{"session_id","task_id","envelope":{…}}` → `{"accepted":true|false}` (false for unknown, superseded, finished or
 expired tasks). Body ≤ `max_result_bytes` + 64 KiB; larger envelopes are replaced by the node with `too_large`. The
-node retries at 1, 3, 9 s on network errors.
+node retries at 1, 3, 9 s on network errors. Headers `X-Hive-Task` / `X-Hive-Session` (sent by current nodes) name the
+task: the hub answers `{"accepted":false}` without reading the body when it does not expect that result, and with
+the headers present the body's `task_id` / `session_id` must equal them (400 otherwise).
 
 ### 5.4 Hub-side outcomes (§7.4)
 
