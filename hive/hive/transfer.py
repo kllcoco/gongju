@@ -468,5 +468,13 @@ class TransferManager:
         rec.cancel.set()
         return True
 
+    def cancel_all(self) -> int:
+        """Cancel every running transfer (the owner went away); the number cancelled."""
+        with self._lock:
+            running = [r for r in self._recs.values() if r.state == "running" and not r.cancel.is_set()]
+        for r in running:
+            r.cancel.set()
+        return len(running)
+
 
 __all__ = ["FsEndpoint", "LocalFS", "NodeFS", "copy", "TransferManager", "PART_SUFFIX"]

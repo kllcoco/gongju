@@ -1231,6 +1231,30 @@ def _relay_block(cfg: Any, name: str, token: str, args: argparse.Namespace) -> L
     return list(info["lines"])
 
 
+def _check_direct_url(url: str, pinned: bool, out: Out) -> None:
+    """§14.3 / C1: a direct link over http:// only to loopback and tailnet/private addresses; https elsewhere
+    (with a pin or CA: warned when missing). Raises CliError before anything is written."""
+    from urllib.parse import urlsplit
+    from .transport import plaintext_ok, resolve_host
+    try:
+        u = urlsplit(url)
+        host = u.hostname or ""
+        port = u.port or (443 if u.scheme.lower() == "https" else 80)
+    except ValueError as e:
+        raise CliError(f"invalid --direct URL: {e}")
+    if not host:
+        raise CliError("--direct URL has no host", hint="e.g. http://desk.tail1234.ts.net:7701")
+    ips = resolve_host(host, port)
+    if u.scheme.lower() == "http":
+        if not plaintext_ok(host, ips):
+            raise CliError(f"{url}: plain http only to loopback, LAN or tailnet addresses (the hub token would "
+                           f"cross the internet unencrypted)",
+                           hint="use the node's tailnet/LAN address, or https with --tls-pin")
+    elif not pinned and not plaintext_ok(host, ips):
+        out.line("warning: https to a public address without --tls-pin relies on the system CAs (or "
+                 "network.ca_file); pin the node's certificate: hive tls-pin CERT on the node")
+
+
 def cmd_hub_add_node(args: argparse.Namespace, out: Out) -> int:
     """``hive hub add-node NAME --relay [--via] | --direct URL …``."""
     cfg = _hub_config(args)
@@ -1255,6 +1279,7 @@ def cmd_hub_add_node(args: argparse.Namespace, out: Out) -> int:
         url = args.direct.rstrip("/")
         if not url.lower().startswith(("http://", "https://")):
             raise CliError("--direct needs an http(s):// URL", hint="e.g. http://desk.tail1234.ts.net:7701")
+        _check_direct_url(url, bool(args.tls_pin), out)
         if args.generate:
             token = util.new_token()
             lines = [f"on the node '{name}', run (only the hash crosses machines):",
@@ -1348,6 +1373,20 @@ def _role_has_exec(role: Optional[str], classes: Optional[List[str]] = None) -> 
     return "exec" in ROLE_PRESETS.get(role or "operator", set())
 
 
+EXEC_ACTIONS = ("shell.run", "job.start", "service.define", "service.start", "service.restart")
+
+
+def _exec_ungated(entry: Dict[str, Any]) -> bool:
+    """T5 (§19 v5): the token can start commands without approval — it has the exec class and some exec action
+    (``EXEC_ACTIONS``, the exec part of CAUTIOUS_ACTIONS) is neither denied nor approval-gated. Covers the §5.2
+    ``auth.exec_gated`` rule (shell.run) and also job.start/service.*, which run commands too."""
+    if not _role_has_exec(entry.get("role"), entry.get("classes")):
+        return False
+    deny = list(entry.get("deny_actions") or [])
+    appr = list(entry.get("require_approval") or [])
+    return any(not util.glob_match(a, deny) and not util.glob_match(a, appr) for a in EXEC_ACTIONS)
+
+
 def _token_entry_args(args: argparse.Namespace, *, kind: str = "agent") -> Dict[str, Any]:
     from .auth import CAUTIOUS_ACTIONS
     entry: Dict[str, Any] = {"kind": kind, "role": args.role or "operator"}
@@ -1414,7 +1453,7 @@ def cmd_hub_add_agent(args: argparse.Namespace, out: Out) -> int:
     if https and cfg.listen.mcp_http:
         out.line("remote MCP (Claude Code over HTTP; the only case where a token appears in an agent config):")
         out.line("  " + _mcp_remote_line(https[0], token))
-    if _role_has_exec(entry.get("role")) and not entry.get("require_approval"):
+    if _exec_ungated(entry):
         local = [n for n in _hub_local_nodes(cfg) if any(fnmatch.fnmatchcase(n, g) for g in entry["nodes"])]
         if local:
             out.line(f"warning: this token can run commands on {', '.join(local)} (the hub's machine): an "
@@ -1611,16 +1650,28 @@ def cmd_hub_restart_node(args: argparse.Namespace, out: Out) -> int:
                 break
             out.line(f"waiting for relay nodes to come online: {', '.join(missing)}")
             _sleep(5)
-        outdated = [r for r in rows if r.get("outdated") and r.get("online")]
+        # §19 v4: every outdated node is named; only online auto-updating relay nodes get a restart
         queued = []
-        for r in outdated:
+        for r in client.nodes():
+            if not r.get("outdated"):
+                continue
+            rname = util.escape_terminal(str(r.get("name")))
+            ver = util.escape_terminal(str(r.get("version")))
+            if r.get("name") not in relay_names:
+                out.line(f"{rname}: outdated (version {ver}), direct node: upgrade by hand")
+                continue
+            if not r.get("online"):
+                out.line(f"{rname}: outdated (version {ver}), offline: upgrade by hand when it is back")
+                continue
             if not r.get("auto_update"):
-                out.line(f"{r.get('name')}: outdated (version {r.get('version')}), auto_update off: upgrade by hand")
+                out.line(f"{rname}: outdated (version {ver}), auto_update off: upgrade by hand")
                 continue
             res = _owner_request(client, "POST", f"/v1/hub/nodes/{r.get('name')}/restart", {})
             if res.get("queued"):
                 queued.append(r.get("name"))
-                out.line(f"{r.get('name')}: restart queued")
+                out.line(f"{rname}: restart queued")
+            else:
+                out.line(f"{rname}: outdated (version {ver}), restart not queued: upgrade by hand")
         if not queued:
             out.line("no auto-updating outdated relay node to restart")
             return EXIT_OK
@@ -1695,11 +1746,21 @@ def cmd_gateway_token_add(args: argparse.Namespace, out: Out) -> int:
     out.line("API key (shown once; paste it only into the app's settings, never into a chat):")
     out.line(token)
     first = models[0]
-    if side == "hub" and "*" not in first:
-        node, svc = first.split("/", 1)
-        out.line(f"app settings: hive gateway url {node} {svc}")
-    elif side == "node" and "*" not in first:
-        out.line(f"app settings: hive gateway url self {first} --node")
+    if not any(ch in first for ch in "*?["):
+        # §19/§8.7: the app settings block right away (Model: the id the model server reports; `gateway url
+        # --token-file` lists them once the daemon has restarted)
+        node, svc = first.split("/", 1) if side == "hub" else ("self", first)
+        try:
+            bases = _gateway_bases(out, node, svc, own_node=args if side == "node" else None,
+                                   hub_args=args if side == "hub" else None)
+        except CliError as e:
+            bases = []
+            out.line(f"note: cannot build the base URLs ({e})")
+        if bases:
+            out.line("app settings:")
+            _gateway_settings(out, bases, "<model name>", "the API key above")
+        out.line(f"model ids served: hive gateway url {node} {svc}" + (" --node" if side == "node" else "")
+                 + " --token-file FILE (a file holding this key)")
     else:
         out.line("app settings: hive gateway url NODE SERVICE" + (" --node" if side == "node" else ""))
     _restart_daemon(side, out, no_restart=args.no_restart)
@@ -1767,27 +1828,26 @@ def _gateway_models(base: str, token: str) -> List[str]:
     return [str(m.get("id")) for m in (data.get("data") or []) if isinstance(m, dict) and m.get("id")][:10]
 
 
-def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
-    """``hive gateway url NODE SERVICE [--connection C] [--token-file F] [--node]`` (§8.7 URLs)."""
+def _gateway_bases(out: Out, node: str, svc: str, *, own_node: Optional[argparse.Namespace] = None,
+                   connection: Optional[str] = None, hub_args: Optional[argparse.Namespace] = None
+                   ) -> List[Tuple[str, str]]:
+    """[(label, base URL without /v1)] for NODE/SERVICE (§8.7 URLs): this node's own gateway (``own_node`` = the args
+    naming its config), a client.json connection, or the hub config on this machine."""
     from .config import default_paths
-    svc = args.service
-    if not re.match(r"^[a-z0-9][a-z0-9._-]{0,63}\Z", svc or ""):
-        raise CliError(f"invalid service name {svc!r}")
-    node = args.node_name.lower()
     bases: List[Tuple[str, str]] = []
-    if args.node:
-        cfg = _node_config(args)
+    if own_node is not None:
+        cfg = _node_config(own_node)
         scheme = "https" if cfg.listen.tls.cert else "http"
         bases.append(("apps on this PC", f"{scheme}://127.0.0.1:{cfg.listen.port}/openai/self/{svc}"))
-    elif args.connection:
+    elif connection:
         from .config import load_client_config
         cc = load_client_config()
-        conn = cc.connections.get(args.connection)
+        conn = cc.connections.get(connection)
         if conn is None:
-            raise CliError(f"no connection named {args.connection!r}", hint="hive init client …")
+            raise CliError(f"no connection named {connection!r}", hint="hive init client …")
         bases.append(("via your connection", f"{conn.url.rstrip('/')}/openai/{node}/{svc}"))
-    elif default_paths()["hub_config"].exists():
-        cfg = _hub_config(args)
+    elif hub_args is not None or default_paths()["hub_config"].exists():
+        cfg = _hub_config(hub_args if hub_args is not None else argparse.Namespace())
         labels = {"tailnet": "apps on your tailnet (recommended)",
                   "magicdns": "alternative (MagicDNS name; not through a system proxy)",
                   "lan": "apps on your LAN", "listen": "apps that reach the hub",
@@ -1803,6 +1863,28 @@ def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
     else:
         raise CliError("no hub config on this machine", hint="run it on the hub, or pass --connection C (a hub "
                                                              "connection) or --node (this node's own gateway)")
+    return bases
+
+
+def _gateway_settings(out: Out, bases: List[Tuple[str, str]], model: str, api_key: str) -> None:
+    """The "Provider: OpenAI-compatible · Base URL · API key · Model" block per base, plus the /v1-less variant."""
+    for label, base in bases:
+        out.line(f"{label}:")
+        out.line(f"  Provider: OpenAI-compatible · Base URL: {base}/v1 · API key: {api_key} · Model: {model}")
+        out.line(f"  Apps that add /v1 themselves (e.g. Cherry Studio): Base URL {base}")
+    if any(lab.startswith("apps on your tailnet") for lab, _b in bases):
+        out.line("if the app uses a system proxy (Clash …), add 100.64.0.0/10 and *.ts.net to its proxy bypass")
+
+
+def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
+    """``hive gateway url NODE SERVICE [--connection C] [--token-file F] [--node]`` (§8.7 URLs)."""
+    svc = args.service
+    if not re.match(r"^[a-z0-9][a-z0-9._-]{0,63}\Z", svc or ""):
+        raise CliError(f"invalid service name {svc!r}")
+    node = args.node_name.lower()
+    conn = getattr(args, "connection", None)
+    bases = _gateway_bases(out, node, svc, own_node=args if args.node else None, connection=conn,
+                           hub_args=args if getattr(args, "config", None) else None)
     model = "<model name>"
     if args.token_file:
         try:
@@ -1810,17 +1892,11 @@ def cmd_gateway_url(args: argparse.Namespace, out: Out) -> int:
             probe = [b for lab, b in bases if lab == "apps on this PC"] or [bases[0][1]]
             ids = _gateway_models(probe[0], tok)
             if ids:
-                model = ids[0]
+                model = util.escape_terminal(ids[0])        # model-server text (§19: node-supplied, escaped)
                 out.foreign("served models: " + ", ".join(ids))
         except (OSError, IndexError, HiveError, ValueError) as e:
-            out.line(f"note: could not list the served models ({getattr(e, 'message', e)})")
-    for label, base in bases:
-        out.line(f"{label}:")
-        out.line(f"  Provider: OpenAI-compatible · Base URL: {base}/v1 · API key: <your gateway token> · Model: "
-                 f"{model}")
-        out.line(f"  Apps that add /v1 themselves (e.g. Cherry Studio): Base URL {base}")
-    if any(lab.startswith("apps on your tailnet") for lab, _b in bases):
-        out.line("if the app uses a system proxy (Clash …), add 100.64.0.0/10 and *.ts.net to its proxy bypass")
+            out.line(f"note: could not list the served models ({util.escape_terminal(str(getattr(e, 'message', e)))})")
+    _gateway_settings(out, bases, model, "<your gateway token>")
     out.line("browser apps on an https:// page need the https (public) URL or a http://127.0.0.1 URL on the same "
              "machine; a model_endpoints name such as ollama or lmstudio works as SERVICE too")
     out.line("no token yet? hive gateway token add APP --models '" + (f"{svc}'" if args.node else f"{node}/{svc}'")
@@ -1864,7 +1940,9 @@ def cmd_approvals_list(args: argparse.Namespace, out: Out) -> int:
     """``hive approvals list [--node|--hub]``."""
     rows: List[dict] = []
     errors = 0
-    for where, conn in _approval_places(args):
+    last = HiveError("unavailable", "not running")
+    places = _approval_places(args)
+    for where, conn in places:
         c = _place_client(conn)
         try:
             res = _owner_request(c, "GET", "/v1/approvals")
@@ -1872,15 +1950,21 @@ def cmd_approvals_list(args: argparse.Namespace, out: Out) -> int:
                 rows.append(dict(r, _where=where))
         except HiveError as e:
             errors += 1
+            last = e
             out.line(f"{where}: {_not_running(where) if e.code == 'unavailable' else e.code + ': ' + e.message}")
         finally:
             c.close()
+    if errors and errors == len(places):
+        # nothing could be asked: not "no pending approvals" (like approvals revoke)
+        if out.as_json:
+            out.data(rows)
+        return exit_code_for(last)
     if out.as_json:
         out.data(rows)
         return EXIT_OK
     if not rows:
-        out.line("no pending approvals")
-        return EXIT_OK if not errors or rows else EXIT_OK
+        out.line("no pending approvals" + (" (where it could be checked)" if errors else ""))
+        return EXIT_OK
     for r in rows:
         exp = r.get("expires")
         out.foreign(f"{r.get('id')}  [{r.get('_where')}] {r.get('requester')} → {r.get('action')} on "
@@ -2052,7 +2136,8 @@ def _write_mcp_json(path: Path, server: dict, out: Out) -> None:
         if not isinstance(data, dict):
             raise CliError(f"{path} is not a JSON object")
         try:
-            Path(str(path) + ".bak").write_bytes(path.read_bytes())
+            # the config may hold other MCP servers' API keys (env): the backup is private like the original
+            util.atomic_write_bytes(Path(str(path) + ".bak"), path.read_bytes(), private=True)
         except OSError:
             pass
     data.setdefault("mcpServers", {})["hive"] = server
@@ -2061,9 +2146,50 @@ def _write_mcp_json(path: Path, server: dict, out: Out) -> None:
     out.line(f"wrote {path} (restart the app to load it)")
 
 
+def _local_token_kind(token: Optional[str]) -> Optional[str]:
+    """Kind of ``token`` from the configs on this machine (node ``auth.tokens``, hub ``tokens``), None if unknown."""
+    if not token:
+        return None
+    from .config import default_paths, load_hub_config, load_node_config
+    h = util.hash_token(token)
+    paths = default_paths()
+    found: Optional[str] = None
+    for path, load, attr in ((paths["node_config"], load_node_config, "auth"),
+                             (paths["hub_config"], load_hub_config, None)):
+        try:
+            if not Path(path).exists():
+                continue
+            cfg = load(str(path))
+            toks = cfg.auth.tokens if attr else cfg.tokens
+        except Exception:  # noqa: BLE001 - an unreadable config just tells us nothing
+            continue
+        for t in toks:
+            if getattr(t, "sha256", None) == h:
+                if t.kind == "owner":
+                    return "owner"
+                found = found or t.kind
+    return found
+
+
+def _mcp_probe(c: Any) -> Optional[int]:
+    """HTTP status of a session-less ``POST /mcp`` (400 = the hub serves /mcp, 404 = not served); None on failure."""
+    tr = getattr(c.target, "transport", None)
+    if tr is None:
+        return None
+    try:
+        st, _h, _b = tr.request("POST", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "ping"}, raw=True,
+                                headers={"Accept": "application/json, text/event-stream"})
+        return int(st)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
-    """``hive mcp-config [--client …] [--connection NAME | --local] [--remote] [--write] [--allow-owner]``."""
-    from .client import connect
+    """``hive mcp-config [--client …] [--connection NAME | --local] [--remote] [--write] [--allow-owner]``.
+
+    Fails closed (§5.1, §18.4): the token kind comes from ``whoami``; with the server unreachable, from the configs on
+    this machine; a kind that stays unknown is refused like an owner token unless ``--allow-owner``."""
+    from .client import _cfg_base, _conn_token, connect
     from .config import load_client_config
     cc = load_client_config()
     if args.local:
@@ -2078,33 +2204,72 @@ def cmd_mcp_config(args: argparse.Namespace, out: Out) -> int:
     if conn not in cc.connections:
         raise CliError(f"no connection named {conn!r} in client.json",
                        hint="hive init node (this-pc) or hive init client --name … --url …")
-    kind = None
+    conn_obj = cc.connections[conn]
+    try:
+        tok: Optional[str] = _conn_token(conn_obj, _cfg_base(cc))
+    except HiveError:
+        tok = None
+    client = args.client or "claude-desktop"
+    kind = role = None
+    mcp_status: Optional[int] = None
+    unreachable: Optional[HiveError] = None
     try:
         c = connect(conn)
         try:
-            kind = ((c.whoami() or {}).get("identity") or {}).get("kind")
+            w = c.whoami() or {}
+            kind = (w.get("identity") or {}).get("kind")
+            role = (w.get("server") or {}).get("role")
+            if args.remote and role == "hub":
+                mcp_status = _mcp_probe(c)
         finally:
             c.close()
     except HiveError as e:
-        if conn in ("this-pc-owner", "hub-local"):
+        unreachable = e
+        kind = _local_token_kind(tok)
+        if kind is None and conn in ("this-pc-owner", "hub-local"):
             kind = "owner"
-        else:
-            out.line(f"note: could not check the token ({e.code}: {e.message}); the snippet is printed anyway")
     if kind == "owner" and not args.allow_owner:
         out.error("forbidden", f"connection '{conn}' uses an owner token",
                   "agents should use an agent token; see this-pc (hive mcp-config --local), or pass --allow-owner")
         return EXIT_AUTH
-    client = args.client or "claude-desktop"
+    if kind is None and not args.allow_owner:
+        e = unreachable
+        why = f"{e.code}: {e.message}" if e is not None else "whoami named no kind"
+        out.error("unavailable", f"cannot check the token of connection '{conn}' ({why})",
+                  "start the hub/node and run this again (owner tokens are refused), or pass --allow-owner to print "
+                  "the snippet anyway")
+        return EXIT_UNAVAILABLE
+    if unreachable is not None:
+        out.line(f"note: could not reach the server ({unreachable.code}); the token kind was checked locally"
+                 if kind else f"note: could not check the token ({unreachable.code}); printed because of "
+                              f"--allow-owner")
     if args.remote:
-        conn_obj = cc.connections[conn]
-        tok = None
-        try:
-            from .client import _read_token_file
-            tok = conn_obj.token or (_read_token_file(conn_obj.token_file, getattr(cc, "_path", None))
-                                     if conn_obj.token_file else None)
-        except Exception:  # noqa: BLE001
-            tok = None
+        # §18.3/§18.5: only a hub serves /mcp; §18.4: the token goes into an agent config only for that hub
+        if unreachable is not None:
+            out.error("unavailable", f"cannot check that connection '{conn}' is a hub serving /mcp "
+                                     f"({unreachable.code})", "start the hub and run this again, or use the stdio "
+                                                              "snippet (drop --remote)")
+            return EXIT_UNAVAILABLE
+        if role != "hub" or mcp_status == 404:
+            what = "a node" if role == "node" else ("a hub with listen.mcp_http off" if role == "hub" else
+                                                   "not a hub")
+            out.error("bad_request", f"remote MCP is served by a hub only (connection '{conn}' is {what})",
+                      "use the stdio snippet (drop --remote)")
+            return EXIT_USAGE
+        from urllib.parse import urlsplit
         base = conn_obj.url.rstrip("/")
+        try:
+            u = urlsplit(base)
+            host, port = (u.hostname or ""), (u.port or (443 if u.scheme == "https" else 80))
+        except ValueError:
+            host, port = "", 0
+        if base.lower().startswith("http://"):
+            from .transport import plaintext_ok, resolve_host
+            if not host or not plaintext_ok(host, resolve_host(host, port)):
+                out.error("bad_request", f"{base} is plain http to a public address; the token would cross the "
+                                         f"internet unencrypted", "use the hub's https URL (public_url) or its "
+                                                                  "tailnet/LAN address")
+                return EXIT_USAGE
         out.line("warning: this puts the token into the agent's config (the only case where Hive does that); "
                  "prefer stdio (drop --remote)")
         if client == "claude-code":

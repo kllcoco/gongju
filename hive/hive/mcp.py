@@ -253,6 +253,9 @@ class McpCore:
         from .client import new_request_id
         h = CallHandle(new_request_id())
         with self._lock:
+            if mid in session.inflight:
+                # a second call with the same id would orphan the first one's handle (cancel/close would miss it)
+                return _err(mid, INVALID_REQUEST, "duplicate request id in flight")
             session.inflight[mid] = h
         version = session.protocol_version
 
@@ -289,7 +292,8 @@ class McpCore:
                 out = _resp(mid, {"content": [{"type": "text", "text": f"ERROR internal: {type(e).__name__}"}],
                                   "isError": True})
             with self._lock:
-                session.inflight.pop(mid, None)
+                if session.inflight.get(mid) is h:
+                    session.inflight.pop(mid, None)
             if h.cancelled:
                 return
             try:
@@ -306,7 +310,8 @@ class McpCore:
             self._pool.submit(work)
         except RuntimeError:
             with self._lock:
-                session.inflight.pop(mid, None)
+                if session.inflight.get(mid) is h:
+                    session.inflight.pop(mid, None)
             return _err(mid, INTERNAL_ERROR, "server is shutting down")
         return None
 
@@ -543,6 +548,13 @@ class HttpSessions:
             rec.core.close(rec.session, wait=0)
         except Exception as e:  # noqa: BLE001
             log.debug("closing mcp session failed: %s", e)
+        # the session's hub-process fs_transfer copies have no owner once it is gone: stop them too
+        fn = getattr(getattr(rec.core, "toolkit", None), "close", None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                log.debug("closing mcp session toolkit failed: %s", e)
 
     def _prune_locked(self, now: float) -> List[HttpSession]:
         gone = [r for r in self._s.values() if r.active == 0 and now - r.last_used > self.idle]
@@ -550,27 +562,47 @@ class HttpSessions:
             self._s.pop(r.id, None)
         return gone
 
+    @staticmethod
+    def _idle_victims(recs: List[HttpSession], n: int) -> Optional[List[HttpSession]]:
+        """The ``n`` least recently used idle sessions of ``recs`` (None when fewer are idle: never evict a session
+        with a request in flight, §18.5 "the oldest idle one is evicted")."""
+        if n <= 0:
+            return []
+        idle = sorted((r for r in recs if r.active == 0), key=lambda r: r.last_used)
+        return idle[:n] if len(idle) >= n else None
+
     def create(self, token_name: str, core: McpCore, session: McpSession) -> HttpSession:
-        """Register a new session (evicting the least recently used ones over the limits)."""
+        """Register a new session, evicting the least recently used idle ones over the limits; raises
+        ``HiveError("unavailable")`` (nothing evicted) when a limit is reached by sessions that are all in use."""
         import secrets as _secrets
         now = self.clock()
+        rec: Optional[HttpSession] = None
+        busy = ""
         with self._lock:
             closed = self._prune_locked(now)
-            mine = sorted((r for r in self._s.values() if r.token_name == token_name), key=lambda r: r.last_used)
-            while len(mine) >= self.per_token:
-                r = mine.pop(0)
-                self._s.pop(r.id, None)
-                closed.append(r)
-            if len(self._s) >= self.total:
-                for r in sorted(self._s.values(), key=lambda r: r.last_used)[:len(self._s) - self.total + 1]:
+            mine = [r for r in self._s.values() if r.token_name == token_name]
+            v1 = self._idle_victims(mine, len(mine) - self.per_token + 1)
+            v2: Optional[List[HttpSession]] = None
+            if v1 is None:
+                busy = f"this token has {len(mine)} MCP sessions in use (max {self.per_token})"
+            else:
+                rest = [r for r in self._s.values() if r not in v1]
+                v2 = self._idle_victims(rest, len(rest) - self.total + 1)
+                if v2 is None:
+                    busy = f"{len(rest)} MCP sessions in use (max {self.total})"
+            if not busy:
+                for r in (v1 or []) + (v2 or []):
                     self._s.pop(r.id, None)
                     closed.append(r)
-            sid = _secrets.token_urlsafe(32)
-            rec = HttpSession(sid, token_name, core, session, now)
-            self._s[sid] = rec
+                sid = _secrets.token_urlsafe(32)
+                rec = HttpSession(sid, token_name, core, session, now)
+                self._s[sid] = rec
         for r in closed:
             log.info("mcp session of %s closed (idle or over the limit)", r.token_name)
             self._close(r)
+        if rec is None:
+            raise HiveError("unavailable", busy, hint="retry when a call has finished, or end an old session "
+                                                      "(DELETE /mcp)")
         return rec
 
     def acquire(self, sid: str, token_name: str) -> Optional[HttpSession]:
@@ -663,10 +695,16 @@ def http_handler(core_factory: Callable[..., McpCore], *, sessions: Optional[Htt
         if pv and pv not in SUPPORTED_VERSIONS:
             return _http_json(400, _err(None, INVALID_REQUEST, f"unsupported MCP-Protocol-Version {pv[:40]!r}; "
                                                                f"supported: {', '.join(SUPPORTED_VERSIONS)}"))
+        body = req.body or b""
+        from .httpserver import json_depth_ok
+        if not json_depth_ok(body):
+            return _http_json(400, _err(None, INVALID_REQUEST, "JSON nested too deeply"))
         try:
-            msg = json.loads((req.body or b"").decode("utf-8"))
+            msg = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return _http_json(400, _err(None, PARSE_ERROR, "Parse error"))
+        except RecursionError:
+            return _http_json(400, _err(None, INVALID_REQUEST, "JSON nested too deeply"))
         if isinstance(msg, list):
             return _http_json(400, _err(None, INVALID_REQUEST, "batches not supported"))
         if not isinstance(msg, dict):
@@ -692,7 +730,11 @@ def http_handler(core_factory: Callable[..., McpCore], *, sessions: Optional[Htt
                 core.close(sess, wait=0)
                 return _http_json(200, resp if resp is not None else _err(mid, INTERNAL_ERROR, "no response"))
             sess.initialized = True                 # notifications/initialized follows; tools work either way
-            rec = table.create(token_name, core, sess)
+            try:
+                rec = table.create(token_name, core, sess)
+            except HiveError as e:                  # every session over the limit is busy: refuse, cancel nothing
+                core.close(sess, wait=0)
+                return _http_json(503, _err(mid, INTERNAL_ERROR, e.message), {"Retry-After": "10"})
             return _http_json(200, resp, {"Mcp-Session-Id": rec.id})
         if not sid:
             return _http_json(400, _err(mid if has_id else None, INVALID_REQUEST,

@@ -1078,6 +1078,14 @@ class Toolkit:
             except Exception as e:  # noqa: BLE001
                 log.debug("cancel %s: %s", request_id, e)
 
+    def close(self) -> int:
+        """Stop this Toolkit's running ``fs_transfer`` copies (their part files stay for a resume); the number
+        cancelled. Called when a hub ``/mcp`` session ends (§18.5): nothing could query or cancel them afterwards."""
+        with self._lock:
+            tm = self._tm
+        fn = getattr(tm, "cancel_all", None)
+        return int(fn()) if callable(fn) else 0
+
     def _transfer_manager(self) -> Any:
         with self._lock:
             if self._tm is None:
