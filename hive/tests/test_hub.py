@@ -689,3 +689,82 @@ class TestCancelAndRunHub(_HubCase):
         util.write_json_atomic(data / "control.json", {"cmd": "restart", "at": util.iso_utc()}, private=True)
         t.join(20)
         self.assertEqual(rc.get("code"), 75)
+
+
+class TestHubFileBinding(_HubCase):
+    """§8.2 step 4 v7/v8 file binding over the link, against a scripted relay node."""
+
+    def setUp(self):
+        e, self.rtok = self.relay_entry()
+        self.url, self.toks, self.hub = self.make_hub([e], agent_entry={"require_approval": ["shell.run"]})
+        self.fake = FakeRelay(self.url, self.rtok, "pod-a")
+        self.client = connect(self.url, token=self.toks["agent"])
+        self.addCleanup(self.client.close)
+
+    def run_call(self, params, answer):
+        """Call shell.run through the hub while the fake node answers every sub-call with ``answer(task)``."""
+        self.fake.register()
+        box = call_async(self.client.call, "shell.run", params, node="pod-a")
+        seen = []
+        for _ in range(20):
+            for t in self.fake.poll().get("tasks") or []:
+                seen.append(t)
+                self.fake.result(t["task_id"], answer(t))
+            if not box["thread"].is_alive():
+                break
+        box["thread"].join(10)
+        return box, seen
+
+    def test_large_file_bound_by_stat(self):
+        def answer(t):
+            p = t["params"]["path"]
+            if p.endswith("model.gguf"):
+                return ok_env({"path": "/w/model.gguf", "exists": True, "type": "file", "size": 20 << 30,
+                               "mtime": "2026-11-01T00:00:00.000Z"})
+            return ok_env({"path": "/w/" + p, "exists": False})
+        box, seen = self.run_call({"command": "llama-server -m /w/model.gguf"}, answer)
+        self.assertEqual(box["error"].code, "approval_required")
+        rec = self.hub.approvals.get(box["error"].details["approval_id"])
+        f = [x for x in rec["review"]["files"] if x["path"] == "/w/model.gguf"][0]
+        self.assertEqual((f["bind"], f["shown"]), ("stat", False))
+        self.assertEqual(rec["files"]["/w/model.gguf"], "stat:21474836480:2026-11-01T00:00:00.000Z")
+        self.assertFalse([t for t in seen if t["action"] == "fs.read" or t["params"].get("sha256")])
+
+    def test_incomplete_read_not_shown(self):
+        def answer(t):
+            a, p = t["action"], t["params"]
+            if a == "fs.stat" and p.get("sha256"):
+                return ok_env({"path": "/w/run.sh", "exists": True, "type": "file", "size": 9000,
+                               "sha256": "ab" * 32})
+            if a == "fs.stat":
+                return ok_env({"path": "/w/run.sh", "exists": True, "type": "file", "size": 9000,
+                               "mtime": "2026-11-01T00:00:00.000Z"} if p["path"].endswith("run.sh")
+                              else {"path": p["path"], "exists": False})
+            return ok_env({"content": "line1\n", "next_start_line": 501, "long_lines_cut": False,
+                           "version": "cd" * 32})
+        box, _seen = self.run_call({"command": "bash run.sh", "cwd": "/w"}, answer)
+        rec = self.hub.approvals.get(box["error"].details["approval_id"])
+        f = [x for x in rec["review"]["files"] if x["path"] == "/w/run.sh"][0]
+        self.assertEqual((f["bind"], f["sha256"], f["shown"]), ("sha256", "ab" * 32, False))
+        self.assertNotIn("line1", rec["review"]["lines"])
+        self.assertIn("content not shown; inspect it on the node", rec["review"]["lines"])
+
+    def test_windows_word_split(self):
+        self.fake.info = dict(self.fake.info, os="Windows")
+        paths = []
+
+        def answer(t):
+            paths.append(t["params"]["path"])
+            return ok_env({"path": t["params"]["path"], "exists": False})
+        box, _seen = self.run_call({"command": "python C:\\scripts\\run.py"}, answer)
+        self.assertIn("C:\\scripts\\run.py", paths)
+        rec = self.hub.approvals.get(box["error"].details["approval_id"])
+        self.assertEqual(rec["files"], {"C:\\scripts\\run.py": None})          # absent: must stay absent
+
+    def test_sub_call_unavailable_fails_request(self):
+        def answer(t):
+            return {"ok": False, "error": {"code": "unavailable", "message": "busy",
+                                           "details": {"reason": "busy", "maybe_executed": False}}, "meta": {}}
+        box, _seen = self.run_call({"command": "bash run.sh"}, answer)
+        self.assertEqual(box["error"].code, "unavailable")
+        self.assertEqual(self.hub.approvals.list(), [])

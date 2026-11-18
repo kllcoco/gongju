@@ -504,7 +504,8 @@ class RelayLink(NodeLink):
                         self.status_row = _sanitize(st)
                 except (TypeError, ValueError):
                     pass
-            running = set(x for x in (body.get("running") or []) if isinstance(x, str))
+            rl = body.get("running")
+            running = set(x for x in rl if isinstance(x, str)) if isinstance(rl, list) else set()
             now = time.monotonic()
             for t in self.delivered.values():
                 if t.session == sid and t.task_id not in running and t.absent_since is None:
