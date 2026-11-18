@@ -198,10 +198,11 @@ class TestServiceBinding(unittest.TestCase):
         e = n.err("fs.write", {"path": "~/~/lib5/x.py", "content": "print('EVIL-s5')", "make_dirs": True},
                   identity=CAUTIOUS)
         self.assertEqual(e["code"], "policy_denied", e)
-        # created out of band: the crash respawn refuses to run it
+        # created out of band once the approved run has exited: the crash respawn refuses to run it
+        wait_for(lambda: self.rs("s5")["state"] in ("backoff", "failed") or self.rs("s5")["restarts"], 30)
         os.makedirs(os.path.dirname(lit))
         Path(lit).write_text("print('EVIL-s5 never approved', flush=True)\n")
-        wait_for(lambda: self.rs("s5")["state"] == "failed", 30)
+        wait_for(lambda: self.rs("s5")["state"] == "failed", 90)
         self.assertEqual(self.rs("s5")["last_error"], services.APPROVED_CHANGED_ERROR)
         self.assertNotIn("EVIL-s5", str(n.ok("service.logs", {"name": "s5"})))
 
