@@ -54,6 +54,8 @@ class RenderCtx:
 # small formatting helpers
 
 def _s(v: Any) -> str:
+    if isinstance(v, bool):    # JSON spelling, as agents write tool arguments (M1: "autostart: False" was rendered)
+        return "true" if v else "false"
     return "" if v is None else str(v)
 
 

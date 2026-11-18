@@ -66,10 +66,16 @@ def shell_run(ctx: ActionContext, p: dict) -> dict:
     t = ctx.policy.check_timeout(p.get("timeout"), lim.exec_default_timeout, lim.exec_max_timeout)
     plan = prepare_command(ctx.policy, p)
     yield_after: Optional[float] = p.get("yield_after")
+    on_timeout = p.get("on_timeout") or "kill"
+    if yield_after is not None and on_timeout == "kill" and float(yield_after) >= t:
+        # M1 integration: the Toolkit sends yield_after = min(timeout, w) (§17.4), i.e. yield_after == timeout for every
+        # timeout <= the wait budget. Yielding when the shim kills the command anyway reported a killed command as
+        # "still running → background job"; wait for the shim's timeout result instead, at most TIMEOUT_GRACE + 1 s
+        # past the timeout (then yield as before, so the call stays inside the client's wait budget).
+        yield_after = t + TIMEOUT_GRACE + 1.0
     if yield_after is None and t > ctx.remaining() - 5:
         yield_after = max(1.0, ctx.remaining() - 5)   # auto-yield instead of failing at the call deadline
     max_output = max(1024, min(int(p.get("max_output") or 65536), int(lim.max_output_bytes)))
-    on_timeout = p.get("on_timeout") or "kill"
     merge = bool(p.get("merge_stderr", True))
     info = jm.start_job(ctx, kind="shell", argv_or_cmdline=plan.argv, shell=plan.shell, cwd=plan.cwd, env=plan.env,
                         stdin=p.get("stdin"), name=plan.display[:40], timeout=t if on_timeout == "kill" else 0,

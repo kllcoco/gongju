@@ -760,3 +760,44 @@ by the lead or a line in DESIGN.md.
     - `_console_command()` looks for the console script next to `sys.executable`, in `sysconfig.get_path("scripts")`
       and in `<python dir>/Scripts`, then searches PATH by hand without the current directory or relative entries
       (D56; `shutil.which` searches the cwd first on Windows before Python 3.12).
+
+## M1 integration (lead, §22.1 step 3)
+
+90. **E2E-M1 moved to `tests/integration/test_e2e_m1.py`** (§3: `tests/integration/` is the lead's). The WP6a
+    in-process variant `tests/test_e2e_m1.py` (note 87) is removed: the new test drives only real processes —
+    `hive init node` (temp `HIVE_HOME`, `--listen 127.0.0.1:<free port> --root <tmp> --proxy off`), a real
+    `hive node run` daemon, `hive mcp --local` (the `this-pc` agent connection init wrote) and the CLI (`hive call`,
+    `hive sh`, `hive node status|stop`, owner and `--connection this-pc`). Flow: tools/list → shell_run (and a 1 s
+    hard timeout) → job_start(argv) / job_status(wait) → fs_write / fs_read / fs_edit / fs_search / fs_op copy+delete /
+    fs_list / policy-denied read outside the roots → service_define of a stub OpenAI server through the **llamacpp
+    preset** (a `llama-server` sh wrapper; Windows defines it with `options=['argv=[…]']`) → service_status(wait) →
+    model_chat (MCP), model.chat (owner CLI), model.endpoints (agent CLI) → `hive sh` exit codes → CLI error exit
+    codes (policy_denied 3, not_found 1) → service_control remove → MCP EOF exit 0 → audit rows carry the agent's
+    own identity → `hive node stop` exits the daemon with 0. When the CI user is root the test sets `allow_root` in
+    the written config (§13.1 refuses root otherwise). The Windows branch is written for the lead's Windows CI and
+    is not exercised here.
+91. **CONTRACT-REQUEST (M1 → WP2 `actions/shell.py`, behaviour fix):** the Toolkit sends `yield_after = min(timeout,
+    w)` (§17.4), so every shell_run with a timeout ≤ the wait budget had `yield_after == timeout`; the handler yielded
+    at that instant while the shim was killing the command, and the agent read "still running after 1s → background
+    job" for a command that had timed out. Now, with `on_timeout:"kill"`, a `yield_after ≥ timeout` is treated as
+    `timeout + TIMEOUT_GRACE + 1` (wait for the shim's timeout result, bounded so the call stays inside the client's
+    budget). `yield_after < timeout` and `on_timeout:"background"` are unchanged. Regression tests:
+    `tests/integration/test_m1_fixes.py`, plus the E2E's 1 s-timeout shell_run.
+92. **CONTRACT-REQUEST (M1 → WP6 `render.py`, cosmetic):** `render._s` spells booleans the JSON way (`true`/`false`)
+    so definition lines read `autostart: false` (agents copy these into tool arguments); was `autostart: False`.
+93. **(M1 → WP6 test `tests/test_render.py`):** `test_fs_list_paging` was timing-flaky (`mtime = now − 120` truncated
+    to ms could render `1m59s ago`); it now uses `now − 120.5`.
+94. **M1 observations (no change made):**
+    - `service.define` health checks run every `health_interval` (default 15 s) also while `starting` (§10.5), so a
+      server that needs 0.3 s to bind can report `healthy` only ~15 s after the define when the first check raced
+      its bind. Per design; a shorter first-checks cadence during `start_period` would be a design change (lead).
+    - `hive init node --listen 127.0.0.1:0` is accepted and writes client.json URLs with port 0 (useless for the
+      CLI/MCP); consider refusing port 0 in `init_node` (tests use free ports instead).
+    - Several renders point at commands that are WP6b/WP4/WP5b gaps at M1: approval_required says "hive approvals
+      approve ap_…" (CLI answers "not available yet (WP6b)"; the owner HTTP route works), service renders say "hive
+      gateway url NODE SERVICE" (WP6b) while the node logs "model gateway routes not registered" (WP5) yet
+      `node.info.modes.gateway` is `true`; config-changing CLI commands print "restart to apply: hive node restart"
+      but `install.restart` is the WP4 stub (a foreground daemon must be stopped and started by hand); `fs_transfer`
+      answers `unsupported` (WP5b TransferManager).
+    - Without `pyproject.toml` (WP6b) the MCP snippet printed by `hive init node` (`python3 -P -m hive mcp --local`)
+      only works when `hive` is importable (PYTHONPATH / installed).

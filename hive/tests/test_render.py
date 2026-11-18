@@ -174,7 +174,7 @@ class TestGolden(unittest.TestCase):
         self.assertIn("(secret values were masked)", r)
 
     def test_fs_list_paging(self):
-        ents = [{"path": f"f{i}.txt", "type": "file", "size": 10, "mtime": util.iso_utc(time.time() - 120)}
+        ents = [{"path": f"f{i}.txt", "type": "file", "size": 10, "mtime": util.iso_utc(time.time() - 120.5)}
                 for i in range(50)]
         text = render.fs_list({"path": "/data", "entries": ents, "total": 182, "next_offset": 50}, {}, ctx("fs_list"))
         self.assertTrue(text.startswith("[pod-a] /data · 182 entries"))
